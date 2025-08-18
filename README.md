@@ -1,4 +1,4 @@
-# WSSocks.js
+# LinkSocks.js
 
 [中文文档](README.cn.md)
 
@@ -12,7 +12,7 @@ This project is mainly used to quickly connect to uncertain user intranet enviro
 
 ### Client Setup
 
-1. Download the wssocks client from https://github.com/zetxtech/wssocks/releases.
+1. Download the linksocks client from https://github.com/zetxtech/linksocks/releases.
 2. Select the appropriate version for your OS (Windows, Linux, macOS).
 3. Extract and add to your PATH or run directly.
 
@@ -20,19 +20,19 @@ This project is mainly used to quickly connect to uncertain user intranet enviro
 
 This repository contains the Cloudflare Worker server-side code. You can:
 
-1. Use our public server: `https://wssocks.zetx.tech`
+1. Use our public server: `https://linksocks.zetx.tech`
 2. Deploy your own:
 
-   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zetxtech/wssocks.js)
+   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zetxtech/linksocks.js)
 
 ## Usage
 
 ```bash
 # Step 1: On machine A (inside the network you want to access)
-wssocks provider -t any_token -u wssocks.zetx.tech -c your_token
+linksocks provider -t any_token -u linksocks.zetx.tech -c your_token
 
 # Step 2: On machine B (where you want to access the network)
-wssocks connector -t your_token -u wssocks.zetx.tech -p 1180
+linksocks connector -t your_token -u linksocks.zetx.tech -p 1180
 ```
 
 After running both commands, you can access the internal network through the SOCKS5 proxy at `127.0.0.1:1180` on machine B.
