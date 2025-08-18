@@ -1,12 +1,12 @@
 # LinkSocks.js
 
-[中文文档](README.cn.md)
-
 A SOCKS proxy over WebSocket service built on Cloudflare Workers, designed for simple intranet penetration with no server setup required.
 
 If you own certain intranet server, please use [FRP](https://github.com/fatedier/frp) or [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/).
 
 This project is mainly used to quickly connect to uncertain user intranet environment.
+
+[中文文档 / Chinese README](README.cn.md)
 
 ## Installation
 
