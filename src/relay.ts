@@ -139,18 +139,20 @@ export class Relay extends DurableObject {
           })
           .then(ip => {
             const colo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
+            const country = request.cf && request.cf.country ? String(request.cf.country) : 'unknown';
             const log: LogMessage = {
               level: "info",
-              msg: `Welcome to Worker.js server (colo = ${colo}, ip = ${ip.trim()})`,
+              msg: `Welcome to LinkSocks.js server (colo = ${colo}, country = ${country}, ip = ${ip.trim()})`,
               getType: () => MessageType.Log,
             };
             server.send(packMessage(log));
           })
           .catch(err => {
             const colo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
+            const country = request.cf && request.cf.country ? String(request.cf.country) : 'unknown';
             const log: LogMessage = {
               level: "info",
-              msg: `Welcome to Worker.js server (colo = ${colo}, ip = failed to retrieve: ${err})`,
+              msg: `Welcome to LinkSocks.js server (colo = ${colo}, country = ${country}, ip = failed to retrieve: ${err})`,
               getType: () => MessageType.Log,
             };
             server.send(packMessage(log));
