@@ -16,7 +16,7 @@ export default {
         const welcomeMessage = `LinkSocks.js is running. You can use LinkSocks client to connect to it:
 
 For network provider:
-linksocks provider -u https://${host} -t your_token -c your_connector_token
+linksocks provider -u https://${host} -c your_connector_token
 
 For connector:
 linksocks connector -u https://${host} -t your_connector_token
