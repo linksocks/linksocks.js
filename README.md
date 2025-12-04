@@ -29,7 +29,7 @@ This repository contains the Cloudflare Worker server-side code. You can:
 
 ```bash
 # Step 1: On machine A (inside the network you want to access)
-linksocks provider -t 0 -u linksocks.zetx.tech -c your_token
+linksocks provider -u linksocks.zetx.tech -c your_token
 
 # Step 2: On machine B (where you want to access the network)
 linksocks connector -t your_token -u linksocks.zetx.tech -p 1180
