@@ -20,7 +20,7 @@ This project is mainly used to quickly connect to uncertain user intranet enviro
 
 This repository contains the Cloudflare Worker server-side code. You can:
 
-1. Use our public server: `https://linksocks.zetx.tech`
+1. Use our public server: `https://l.zetx.tech`
 2. Deploy your own:
 
    [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zetxtech/linksocks.js)
@@ -29,10 +29,10 @@ This repository contains the Cloudflare Worker server-side code. You can:
 
 ```bash
 # Step 1: On machine A (inside the network you want to access)
-linksocks provider -u linksocks.zetx.tech -c your_token
+linksocks provider -u l.zetx.tech -c your_token
 
 # Step 2: On machine B (where you want to access the network)
-linksocks connector -t your_token -u linksocks.zetx.tech -p 1180
+linksocks connector -t your_token -u l.zetx.tech -p 1180
 ```
 
 After running both commands, you can access the internal network through the SOCKS5 proxy at `127.0.0.1:1180` on machine B.
