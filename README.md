@@ -23,7 +23,7 @@ This repository contains the Cloudflare Worker server-side code. You can:
 1. Use our public server: `https://l.zetx.tech`
 2. Deploy your own:
 
-   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zetxtech/linksocks.js)
+   [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/linksocks/linksocks.js)
 
 ## Usage
 
