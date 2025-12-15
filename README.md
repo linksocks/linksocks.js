@@ -12,7 +12,7 @@ This project is mainly used to quickly connect to uncertain user intranet enviro
 
 ### Client Setup
 
-1. Download the linksocks client from https://github.com/zetxtech/linksocks/releases.
+1. Download the linksocks client from https://github.com/linksocks/linksocks/releases.
 2. Select the appropriate version for your OS (Windows, Linux, macOS).
 3. Extract and add to your PATH or run directly.
 
