@@ -22,7 +22,7 @@ linksocks provider -u https://${host} -c your_connector_token
 For connector:
 linksocks connector -u https://${host} -t your_connector_token
 
-LinkSocks client can be downloaded at https://github.com/zetxtech/linksocks`;
+LinkSocks client can be downloaded at https://github.com/linksocks/linksocks`;
 
         return new Response(welcomeMessage, {
           status: 200,
