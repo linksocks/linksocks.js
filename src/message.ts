@@ -63,6 +63,7 @@ export interface AuthMessage extends BaseMessage {
 
 export interface AuthResponseMessage extends BaseMessage {
   success: boolean;
+  token?: string;
   error?: string;
 }
 
@@ -214,7 +215,10 @@ export function packMessage(msg: BaseMessage): Uint8Array {
     case MessageType.AuthResponse: {
       const authRespMsg = msg as AuthResponseMessage;
       const payload = [BinaryType.AuthResponse, authRespMsg.success ? 1 : 0];
-      if (!authRespMsg.success && authRespMsg.error) {
+      if (authRespMsg.success && authRespMsg.token) {
+        const tokenBytes = new TextEncoder().encode(authRespMsg.token);
+        payload.push(tokenBytes.length, ...tokenBytes);
+      } else if (!authRespMsg.success && authRespMsg.error) {
         const errorBytes = new TextEncoder().encode(authRespMsg.error);
         payload.push(errorBytes.length, ...errorBytes);
       }
@@ -427,12 +431,16 @@ export function parseMessage(data: Uint8Array): BaseMessage {
         success,
         getType: () => MessageType.AuthResponse,
       };
-      if (!success && payload.length > 1) {
-        const errorLen = payload[1];
-        if (payload.length < 2 + errorLen) {
-          throw new Error("Invalid auth response error length");
+      if (payload.length > 1) {
+        const strLen = payload[1];
+        if (payload.length < 2 + strLen) {
+          throw new Error("Invalid auth response data length");
         }
-        msg.error = new TextDecoder().decode(payload.slice(2, 2 + errorLen));
+        if (success) {
+          msg.token = new TextDecoder().decode(payload.slice(2, 2 + strLen));
+        } else {
+          msg.error = new TextDecoder().decode(payload.slice(2, 2 + strLen));
+        }
       }
       return msg;
     }

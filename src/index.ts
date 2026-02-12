@@ -1,4 +1,5 @@
 import type { Env } from "./types";
+import zxcvbn from "zxcvbn";
 
 import { handleErrors } from "./common";
 import { AuthResponseMessage, packMessage, MessageType } from "./message";
@@ -45,33 +46,64 @@ LinkSocks client can be downloaded at https://github.com/zetxtech/linksocks`;
   },
 };
 
-async function handleWebsocket(request: Request, env: Env, tokenHash: string, isProvider: boolean): Promise<Response> {
+function isTokenComplexEnough(token: string): { valid: boolean; reason?: string } {
+  if (token.length < 8) {
+    return { valid: false, reason: "Token must be at least 8 characters" };
+  }
+  
+  const result = zxcvbn(token);
+  // score: 0 = too guessable, 1 = very guessable, 2 = somewhat guessable, 3 = safely unguessable, 4 = very unguessable
+  // Require at least score 2 (somewhat guessable)
+  if (result.score < 2) {
+    const feedback = result.feedback.warning || result.feedback.suggestions[0] || "Token is too weak";
+    return { valid: false, reason: feedback };
+  }
+  
+  return { valid: true };
+}
+
+function rejectWithMessage(message: string): Response {
+  const pair = new WebSocketPair();
+  const [client, server] = [pair[0], pair[1]];
+  server.accept();
+  const response: AuthResponseMessage = {
+    success: false,
+    error: message,
+    getType: () => MessageType.AuthResponse,
+  };
+  server.send(packMessage(response));
+  return new Response(null, { status: 101, webSocket: client });
+}
+
+async function handleWebsocket(request: Request, env: Env, token: string, isProvider: boolean): Promise<Response> {
   // Validate request
   if (request.headers.get("Upgrade") !== "websocket") {
     return new Response("Expected WebSocket", { status: 426 });
   }
 
   let relayId: DurableObjectId;
+  let actualToken = token;
 
   if (!isProvider) {
-    const token = env.TOKEN.get(env.TOKEN.idFromName("main"));
-    const relayStr = await token.getRelay(tokenHash);
+    const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
+    const relayStr = await tokenDO.getRelay(token);
     if (!relayStr) {
-      let pair = new WebSocketPair();
-      const [client, server] = [pair[0], pair[1]];
-      server.accept();
-      const response: AuthResponseMessage = {
-        success: false,
-        error: `invalid token (${request.url})`,
-        getType: () => MessageType.AuthResponse,
-      };
-      server.send(packMessage(response));
-      return new Response(null, { status: 101, webSocket: pair[0] });
+      return rejectWithMessage(`invalid token (${request.url})`);
     }
     relayId = env.RELAY.idFromString(relayStr);
   } else {
-    // For connector, create or get a relay based on the token
-    relayId = env.RELAY.idFromName(tokenHash);
+    // For provider: validate token complexity (except "anonymous")
+    if (token !== "anonymous") {
+      const validation = isTokenComplexEnough(token);
+      if (!validation.valid) {
+        return rejectWithMessage(validation.reason!);
+      }
+    }
+    
+    if (token === "anonymous") {
+      actualToken = crypto.randomUUID();
+    }
+    relayId = env.RELAY.idFromName(actualToken);
   }
 
   // Check if the request is from APAC region and set locationHint accordingly
@@ -84,6 +116,7 @@ async function handleWebsocket(request: Request, env: Env, tokenHash: string, is
   // Add provider/connector information to the URL for the relay
   const newUrl = new URL(request.url);
   newUrl.pathname = isProvider ? "/provider" : "/connector";
+  newUrl.searchParams.set("actualToken", actualToken);
 
   // Forward to relay
   return await relay.fetch(new Request(newUrl, request));

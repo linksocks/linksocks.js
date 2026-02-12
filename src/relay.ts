@@ -1,5 +1,6 @@
 import { DurableObject } from "cloudflare:workers";
 import type { WebSocket } from "@cloudflare/workers-types";
+import zxcvbn from "zxcvbn";
 
 import type { Env, WebsocketMeta } from "./types";
 import {
@@ -80,6 +81,20 @@ export class Relay extends DurableObject {
       .join('');
   }
 
+  private validateTokenComplexity(token: string): { valid: boolean; reason?: string } {
+    if (token.length < 8) {
+      return { valid: false, reason: "Token must be at least 8 characters" };
+    }
+    
+    const result = zxcvbn(token);
+    if (result.score < 2) {
+      const feedback = result.feedback.warning || result.feedback.suggestions[0] || "Token is too weak";
+      return { valid: false, reason: feedback };
+    }
+    
+    return { valid: true };
+  }
+
   private async saveToken(token: string) {
     const tokens = await this.storage.get('tokens') as string[] || [];
     if (!tokens.includes(token)) {
@@ -123,8 +138,11 @@ export class Relay extends DurableObject {
         // Save session data for hibernation
         server.serializeAttachment({ isProvider });
 
+        // Return the actual token for reconnection (especially for anonymous providers)
+        const actualToken = url.searchParams.get("actualToken") || "";
         const response: AuthResponseMessage = {
           success: true,
+          token: actualToken,
           getType: () => MessageType.AuthResponse,
         };
         server.send(packMessage(response));
@@ -298,6 +316,19 @@ export class Relay extends DurableObject {
               connectorMsg.connectorToken = Array.from(randomBytes)
                 .map(b => b.toString(16).padStart(2, '0'))
                 .join('');
+            } else {
+              // Validate user-provided token complexity
+              const validation = this.validateTokenComplexity(connectorMsg.connectorToken);
+              if (!validation.valid) {
+                const response: ConnectorResponseMessage = {
+                  success: false,
+                  error: validation.reason,
+                  channelId: connectorMsg.channelId,
+                  getType: () => MessageType.ConnectorResponse,
+                };
+                ws.send(packMessage(response));
+                break;
+              }
             }
 
             const tokenHash = await this.sha256(connectorMsg.connectorToken)
@@ -421,6 +452,11 @@ export class Relay extends DurableObject {
       this.providers.delete(ws);
       // Broadcast updated providers count to connectors
       this.broadcastPartnersCountToConnectors();
+      
+      // If all providers have disconnected, schedule connector token invalidation after 60s
+      if (this.providers.size === 0) {
+        await this.storage.setAlarm(Date.now() + 60 * 1000);
+      }
     } else {
       this.connectors.delete(ws);
       // Broadcast updated connectors count to providers
@@ -438,45 +474,40 @@ export class Relay extends DurableObject {
     }
   }
 
+  private async invalidateConnectorTokens() {
+    const tokens = await this.storage.get('tokens') as string[] || [];
+    
+    for (const tokenName of tokens) {
+      const tokenHash = await this.sha256(tokenName);
+      const metadata = await this.token.getRelayMetadata(tokenHash);
+      
+      if (metadata && metadata.connectorTokens) {
+        for (const connectorToken of metadata.connectorTokens) {
+          const connectorTokenHash = await this.sha256(connectorToken);
+          await this.token.deleteToken(connectorTokenHash);
+        }
+        await this.token.updateRelayMetadata(tokenHash, { connectorTokens: [] });
+      }
+    }
+
+    for (const connector of this.connectors) {
+      try {
+        connector.close(1001, 'All providers disconnected, connector token invalidated.');
+      } catch (e) {
+        // Ignore close errors
+      }
+    }
+  }
+
   async webSocketError(ws: WebSocket, error: Error) {
     console.error("WebSocket error:", error);
     this.webSocketClose(ws);
   }
 
   async alarm() {
-    // Check if we still have no providers
+    // Check if we still have no providers after 60s delay
     if (this.providers.size === 0) {
-      // 1. Delete all tokens
-      const tokens = await this.storage.get('tokens') as string[] || [];
-      for (const tokenName of tokens) {
-        const tokenHash = await this.sha256(tokenName)
-        await this.token.deleteToken(tokenHash);
-      }
-
-      // 2. Send Disconnect messages to all remaining connectors
-      for (const [channelId, connector] of this.connectorChannels.entries()) {
-        const disconnectMsg = {
-          channelId,
-          getType: () => MessageType.Disconnect,
-        };
-        try {
-          connector.send(packMessage(disconnectMsg));
-        } catch (e) {
-          // Ignore send errors since we're shutting down anyway
-        }
-      }
-
-      // 3. Disconnect all websockets
-      for (const ws of this.state.getWebSockets()) {
-        try {
-          ws.close(1001, 'No active provider in 10 min, shutting down server.');
-        } catch (e) {
-          // Ignore close errors since we're shutting down anyway
-        }
-      }
-
-      // 4. Delete all data
-      await this.storage.deleteAll();
+      await this.invalidateConnectorTokens();
     }
   }
 }

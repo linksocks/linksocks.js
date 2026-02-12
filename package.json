@@ -14,10 +14,12 @@
     "@types/pako": "^2.0.3",
     "@types/service-worker-mock": "^2.0.1",
     "@types/uuid": "^10.0.0",
+    "@types/zxcvbn": "^4.4.5",
     "wrangler": "^4.10.0"
   },
   "dependencies": {
     "pako": "^2.1.0",
-    "uuid": "^11.1.0"
+    "uuid": "^11.1.0",
+    "zxcvbn": "^4.4.2"
   }
 }
