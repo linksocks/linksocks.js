@@ -100,4 +100,81 @@ export class Token extends DurableObject {
       await this.storage.put(`relay:${relayToken}`, metadata);
     }
   }
+
+  async getStats(): Promise<GlobalStats> {
+    const now = Date.now();
+    const oneDayAgo = now - 24 * 60 * 60 * 1000;
+    
+    const storedEvents = (await this.storage.get('connectionEvents') as ConnectionEvent[]) || [];
+    const allEvents = [...storedEvents, ...this.memoryEvents];
+    const recentEvents = allEvents.filter(e => e.timestamp > oneDayAgo);
+    
+    const dailyStats = {
+      connections: recentEvents.length,
+      transferBytes: recentEvents.reduce((sum, e) => sum + e.bytes, 0)
+    };
+    
+    // Calculate current connections from all relay metadata
+    const relayTokens = await this.getAllRelayTokens();
+    let currentConnections = 0;
+    for (const token of relayTokens) {
+      const metadata = await this.getRelayMetadata(token);
+      if (metadata) {
+        currentConnections += (metadata.providerCount || 0) + (metadata.connectorCount || 0);
+      }
+    }
+    
+    return { currentConnections, dailyStats };
+  }
+
+  async reportTraffic(bytes: number) {
+    const now = Date.now();
+    
+    const existingEvent = this.memoryEvents[this.memoryEvents.length - 1];
+    if (existingEvent && now - existingEvent.timestamp < 60000) {
+      existingEvent.bytes += bytes;
+    } else {
+      this.memoryEvents.push({ timestamp: now, bytes });
+    }
+    
+    await this.scheduleAlarm();
+  }
+
+  async reportChannelCreated() {
+    const now = Date.now();
+    this.memoryEvents.push({ timestamp: now, bytes: 0 });
+    await this.scheduleAlarm();
+  }
+
+  private async scheduleAlarm() {
+    if (!this.alarmScheduled) {
+      const alarmTime = Date.now() + 5 * 60 * 1000; // 5 minutes
+      await this.storage.setAlarm(alarmTime);
+      this.alarmScheduled = true;
+    }
+  }
+
+  async alarm() {
+    await this.flushToStorage();
+  }
+
+  private async flushToStorage() {
+    if (this.memoryEvents.length > 0) {
+      const now = Date.now();
+      const oneDayAgo = now - 24 * 60 * 60 * 1000;
+      
+      const storedEvents = (await this.storage.get('connectionEvents') as ConnectionEvent[]) || [];
+      const allEvents = [...storedEvents, ...this.memoryEvents];
+      const recentEvents = allEvents.filter(e => e.timestamp > oneDayAgo);
+      
+      await this.storage.put('connectionEvents', recentEvents);
+      this.memoryEvents = [];
+    }
+    
+    this.alarmScheduled = false;
+  }
+
+  async calibrate() {
+    await this.flushToStorage();
+  }
 }
