@@ -84,6 +84,9 @@ async function handleWebsocket(request: Request, env: Env, token: string, isProv
   let relayId: DurableObjectId;
   let actualToken = token;
 
+  // sha256("anonymous") in lowercase hex
+  const ANONYMOUS_TOKEN_HASH = "2f183a4e64493af3f377f745eda502363cd3e7ef6e4d266d444758de0a85fcc8";
+
   if (!isProvider) {
     const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
     const relayStr = await tokenDO.getRelay(token);
@@ -93,14 +96,14 @@ async function handleWebsocket(request: Request, env: Env, token: string, isProv
     relayId = env.RELAY.idFromString(relayStr);
   } else {
     // For provider: validate token complexity (except "anonymous")
-    if (token !== "anonymous") {
+    if (token !== ANONYMOUS_TOKEN_HASH) {
       const validation = isTokenComplexEnough(token);
       if (!validation.valid) {
         return rejectWithMessage(validation.reason!);
       }
     }
     
-    if (token === "anonymous") {
+    if (token === ANONYMOUS_TOKEN_HASH) {
       actualToken = crypto.randomUUID();
     }
     relayId = env.RELAY.idFromName(actualToken);
