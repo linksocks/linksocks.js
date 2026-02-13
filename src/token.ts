@@ -6,18 +6,36 @@ interface RelayMetadata {
   providerCount: number;
   connectorCount: number;
   connectorTokens: string[];
+  createdAt: number;
+}
+
+interface ConnectionEvent {
+  timestamp: number;
+  bytes: number;
+}
+
+interface DailyStats {
+  connections: number;
+  transferBytes: number;
+}
+
+interface GlobalStats {
+  currentConnections: number;
+  dailyStats: DailyStats;
 }
 
 export class Token extends DurableObject {
   private state: DurableObjectState;
   protected declare env: Env;
   private storage: DurableObjectStorage;
+  private memoryEvents: ConnectionEvent[] = [];
+  private alarmScheduled: boolean = false;
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
     this.state = state;
     this.env = env;
-    this.storage = this.state.storage
+    this.storage = this.state.storage;
   }
 
   async setRelay(token: string, relayId: string) {
@@ -26,7 +44,8 @@ export class Token extends DurableObject {
       relayId,
       providerCount: 0,
       connectorCount: 0,
-      connectorTokens: []
+      connectorTokens: [],
+      createdAt: Date.now()
     };
     
     await this.storage.put(`relay:${token}`, metadata);
