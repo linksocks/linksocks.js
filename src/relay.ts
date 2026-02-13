@@ -10,6 +10,7 @@ import {
   type ConnectResponseMessage,
   type DataMessage,
   type DisconnectMessage,
+  type AuthMessage,
   type PartnersMessage,
   parseMessage,
   packMessage,
@@ -32,6 +33,9 @@ export class Relay extends DurableObject {
   private storage: DurableObjectStorage;
   private token: DurableObjectStub<Token>;
 
+  private trafficAccumulator: number = 0;
+  private lastTrafficReport: number = 0;
+
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
 
@@ -48,31 +52,62 @@ export class Relay extends DurableObject {
     this.providerChannels = new Map();
     this.connectorChannels = new Map();
 
-    // Restore existing WebSockets and their attachments
-    this.state.getWebSockets().forEach((ws) => {
-      const meta = ws.deserializeAttachment() as WebsocketMeta;
-      if (meta.isProvider) {
-        this.providers.add(ws);
-
-        // Restore provider channels
-        if (meta.channels) {
-          for (const channelId of meta.channels) {
-            this.providerChannels.set(channelId, ws);
-          }
-        }
-      } else {
-        this.connectors.add(ws);
-        // Restore connector channels
-        if (meta.channels) {
-          for (const channelId of meta.channels) {
-            this.connectorChannels.set(channelId, ws);
-          }
-        }
-      }
-    });
+    // Setup traffic reporting alarm if not exists
+    // We will use a simple interval check in webSocketMessage or similar, 
+    // but for DO, we can just report periodically if there is activity.
+    // Or just report on every N bytes to avoid too many RPC calls.
   }
 
-  
+  adminGetRuntimeInfo(): { providerCount: number; connectorCount: number; channelCount: number } {
+    // Get actual WebSocket count from DO state (survives hibernation)
+    const allWebSockets = this.state.getWebSockets();
+    let actualProviderCount = 0;
+    let actualConnectorCount = 0;
+    
+    for (const ws of allWebSockets) {
+      try {
+        const meta = ws.deserializeAttachment() as WebsocketMeta;
+        if (meta.isProvider) {
+          actualProviderCount++;
+        } else {
+          actualConnectorCount++;
+        }
+      } catch (e) {
+        // Ignore deserialization errors
+      }
+    }
+    
+    return {
+      providerCount: actualProviderCount,
+      connectorCount: actualConnectorCount,
+      channelCount: this.providerChannels.size,
+    };
+  }
+
+  adminDisconnectAll(reason: string = "Admin disconnect") {
+    const closeAll = (set: Set<WebSocket>) => {
+      for (const ws of set) {
+        try {
+          ws.close(1012, reason);
+        } catch (e) {
+          // Ignore
+        }
+      }
+    };
+
+    closeAll(this.providers);
+    closeAll(this.connectors);
+
+    this.providerChannels.clear();
+    this.connectorChannels.clear();
+    this.providers.clear();
+    this.connectors.clear();
+  }
+
+  async adminRevokeConnectorTokens() {
+    await this.invalidateConnectorTokens();
+  }
+
   private async sha256(tokenName: string): Promise<string> {
     const msgBuffer = new TextEncoder().encode(tokenName);
     const hashBuffer = await crypto.subtle.digest('SHA-256', msgBuffer);
@@ -97,20 +132,61 @@ export class Relay extends DurableObject {
 
   private async saveToken(token: string) {
     const tokens = await this.storage.get('tokens') as string[] || [];
-    if (!tokens.includes(token)) {
+    const isNewToken = !tokens.includes(token);
+    
+    if (isNewToken) {
       tokens.push(token);
       await this.storage.put('tokens', tokens);
+    }
+    
+    // Always ensure metadata exists with createdAt
+    const tokenHash = await this.sha256(token);
+    const metadata = await this.token.getRelayMetadata(tokenHash);
+    if (!metadata) {
+      await this.token.setRelay(tokenHash, this.state.id.toString());
+    } else if (!metadata.createdAt) {
+      await this.token.updateRelayMetadata(tokenHash, { createdAt: Date.now() });
     }
   }
 
   private async updateMetadata() {
     const tokens = await this.storage.get('tokens') as string[] || [];
+    
+    // Get actual WebSocket count from DO state (survives hibernation)
+    const allWebSockets = this.state.getWebSockets();
+    let actualProviderCount = 0;
+    let actualConnectorCount = 0;
+    
+    for (const ws of allWebSockets) {
+      try {
+        const meta = ws.deserializeAttachment() as WebsocketMeta;
+        if (meta.isProvider) {
+          actualProviderCount++;
+        } else {
+          actualConnectorCount++;
+        }
+      } catch (e) {
+        // Ignore deserialization errors
+      }
+    }
+    
     for (const tokenName of tokens) {
       const tokenHash = await this.sha256(tokenName);
       await this.token.updateRelayMetadata(tokenHash, {
-        providerCount: this.providers.size,
-        connectorCount: this.connectors.size
+        providerCount: actualProviderCount,
+        connectorCount: actualConnectorCount
       });
+    }
+  }
+
+  private async reportTraffic(bytes: number) {
+    this.trafficAccumulator += bytes;
+    const now = Date.now();
+    // Report if > 1MB or > 1 minute since last report
+    if (this.trafficAccumulator > 1024 * 1024 || (now - this.lastTrafficReport > 60000 && this.trafficAccumulator > 0)) {
+      await this.token.reportTraffic(this.trafficAccumulator);
+      this.trafficAccumulator = 0;
+      this.lastTrafficReport = now;
     }
   }
 
@@ -131,15 +207,26 @@ export class Relay extends DurableObject {
         // Add to providers/connectors set
         if (isProvider) {
           this.providers.add(server);
+          // If provider reconnected, cancel the alarm
+          if (this.providers.size > 0) {
+            await this.storage.delete('providerDisconnectTime');
+          }
         } else {
           this.connectors.add(server);
         }
 
-        // Save session data for hibernation
-        server.serializeAttachment({ isProvider });
-
         // Return the actual token for reconnection (especially for anonymous providers)
         const actualToken = url.searchParams.get("actualToken") || "";
+
+        // Save token and update metadata when connection is established
+        if (actualToken) {
+          await this.saveToken(actualToken);
+          await this.updateMetadata();
+        }
+
+        // Save session data for hibernation
+        server.serializeAttachment({ isProvider, actualToken } satisfies WebsocketMeta);
+
         const response: AuthResponseMessage = {
           success: true,
           token: actualToken,
@@ -199,8 +286,23 @@ export class Relay extends DurableObject {
 
   // Helper method to broadcast partners count to all connectors
   private broadcastPartnersCountToConnectors() {
+    // Get actual provider count from DO state (survives hibernation)
+    const allWebSockets = this.state.getWebSockets();
+    let actualProviderCount = 0;
+    
+    for (const ws of allWebSockets) {
+      try {
+        const meta = ws.deserializeAttachment() as WebsocketMeta;
+        if (meta.isProvider) {
+          actualProviderCount++;
+        }
+      } catch (e) {
+        // Ignore
+      }
+    }
+    
     const partnersMsg: PartnersMessage = {
-      count: this.providers.size,
+      count: actualProviderCount,
       getType: () => MessageType.Partners,
     };
     const encodedMsg = packMessage(partnersMsg);
@@ -215,8 +317,23 @@ export class Relay extends DurableObject {
 
   // Helper method to broadcast partners count to all providers
   private broadcastPartnersCountToProviders() {
+    // Get actual connector count from DO state (survives hibernation)
+    const allWebSockets = this.state.getWebSockets();
+    let actualConnectorCount = 0;
+    
+    for (const ws of allWebSockets) {
+      try {
+        const meta = ws.deserializeAttachment() as WebsocketMeta;
+        if (!meta.isProvider) {
+          actualConnectorCount++;
+        }
+      } catch (e) {
+        // Ignore
+      }
+    }
+    
     const partnersMsg: PartnersMessage = {
-      count: this.connectors.size,
+      count: actualConnectorCount,
       getType: () => MessageType.Partners,
     };
     const encodedMsg = packMessage(partnersMsg);
@@ -231,8 +348,23 @@ export class Relay extends DurableObject {
 
   // Helper method to send partners count to a specific connector
   private sendPartnersCountToConnector(connector: WebSocket) {
+    // Get actual provider count from DO state (survives hibernation)
+    const allWebSockets = this.state.getWebSockets();
+    let actualProviderCount = 0;
+    
+    for (const ws of allWebSockets) {
+      try {
+        const meta = ws.deserializeAttachment() as WebsocketMeta;
+        if (meta.isProvider) {
+          actualProviderCount++;
+        }
+      } catch (e) {
+        // Ignore
+      }
+    }
+    
     const partnersMsg: PartnersMessage = {
-      count: this.providers.size,
+      count: actualProviderCount,
       getType: () => MessageType.Partners,
     };
     try {
@@ -258,11 +390,76 @@ export class Relay extends DurableObject {
         typeof message === "string"
           ? new TextEncoder().encode(message)
           : new Uint8Array(message);
+      
+      // Report traffic (approximate size)
+      this.reportTraffic(messageData.byteLength).catch(console.error);
+
       const msg = parseMessage(messageData);
 
       const isProvider = this.providers.has(ws);
 
+      const meta = ws.deserializeAttachment() as WebsocketMeta;
+
       switch (msg.getType()) {
+        case MessageType.Auth: {
+          const authMsg = msg as AuthMessage;
+
+          // sha256("anonymous") in lowercase hex
+          const ANONYMOUS_TOKEN_HASH = "2f183a4e64493af3f377f745eda502363cd3e7ef6e4d266d444758de0a85fcc8";
+
+          const actualToken = meta.actualToken || "";
+
+          if (!actualToken) {
+            const response: AuthResponseMessage = {
+              success: false,
+              error: "Missing actual token",
+              getType: () => MessageType.AuthResponse,
+            };
+            ws.send(packMessage(response));
+            break;
+          }
+
+          // If client uses anonymous token hash, return the actual token bound to this websocket.
+          if (authMsg.token === ANONYMOUS_TOKEN_HASH) {
+            if (!isProvider) {
+              const response: AuthResponseMessage = {
+                success: false,
+                error: "Anonymous token is only allowed for providers",
+                getType: () => MessageType.AuthResponse,
+              };
+              ws.send(packMessage(response));
+              break;
+            }
+            const response: AuthResponseMessage = {
+              success: true,
+              token: actualToken,
+              getType: () => MessageType.AuthResponse,
+            };
+            ws.send(packMessage(response));
+            break;
+          }
+
+          if (authMsg.token !== actualToken) {
+            const response: AuthResponseMessage = {
+              success: false,
+              error: "Invalid token",
+              getType: () => MessageType.AuthResponse,
+            };
+            ws.send(packMessage(response));
+            break;
+          }
+
+          // For non-anonymous auth messages, we currently don't perform additional auth here.
+          // The connection is already authenticated by the entry worker.
+          const response: AuthResponseMessage = {
+            success: true,
+            token: actualToken,
+            getType: () => MessageType.AuthResponse,
+          };
+          ws.send(packMessage(response));
+          break;
+        }
+
         case MessageType.Connect: {
           if (!isProvider) {
             // Only connectors can send Connect messages
@@ -285,6 +482,9 @@ export class Relay extends DurableObject {
             const channelId = connectMsg.channelId;
             this.providerChannels.set(channelId, provider);
             this.connectorChannels.set(channelId, ws);
+
+            // Report channel creation
+            this.token.reportChannelCreated().catch(console.error);
 
             // Update metadata for both WebSockets
             const providerMeta = provider.deserializeAttachment() as WebsocketMeta;
@@ -332,6 +532,19 @@ export class Relay extends DurableObject {
             }
 
             const tokenHash = await this.sha256(connectorMsg.connectorToken)
+            
+            // Check if connector token already exists
+            const existingRelay = await this.token.getRelay(tokenHash);
+            if (existingRelay && existingRelay !== this.state.id.toString()) {
+              const response: ConnectorResponseMessage = {
+                success: false,
+                error: 'Connector token already exists, please choose a different one',
+                channelId: connectorMsg.channelId,
+                getType: () => MessageType.ConnectorResponse,
+              };
+              ws.send(packMessage(response));
+              break;
+            }
             
             // Get the relay token that created this relay
             const tokens = await this.storage.get('tokens') as string[] || [];
@@ -455,6 +668,7 @@ export class Relay extends DurableObject {
       
       // If all providers have disconnected, schedule connector token invalidation after 60s
       if (this.providers.size === 0) {
+        await this.storage.put('providerDisconnectTime', Date.now());
         await this.storage.setAlarm(Date.now() + 60 * 1000);
       }
     } else {
@@ -490,13 +704,15 @@ export class Relay extends DurableObject {
       }
     }
 
+    // Close all connector connections
     for (const connector of this.connectors) {
       try {
-        connector.close(1001, 'All providers disconnected, connector token invalidated.');
+        connector.close(1001, 'Connector tokens revoked.');
       } catch (e) {
         // Ignore close errors
       }
     }
+    this.connectors.clear();
   }
 
   async webSocketError(ws: WebSocket, error: Error) {
@@ -507,7 +723,27 @@ export class Relay extends DurableObject {
   async alarm() {
     // Check if we still have no providers after 60s delay
     if (this.providers.size === 0) {
-      await this.invalidateConnectorTokens();
+      const providerDisconnectTime = await this.storage.get('providerDisconnectTime') as number;
+      
+      // Only proceed if providers have been disconnected for at least 60 seconds
+      if (providerDisconnectTime && Date.now() - providerDisconnectTime >= 60 * 1000) {
+        // Delete all tokens (both provider and connector tokens)
+        const tokens = await this.storage.get('tokens') as string[] || [];
+        
+        for (const tokenName of tokens) {
+          const tokenHash = await this.sha256(tokenName);
+          await this.token.deleteToken(tokenHash);
+        }
+        
+        // Clear local storage
+        await this.storage.deleteAll();
+        
+        // Close all remaining connections
+        this.adminDisconnectAll('All providers disconnected, relay terminated');
+      }
+    } else {
+      // Providers reconnected, clear the disconnect time
+      await this.storage.delete('providerDisconnectTime');
     }
   }
 }
