@@ -3,6 +3,10 @@ import { gzip, ungzip } from "pako";
 // Protocol version
 export const PROTOCOL_VERSION = 0x01;
 
+function protocolMajor(v: number): number {
+  return (v >> 4) & 0x0f;
+}
+
 // Binary message types
 export const enum BinaryType {
   Auth = 0x01,
@@ -15,6 +19,9 @@ export const enum BinaryType {
   ConnectorResponse = 0x08,
   Log = 0x09,
   Partners = 0x0A,
+  DirectCapabilities = 0x0B,
+  DirectRendezvous = 0x0C,
+  DirectStatus = 0x0D,
 }
 
 // Protocol types
@@ -41,6 +48,10 @@ export const enum MessageType {
   ConnectorResponse = "connector_response",
   Log = "log",
   Partners = "partners",
+  DirectCapabilities = "direct_capabilities",
+  DirectRendezvous = "direct_rendezvous",
+  DirectStatus = "direct_status",
+  Unknown = "unknown",
 }
 
 // Compression flags
@@ -115,6 +126,46 @@ export interface LogMessage extends BaseMessage {
 
 export interface PartnersMessage extends BaseMessage {
   count: number;
+}
+
+export interface DirectCandidate {
+  addr: string;
+  port: number;
+  kind?: string;
+}
+
+export interface DirectMetrics {
+  rttMs?: number;
+  lossPpm?: number;
+  reason?: string;
+}
+
+export interface DirectCapabilitiesMessage extends BaseMessage {
+  sessionId: string;
+  candidates?: DirectCandidate[];
+  discoveries?: string[];
+  publicKey?: string;
+}
+
+export interface DirectRendezvousMessage extends BaseMessage {
+  sessionId: string;
+  candidates?: DirectCandidate[];
+  publicKey?: string;
+}
+
+export interface DirectStatusMessage extends BaseMessage {
+  sessionId: string;
+  status: string;
+  metrics?: DirectMetrics;
+}
+
+export interface UnknownMessage extends BaseMessage {
+  binaryType: number;
+}
+
+export interface ParsedMessageWithVersion {
+  message: BaseMessage;
+  version: number;
 }
 
 // Helper functions
@@ -382,19 +433,82 @@ export function packMessage(msg: BaseMessage): Uint8Array {
       return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
     }
 
+    case MessageType.DirectCapabilities: {
+      const directMsg = msg as DirectCapabilitiesMessage;
+      const payloadBody = {
+        session_id: directMsg.sessionId,
+        candidates: directMsg.candidates,
+        discoveries: directMsg.discoveries,
+        public_key: directMsg.publicKey,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.DirectCapabilities,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.DirectRendezvous: {
+      const directMsg = msg as DirectRendezvousMessage;
+      const payloadBody = {
+        session_id: directMsg.sessionId,
+        candidates: directMsg.candidates,
+        public_key: directMsg.publicKey,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.DirectRendezvous,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.DirectStatus: {
+      const directMsg = msg as DirectStatusMessage;
+      const payloadBody = {
+        session_id: directMsg.sessionId,
+        status: directMsg.status,
+        metrics: directMsg.metrics
+          ? {
+              rtt_ms: directMsg.metrics.rttMs,
+              loss_ppm: directMsg.metrics.lossPpm,
+              reason: directMsg.metrics.reason,
+            }
+          : undefined,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.DirectStatus,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
     default:
       throw new Error("Unsupported message type for binary serialization");
   }
 }
 
-export function parseMessage(data: Uint8Array): BaseMessage {
+export function parseMessageWithVersion(data: Uint8Array): ParsedMessageWithVersion {
   if (data.length < 2) {
     throw new Error("Message too short");
   }
 
   const version = data[0];
-  if (version !== PROTOCOL_VERSION) {
-    throw new Error(`Unsupported protocol version: ${version}`);
+  if (protocolMajor(version) !== protocolMajor(PROTOCOL_VERSION)) {
+    throw new Error(
+      `Unsupported protocol major version: peer=0x${version.toString(16).padStart(2, "0")} local=0x${PROTOCOL_VERSION.toString(16).padStart(2, "0")}`,
+    );
   }
 
   const msgType = data[1];
@@ -415,11 +529,14 @@ export function parseMessage(data: Uint8Array): BaseMessage {
         payload.slice(1 + tokenLen + 1, 1 + tokenLen + 1 + 16),
       );
       return {
+        version,
+        message: {
         token,
         reverse,
         instance,
         getType: () => MessageType.Auth,
-      } as AuthMessage;
+        } as AuthMessage,
+      };
     }
 
     case BinaryType.AuthResponse: {
@@ -442,7 +559,10 @@ export function parseMessage(data: Uint8Array): BaseMessage {
           msg.error = new TextDecoder().decode(payload.slice(2, 2 + strLen));
         }
       }
-      return msg;
+      return {
+        version,
+        message: msg,
+      };
     }
 
     case BinaryType.Connect: {
@@ -465,7 +585,10 @@ export function parseMessage(data: Uint8Array): BaseMessage {
         msg.address = new TextDecoder().decode(payload.slice(18, 18 + addrLen));
         msg.port = (payload[18 + addrLen] << 8) | payload[18 + addrLen + 1];
       }
-      return msg;
+      return {
+        version,
+        message: msg,
+      };
     }
 
     case BinaryType.Data: {
@@ -529,7 +652,10 @@ export function parseMessage(data: Uint8Array): BaseMessage {
         offset += targetAddrLen;
         msg.targetPort = (payload[offset] << 8) | payload[offset + 1];
       }
-      return msg;
+      return {
+        version,
+        message: msg,
+      };
     }
 
     case BinaryType.ConnectResponse: {
@@ -550,7 +676,10 @@ export function parseMessage(data: Uint8Array): BaseMessage {
         }
         msg.error = new TextDecoder().decode(payload.slice(18, 18 + errorLen));
       }
-      return msg;
+      return {
+        version,
+        message: msg,
+      };
     }
 
     case BinaryType.Disconnect: {
@@ -558,9 +687,12 @@ export function parseMessage(data: Uint8Array): BaseMessage {
         throw new Error("Invalid disconnect message");
       }
       return {
-        channelId: bytesToUUID(payload.slice(0, 16)),
-        getType: () => MessageType.Disconnect,
-      } as DisconnectMessage;
+        version,
+        message: {
+          channelId: bytesToUUID(payload.slice(0, 16)),
+          getType: () => MessageType.Disconnect,
+        } as DisconnectMessage,
+      };
     }
 
     case BinaryType.Connector: {
@@ -580,11 +712,14 @@ export function parseMessage(data: Uint8Array): BaseMessage {
       );
       const operation = bytesToOperation(payload[17 + tokenLen]);
       return {
-        channelId,
-        connectorToken,
-        operation,
-        getType: () => MessageType.Connector,
-      } as ConnectorMessage;
+        version,
+        message: {
+          channelId,
+          connectorToken,
+          operation,
+          getType: () => MessageType.Connector,
+        } as ConnectorMessage,
+      };
     }
 
     case BinaryType.ConnectorResponse: {
@@ -614,7 +749,10 @@ export function parseMessage(data: Uint8Array): BaseMessage {
           );
         }
       }
-      return msg;
+      return {
+        version,
+        message: msg,
+      };
     }
 
     case BinaryType.Log: {
@@ -628,9 +766,12 @@ export function parseMessage(data: Uint8Array): BaseMessage {
       const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
       const parsed = JSON.parse(jsonData);
       return {
-        ...parsed,
-        getType: () => MessageType.Log,
-      } as LogMessage;
+        version,
+        message: {
+          ...parsed,
+          getType: () => MessageType.Log,
+        } as LogMessage,
+      };
     }
 
     case BinaryType.Partners: {
@@ -644,12 +785,107 @@ export function parseMessage(data: Uint8Array): BaseMessage {
       const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
       const parsed = JSON.parse(jsonData);
       return {
-        ...parsed,
-        getType: () => MessageType.Partners,
-      } as PartnersMessage;
+        version,
+        message: {
+          ...parsed,
+          getType: () => MessageType.Partners,
+        } as PartnersMessage,
+      };
+    }
+
+    case BinaryType.DirectCapabilities: {
+      if (payload.length < 4) {
+        throw new Error("Invalid direct capabilities message");
+      }
+      const dataLen =
+        (payload[0] << 24) |
+        (payload[1] << 16) |
+        (payload[2] << 8) |
+        payload[3];
+      if (payload.length < 4 + dataLen) {
+        throw new Error("Invalid direct capabilities message length");
+      }
+      const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
+      const parsed = JSON.parse(jsonData);
+      return {
+        version,
+        message: {
+          sessionId: parsed.session_id,
+          candidates: parsed.candidates,
+          discoveries: parsed.discoveries,
+          publicKey: parsed.public_key,
+          getType: () => MessageType.DirectCapabilities,
+        } as DirectCapabilitiesMessage,
+      };
+    }
+
+    case BinaryType.DirectRendezvous: {
+      if (payload.length < 4) {
+        throw new Error("Invalid direct rendezvous message");
+      }
+      const dataLen =
+        (payload[0] << 24) |
+        (payload[1] << 16) |
+        (payload[2] << 8) |
+        payload[3];
+      if (payload.length < 4 + dataLen) {
+        throw new Error("Invalid direct rendezvous message length");
+      }
+      const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
+      const parsed = JSON.parse(jsonData);
+      return {
+        version,
+        message: {
+          sessionId: parsed.session_id,
+          candidates: parsed.candidates,
+          publicKey: parsed.public_key,
+          getType: () => MessageType.DirectRendezvous,
+        } as DirectRendezvousMessage,
+      };
+    }
+
+    case BinaryType.DirectStatus: {
+      if (payload.length < 4) {
+        throw new Error("Invalid direct status message");
+      }
+      const dataLen =
+        (payload[0] << 24) |
+        (payload[1] << 16) |
+        (payload[2] << 8) |
+        payload[3];
+      if (payload.length < 4 + dataLen) {
+        throw new Error("Invalid direct status message length");
+      }
+      const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
+      const parsed = JSON.parse(jsonData);
+      return {
+        version,
+        message: {
+          sessionId: parsed.session_id,
+          status: parsed.status,
+          metrics: parsed.metrics
+            ? {
+                rttMs: parsed.metrics.rtt_ms,
+                lossPpm: parsed.metrics.loss_ppm,
+                reason: parsed.metrics.reason,
+              }
+            : undefined,
+          getType: () => MessageType.DirectStatus,
+        } as DirectStatusMessage,
+      };
     }
 
     default:
-      throw new Error(`Unknown binary message type: ${msgType}`);
+      return {
+        version,
+        message: {
+          binaryType: msgType,
+          getType: () => MessageType.Unknown,
+        } as UnknownMessage,
+      };
   }
+}
+
+export function parseMessage(data: Uint8Array): BaseMessage {
+  return parseMessageWithVersion(data).message;
 }

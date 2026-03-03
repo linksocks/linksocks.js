@@ -10,7 +10,7 @@
 
 ### 客户端设置
 
-1. 从 https://github.com/zetxtech/linksocks/releases 下载 linksocks 客户端
+1. 从 https://github.com/linksocks/linksocks/releases 下载 linksocks 客户端
 2. 选择适合你系统的版本（Windows、Linux、macOS）
 3. 解压后添加到 PATH 或直接在命令行运行
 
@@ -18,7 +18,7 @@
 
 本仓库包含 Cloudflare Worker 服务端代码。你可以：
 
-1. 使用我们的公共服务器：`https://linksocks.zetx.tech`
+1. 使用我们的公共服务器：`https://l.zetx.tech`
 2. 部署自己的服务：
 
    [![部署到 Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/zetxtech/linksocks.js)
@@ -27,10 +27,10 @@
 
 ```bash
 # 步骤 1：在机器 A 上（位于你想访问的网络内）
-linksocks provider -t any_token -u linksocks.zetx.tech -c your_token
+linksocks provider -t any_token -u l.zetx.tech -c your_token
 
 # 步骤 2：在机器 B 上（你想从这里访问网络）
-linksocks connector -t your_token -u linksocks.zetx.tech -p 1180
+linksocks connector -t your_token -u l.zetx.tech -p 1180
 ```
 
 运行这两个命令后，你可以通过机器 B 上的 SOCKS5 代理（`127.0.0.1:1180`）访问内部网络。

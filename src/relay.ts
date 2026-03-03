@@ -410,6 +410,29 @@ export class Relay extends DurableObject {
           this.disconnectChannel(channelId);
           break;
         }
+
+        case MessageType.DirectCapabilities:
+        case MessageType.DirectRendezvous:
+        case MessageType.DirectStatus: {
+          if (isProvider) {
+            for (const connector of this.connectors) {
+              try {
+                connector.send(message);
+              } catch (e) {
+                // Ignore send errors
+              }
+            }
+          } else {
+            for (const provider of this.providers) {
+              try {
+                provider.send(message);
+              } catch (e) {
+                // Ignore send errors
+              }
+            }
+          }
+          break;
+        }
       }
     } catch (err) {
       console.error("Error handling message:", err);
