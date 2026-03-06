@@ -350,10 +350,22 @@ export default {
       background: transparent;
       opacity: 0.6;
     }
+
+    .metaRow:hover,
+    .cmd:hover {
       background: rgba(255,255,255,0.03);
+      border-color: rgba(255,255,255,0.12);
     }
-    a { color: rgba(255,255,255,0.9); text-decoration: none; }
-    a:hover { text-decoration: underline; }
+
+    a {
+      color: rgba(255,255,255,0.95);
+      text-decoration: none;
+    }
+    a:visited { color: rgba(255,255,255,0.92); }
+    a:hover {
+      color: #fff;
+      text-decoration: underline;
+    }
 
     @media (max-width: 860px) {
       .stats { grid-template-columns: 1fr; }
@@ -598,10 +610,30 @@ export default {
           const token = String(form.get("token") || "");
           const relayId = String(form.get("relayId") || "");
 
+          const toTokenKey = async (tokenOrKey: string): Promise<string> => {
+            const v = (tokenOrKey || "").trim();
+            if (!v) return "";
+            if (/^[0-9a-f]{64}$/i.test(v)) return v.toLowerCase();
+            return await sha256Hex(v);
+          };
+
           if (action === "deleteToken" && token) {
-            await tokenDO.deleteToken(token);
-            // Get relay ID and disconnect
-            const meta = await tokenDO.getRelayMetadata(token);
+            const key = await toTokenKey(token);
+            const meta = key ? await tokenDO.getRelayMetadata(key) : null;
+            // Best-effort: if this token is a connector token, remove it from its parent relay's connectorTokens list.
+            if (meta?.relayId && key) {
+              const all = await tokenDO.getAllRelayTokens();
+              for (const t of all) {
+                const m = await tokenDO.getRelayMetadata(t);
+                if (m?.relayId !== meta.relayId) continue;
+                if (Array.isArray(m.connectorTokens) && m.connectorTokens.includes(token)) {
+                  await tokenDO.removeConnectorToken(t, token);
+                }
+              }
+            }
+            if (key) {
+              await tokenDO.deleteToken(key);
+            }
             if (meta?.relayId) {
               const relay = env.RELAY.get(env.RELAY.idFromString(meta.relayId));
               await relay.adminDisconnectAll("Token deleted");
@@ -616,6 +648,7 @@ export default {
                 await tokenDO.deleteToken(t);
               }
             }
+            await tokenDO.markRelayDeleted(relayId);
             // Disconnect all connections for this relay
             const relay = env.RELAY.get(env.RELAY.idFromString(relayId));
             await relay.adminDisconnectAll("Token deleted");
@@ -632,13 +665,14 @@ export default {
           }
 
           if (action === "revokeConnectorToken" && token) {
-            const meta = await tokenDO.getRelayMetadata(token);
-            if (meta?.connectorTokens?.length) {
+            const key = await toTokenKey(token);
+            const meta = key ? await tokenDO.getRelayMetadata(key) : null;
+            if (key && meta?.connectorTokens?.length) {
               for (const raw of meta.connectorTokens) {
                 const h = await sha256Hex(raw);
                 await tokenDO.deleteToken(h);
               }
-              await tokenDO.updateRelayMetadata(token, { connectorTokens: [] });
+              await tokenDO.updateRelayMetadata(key, { connectorTokens: [] });
             }
           }
 
@@ -655,6 +689,7 @@ export default {
             }
             
             for (const relayId of relayIds) {
+              await tokenDO.markRelayDeleted(relayId);
               const relay = env.RELAY.get(env.RELAY.idFromString(relayId));
               await relay.adminDisconnectAll("Token deleted");
             }
@@ -692,7 +727,7 @@ export default {
               .filter(info => info !== null)
               .reduce((sum, info) => sum + (info.providerCount || 0) + (info.connectorCount || 0), 0);
 
-            await tokenDO.calibrate(totalConnections);
+            await tokenDO.calibrate();
           }
 
           return Response.redirect(`${url.origin}/admin`, 303);
@@ -1485,6 +1520,12 @@ async function handleWebsocket(request: Request, env: Env, token: string, isProv
       actualToken = crypto.randomUUID();
     }
     relayId = env.RELAY.idFromName(actualToken);
+
+    const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
+    const tombstoned = await tokenDO.isRelayDeleted(relayId.toString());
+    if (tombstoned) {
+      return rejectWithMessage("relay has been deleted");
+    }
   }
 
   // Check if the request is from APAC region and set locationHint accordingly

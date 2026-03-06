@@ -22,11 +22,18 @@ import { handleErrors } from "./common";
 import { type Token } from "./token";
 
 export class Relay extends DurableObject {
+  private static readonly PROVIDER_DISCONNECT_GRACE_MS = 60_000;
+  private static readonly TRAFFIC_FLUSH_IDLE_MS = 60_000;
+  private static readonly TRAFFIC_PERSIST_INTERVAL_MS = 500;
+  private static readonly TRAFFIC_PERSIST_BYTES_THRESHOLD = 256 * 1024;
+
   private providerChannels: Map<string, WebSocket>;
   private connectorChannels: Map<string, WebSocket>;
   private providers: Set<WebSocket>;
   private connectors: Set<WebSocket>;
   private currentProviderIndex: number;
+
+  private lastSyncAt: number = 0;
 
   private state: DurableObjectState;
   protected declare env: Env;
@@ -35,6 +42,59 @@ export class Relay extends DurableObject {
 
   private trafficAccumulator: number = 0;
   private lastTrafficReport: number = 0;
+  private trafficFlushPromise: Promise<void> | null = null;
+
+  private nextAlarmAt: number = 0;
+  private alarmArmPromise: Promise<void> = Promise.resolve();
+
+  private trafficPersistPromise: Promise<void> | null = null;
+  private lastTrafficPersistAt: number = 0;
+  private lastPersistedAccumulator: number = 0;
+
+  private async getOwnerTokenKey(): Promise<string> {
+    const v = (await this.storage.get("ownerTokenKey")) as string | undefined;
+    if (typeof v === "string" && v.trim()) return v.trim();
+    return "";
+  }
+
+  private async setOwnerTokenKeyFromActualToken(actualToken: string): Promise<void> {
+    const key = await this.toTokenKey(actualToken);
+    if (!key) return;
+    await this.storage.put("ownerTokenKey", key);
+  }
+
+  private scheduleAlarmAt(when: number): Promise<void> {
+    const target = Math.max(1, Math.floor(when));
+    const now = Date.now();
+    if (this.nextAlarmAt > now && this.nextAlarmAt <= target) return this.alarmArmPromise;
+    this.nextAlarmAt = target;
+
+    this.alarmArmPromise = this.alarmArmPromise
+      .then(() => this.storage.setAlarm(this.nextAlarmAt))
+      .catch(() => this.storage.setAlarm(this.nextAlarmAt));
+    return this.alarmArmPromise;
+  }
+
+  private persistTrafficState() {
+    const now = Date.now();
+    const deltaBytes = Math.abs(this.trafficAccumulator - this.lastPersistedAccumulator);
+    const dueByTime = now - this.lastTrafficPersistAt >= Relay.TRAFFIC_PERSIST_INTERVAL_MS;
+    const dueByBytes = deltaBytes >= Relay.TRAFFIC_PERSIST_BYTES_THRESHOLD;
+    if (!dueByTime && !dueByBytes) return;
+    if (this.trafficPersistPromise) return;
+
+    this.lastTrafficPersistAt = now;
+    this.lastPersistedAccumulator = this.trafficAccumulator;
+
+    this.trafficPersistPromise = this.storage
+      .put("trafficState", {
+        accumulator: this.trafficAccumulator,
+        lastTrafficReport: this.lastTrafficReport,
+      })
+      .finally(() => {
+        this.trafficPersistPromise = null;
+      });
+  }
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -52,31 +112,120 @@ export class Relay extends DurableObject {
     this.providerChannels = new Map();
     this.connectorChannels = new Map();
 
+    this.state.blockConcurrencyWhile(async () => {
+      const alarm = await this.storage.getAlarm();
+      if (typeof alarm === "number") this.nextAlarmAt = alarm;
+
+      const trafficState = (await this.storage.get("trafficState")) as
+        | { accumulator?: number; lastTrafficReport?: number }
+        | undefined;
+
+      if (trafficState && typeof trafficState === "object") {
+        if (typeof trafficState.accumulator === "number") this.trafficAccumulator = trafficState.accumulator;
+        if (typeof trafficState.lastTrafficReport === "number") this.lastTrafficReport = trafficState.lastTrafficReport;
+      }
+
+      if (this.trafficAccumulator > 0) {
+        await this.scheduleAlarmAt(Date.now() + Relay.TRAFFIC_FLUSH_IDLE_MS);
+      }
+    });
+
     // Setup traffic reporting alarm if not exists
     // We will use a simple interval check in webSocketMessage or similar, 
     // but for DO, we can just report periodically if there is activity.
     // Or just report on every N bytes to avoid too many RPC calls.
   }
 
-  adminGetRuntimeInfo(): { providerCount: number; connectorCount: number; channelCount: number } {
+  private safeDeserializeAttachment(ws: WebSocket): WebsocketMeta {
+    try {
+      const meta = ws.deserializeAttachment() as WebsocketMeta;
+      if (meta && typeof meta === "object") return meta;
+    } catch {
+      // Ignore
+    }
+    return {};
+  }
+
+  private syncFromState(force: boolean = false) {
+    const now = Date.now();
+    if (!force && now - this.lastSyncAt < 2000) return;
+
+    this.providers.clear();
+    this.connectors.clear();
+    this.providerChannels.clear();
+    this.connectorChannels.clear();
+
+    const providerByChannel = new Map<string, WebSocket>();
+    const connectorByChannel = new Map<string, WebSocket>();
+
+    for (const ws of this.state.getWebSockets()) {
+      const meta = this.safeDeserializeAttachment(ws);
+      const isProvider = meta.isProvider === true;
+      if (isProvider) {
+        this.providers.add(ws);
+      } else {
+        this.connectors.add(ws);
+      }
+
+      const channels = Array.isArray(meta.channels) ? meta.channels : [];
+      for (const channelId of channels) {
+        if (typeof channelId !== "string" || channelId.length === 0) continue;
+        if (isProvider) providerByChannel.set(channelId, ws);
+        else connectorByChannel.set(channelId, ws);
+      }
+    }
+
+    for (const [channelId, provider] of providerByChannel.entries()) {
+      this.providerChannels.set(channelId, provider);
+    }
+    for (const [channelId, connector] of connectorByChannel.entries()) {
+      this.connectorChannels.set(channelId, connector);
+    }
+
+    if (this.currentProviderIndex >= this.providers.size) {
+      this.currentProviderIndex = 0;
+    }
+
+    this.lastSyncAt = now;
+  }
+
+  private getActualProviderCount(): number {
+    let count = 0;
+    for (const ws of this.state.getWebSockets()) {
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.isProvider === true) count++;
+    }
+    return count;
+  }
+
+  private getActualProviderCountExcluding(exclude: WebSocket): number {
+    let count = 0;
+    for (const ws of this.state.getWebSockets()) {
+      if (ws === exclude) continue;
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.isProvider === true) count++;
+    }
+    return count;
+  }
+
+  async adminGetRuntimeInfo(): Promise<{ providerCount: number; connectorCount: number; channelCount: number }> {
+    this.syncFromState(true);
     // Get actual WebSocket count from DO state (survives hibernation)
     const allWebSockets = this.state.getWebSockets();
     let actualProviderCount = 0;
     let actualConnectorCount = 0;
     
     for (const ws of allWebSockets) {
-      try {
-        const meta = ws.deserializeAttachment() as WebsocketMeta;
-        if (meta.isProvider) {
-          actualProviderCount++;
-        } else {
-          actualConnectorCount++;
-        }
-      } catch (e) {
-        // Ignore deserialization errors
-      }
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.isProvider === true) actualProviderCount++;
+      else actualConnectorCount++;
     }
     
+    // Best-effort: if we observe no providers (e.g. the close event was missed), ensure cleanup is scheduled.
+    if (actualProviderCount === 0) {
+      await this.ensureCleanupScheduled();
+    }
+
     return {
       providerCount: actualProviderCount,
       connectorCount: actualConnectorCount,
@@ -84,19 +233,34 @@ export class Relay extends DurableObject {
     };
   }
 
-  adminDisconnectAll(reason: string = "Admin disconnect") {
-    const closeAll = (set: Set<WebSocket>) => {
-      for (const ws of set) {
-        try {
-          ws.close(1012, reason);
-        } catch (e) {
-          // Ignore
-        }
-      }
-    };
+  private async ensureCleanupScheduled() {
+    const providerDisconnectTime = (await this.storage.get('providerDisconnectTime')) as number | undefined;
+    const now = Date.now();
+    if (!providerDisconnectTime) {
+      await this.storage.put('providerDisconnectTime', now);
+      await this.scheduleAlarmAt(now + Relay.PROVIDER_DISCONNECT_GRACE_MS);
+      return;
+    }
 
-    closeAll(this.providers);
-    closeAll(this.connectors);
+    const elapsed = now - providerDisconnectTime;
+    if (elapsed < Relay.PROVIDER_DISCONNECT_GRACE_MS) {
+      await this.scheduleAlarmAt(now + (Relay.PROVIDER_DISCONNECT_GRACE_MS - elapsed));
+      return;
+    }
+
+    // Grace already elapsed, schedule immediate execution.
+    await this.scheduleAlarmAt(now);
+  }
+
+  adminDisconnectAll(reason: string = "Admin disconnect") {
+    // Use the DO-managed websocket list so this also works after hibernation.
+    for (const ws of this.state.getWebSockets()) {
+      try {
+        ws.close(1012, reason);
+      } catch {
+        // Ignore
+      }
+    }
 
     this.providerChannels.clear();
     this.connectorChannels.clear();
@@ -116,6 +280,17 @@ export class Relay extends DurableObject {
       .join('');
   }
 
+  private isSha256Hex(value: string): boolean {
+    return /^[0-9a-f]{64}$/i.test(value);
+  }
+
+  private async toTokenKey(tokenOrKey: string): Promise<string> {
+    const v = (tokenOrKey || "").trim();
+    if (!v) return "";
+    if (this.isSha256Hex(v)) return v.toLowerCase();
+    return await this.sha256(v);
+  }
+
   private validateTokenComplexity(token: string): { valid: boolean; reason?: string } {
     if (token.length < 8) {
       return { valid: false, reason: "Token must be at least 8 characters" };
@@ -130,22 +305,29 @@ export class Relay extends DurableObject {
     return { valid: true };
   }
 
-  private async saveToken(token: string) {
-    const tokens = await this.storage.get('tokens') as string[] || [];
-    const isNewToken = !tokens.includes(token);
-    
-    if (isNewToken) {
-      tokens.push(token);
-      await this.storage.put('tokens', tokens);
+  private async saveToken(tokenOrKey: string) {
+    const tokenKey = await this.toTokenKey(tokenOrKey);
+    if (!tokenKey) return;
+
+    const stored = (await this.storage.get('tokens')) as string[] | undefined;
+    const existing = Array.isArray(stored) ? stored : [];
+
+    // Canonicalize stored entries to keys (migrate older versions that stored raw tokens).
+    const keySet = new Set<string>();
+    for (const t of existing) {
+      const k = await this.toTokenKey(t);
+      if (k) keySet.add(k);
     }
-    
+    keySet.add(tokenKey);
+
+    await this.storage.put('tokens', Array.from(keySet));
+
     // Always ensure metadata exists with createdAt
-    const tokenHash = await this.sha256(token);
-    const metadata = await this.token.getRelayMetadata(tokenHash);
+    const metadata = await this.token.getRelayMetadata(tokenKey);
     if (!metadata) {
-      await this.token.setRelay(tokenHash, this.state.id.toString());
+      await this.token.setRelay(tokenKey, this.state.id.toString());
     } else if (!metadata.createdAt) {
-      await this.token.updateRelayMetadata(tokenHash, { createdAt: Date.now() });
+      await this.token.updateRelayMetadata(tokenKey, { createdAt: Date.now() });
     }
   }
 
@@ -171,23 +353,78 @@ export class Relay extends DurableObject {
     }
     
     for (const tokenName of tokens) {
-      const tokenHash = await this.sha256(tokenName);
-      await this.token.updateRelayMetadata(tokenHash, {
+      const tokenKey = await this.toTokenKey(tokenName);
+      if (!tokenKey) continue;
+      await this.token.updateRelayMetadata(tokenKey, {
         providerCount: actualProviderCount,
         connectorCount: actualConnectorCount
       });
     }
   }
 
-  private async reportTraffic(bytes: number) {
-    this.trafficAccumulator += bytes;
+  private flushTraffic(force: boolean = false): Promise<void> {
+    if (this.trafficFlushPromise) return this.trafficFlushPromise;
+
+    this.trafficFlushPromise = (async () => {
+      try {
+        while (true) {
+          const now = Date.now();
+          const bytesToReport = this.trafficAccumulator;
+
+          if (!force) {
+            const overSize = bytesToReport >= 1024 * 1024;
+            const overTime = now - this.lastTrafficReport >= Relay.TRAFFIC_FLUSH_IDLE_MS;
+            if (!overSize && !(overTime && bytesToReport > 0)) break;
+          }
+
+          if (bytesToReport <= 0) {
+            this.lastTrafficReport = now;
+            break;
+          }
+
+          // Snapshot and reset BEFORE awaiting to avoid losing bytes due to interleaving.
+          this.trafficAccumulator = 0;
+          this.lastTrafficReport = now;
+
+          try {
+            await this.token.reportTraffic(bytesToReport);
+          } catch (err) {
+            // Restore bytes so we can retry later.
+            this.trafficAccumulator += bytesToReport;
+            throw err;
+          }
+
+          if (!force) break;
+          if (this.trafficAccumulator <= 0) break;
+        }
+      } finally {
+        // Persist to avoid losing pending bytes on eviction.
+        await this.storage.put("trafficState", {
+          accumulator: this.trafficAccumulator,
+          lastTrafficReport: this.lastTrafficReport,
+        });
+      }
+    })().finally(() => {
+      this.trafficFlushPromise = null;
+    });
+
+    return this.trafficFlushPromise;
+  }
+
+  private reportTraffic(bytes: number) {
     const now = Date.now();
-    // Report if > 1MB or > 1 minute since last report
-    if (this.trafficAccumulator > 1024 * 1024 || (now - this.lastTrafficReport > 60000 && this.trafficAccumulator > 0)) {
-      await this.token.reportTraffic(this.trafficAccumulator);
-      this.trafficAccumulator = 0;
-      this.lastTrafficReport = now;
+    if (this.lastTrafficReport === 0) this.lastTrafficReport = now;
+
+    this.trafficAccumulator += bytes;
+
+    // Flush in background when threshold is reached.
+    if (this.trafficAccumulator >= 1024 * 1024 || now - this.lastTrafficReport >= Relay.TRAFFIC_FLUSH_IDLE_MS) {
+      this.flushTraffic(false).catch(console.error);
+    } else if (this.trafficAccumulator > 0) {
+      this.scheduleAlarmAt(now + Relay.TRAFFIC_FLUSH_IDLE_MS).catch(console.error);
     }
+
+    this.persistTrafficState();
   }
 
   async fetch(request: Request) {
@@ -207,10 +444,8 @@ export class Relay extends DurableObject {
         // Add to providers/connectors set
         if (isProvider) {
           this.providers.add(server);
-          // If provider reconnected, cancel the alarm
-          if (this.providers.size > 0) {
-            await this.storage.delete('providerDisconnectTime');
-          }
+          // If any provider connects, clear pending termination.
+          await this.storage.delete('providerDisconnectTime');
         } else {
           this.connectors.add(server);
         }
@@ -222,6 +457,10 @@ export class Relay extends DurableObject {
         if (actualToken) {
           await this.saveToken(actualToken);
           await this.updateMetadata();
+
+          if (isProvider) {
+            await this.setOwnerTokenKeyFromActualToken(actualToken);
+          }
         }
 
         // Save session data for hibernation
@@ -375,30 +614,35 @@ export class Relay extends DurableObject {
   }
 
   private getNextProvider(): WebSocket | null {
+    this.syncFromState();
     const providers = Array.from(this.providers);
     if (providers.length === 0) return null;
 
-    this.currentProviderIndex =
-      (this.currentProviderIndex + 1) % providers.length;
-    return providers[this.currentProviderIndex];
+    if (this.currentProviderIndex < 0 || this.currentProviderIndex >= providers.length) {
+      this.currentProviderIndex = 0;
+    }
+
+    const ws = providers[this.currentProviderIndex];
+    this.currentProviderIndex = (this.currentProviderIndex + 1) % providers.length;
+    return ws;
   }
 
   // WebSocket event handlers
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string) {
     try {
+      this.syncFromState();
       const messageData =
         typeof message === "string"
           ? new TextEncoder().encode(message)
           : new Uint8Array(message);
       
       // Report traffic (approximate size)
-      this.reportTraffic(messageData.byteLength).catch(console.error);
+      this.reportTraffic(messageData.byteLength);
 
       const msg = parseMessage(messageData);
 
-      const isProvider = this.providers.has(ws);
-
-      const meta = ws.deserializeAttachment() as WebsocketMeta;
+      const meta = this.safeDeserializeAttachment(ws);
+      const isProvider = meta.isProvider === true;
 
       switch (msg.getType()) {
         case MessageType.Auth: {
@@ -439,7 +683,8 @@ export class Relay extends DurableObject {
             break;
           }
 
-          if (authMsg.token !== actualToken) {
+          const actualTokenKey = await this.toTokenKey(actualToken);
+          if (authMsg.token !== actualToken && (!actualTokenKey || authMsg.token !== actualTokenKey)) {
             const response: AuthResponseMessage = {
               success: false,
               error: "Invalid token",
@@ -509,6 +754,44 @@ export class Relay extends DurableObject {
           if (isProvider) {
             const connectorMsg = msg as ConnectorMessage;
 
+            if (meta.actualToken) {
+              await this.setOwnerTokenKeyFromActualToken(meta.actualToken);
+            }
+
+            const op = (connectorMsg.operation || "add").toLowerCase();
+
+            // Best-effort: always bind connector tokens to the relay owner token, so admin UI can show them.
+            let ownerKey = await this.getOwnerTokenKey();
+            if (!ownerKey) {
+              const tokens = (await this.storage.get("tokens")) as string[] | undefined;
+              if (Array.isArray(tokens) && tokens.length > 0) {
+                ownerKey = await this.toTokenKey(tokens[0]);
+                if (ownerKey) {
+                  await this.storage.put("ownerTokenKey", ownerKey);
+                }
+              }
+            }
+
+            if (op === "remove") {
+              const connectorToken = (connectorMsg.connectorToken || "").trim();
+              if (ownerKey && connectorToken) {
+                await this.token.removeConnectorToken(ownerKey, connectorToken);
+              }
+              const connectorTokenKey = await this.toTokenKey(connectorToken);
+              if (connectorTokenKey) {
+                await this.token.deleteToken(connectorTokenKey);
+              }
+
+              const response: ConnectorResponseMessage = {
+                success: true,
+                channelId: connectorMsg.channelId,
+                connectorToken,
+                getType: () => MessageType.ConnectorResponse,
+              };
+              ws.send(packMessage(response));
+              break;
+            }
+
             // Generate random token if not provided
             if (!connectorMsg.connectorToken) {
               const randomBytes = new Uint8Array(8);
@@ -531,7 +814,7 @@ export class Relay extends DurableObject {
               }
             }
 
-            const tokenHash = await this.sha256(connectorMsg.connectorToken)
+            const tokenHash = await this.toTokenKey(connectorMsg.connectorToken);
             
             // Check if connector token already exists
             const existingRelay = await this.token.getRelay(tokenHash);
@@ -546,11 +829,8 @@ export class Relay extends DurableObject {
               break;
             }
             
-            // Get the relay token that created this relay
-            const tokens = await this.storage.get('tokens') as string[] || [];
-            if (tokens.length > 0) {
-              const relayTokenHash = await this.sha256(tokens[0]);
-              await this.token.addConnectorToken(relayTokenHash, connectorMsg.connectorToken);
+            if (ownerKey) {
+              await this.token.addConnectorToken(ownerKey, connectorMsg.connectorToken);
             }
             
             await this.token.setRelay(tokenHash, this.state.id.toString());
@@ -658,18 +938,25 @@ export class Relay extends DurableObject {
   }
 
   async webSocketClose(ws: WebSocket) {
-    const meta = ws.deserializeAttachment() as WebsocketMeta;
+    this.syncFromState(true);
+
+    // Flush pending bytes so short-lived traffic is not undercounted.
+    await this.flushTraffic(true).catch(console.error);
+
+    const meta = this.safeDeserializeAttachment(ws);
 
     // Remove from providers/connectors set
-    if (meta.isProvider) {
+    if (meta.isProvider === true) {
       this.providers.delete(ws);
       // Broadcast updated providers count to connectors
       this.broadcastPartnersCountToConnectors();
       
       // If all providers have disconnected, schedule connector token invalidation after 60s
-      if (this.providers.size === 0) {
+      // Note: during the close event, the closing socket can still appear in state.getWebSockets().
+      // Exclude it to avoid missing the transition to 0 providers and never scheduling the alarm.
+      if (this.getActualProviderCountExcluding(ws) === 0) {
         await this.storage.put('providerDisconnectTime', Date.now());
-        await this.storage.setAlarm(Date.now() + 60 * 1000);
+        await this.scheduleAlarmAt(Date.now() + Relay.PROVIDER_DISCONNECT_GRACE_MS);
       }
     } else {
       this.connectors.delete(ws);
@@ -692,24 +979,29 @@ export class Relay extends DurableObject {
     const tokens = await this.storage.get('tokens') as string[] || [];
     
     for (const tokenName of tokens) {
-      const tokenHash = await this.sha256(tokenName);
-      const metadata = await this.token.getRelayMetadata(tokenHash);
+      const tokenKey = await this.toTokenKey(tokenName);
+      if (!tokenKey) continue;
+      const metadata = await this.token.getRelayMetadata(tokenKey);
       
       if (metadata && metadata.connectorTokens) {
         for (const connectorToken of metadata.connectorTokens) {
-          const connectorTokenHash = await this.sha256(connectorToken);
-          await this.token.deleteToken(connectorTokenHash);
+          const connectorTokenKey = await this.toTokenKey(connectorToken);
+          if (connectorTokenKey) {
+            await this.token.deleteToken(connectorTokenKey);
+          }
         }
-        await this.token.updateRelayMetadata(tokenHash, { connectorTokens: [] });
+        await this.token.updateRelayMetadata(tokenKey, { connectorTokens: [] });
       }
     }
 
-    // Close all connector connections
-    for (const connector of this.connectors) {
+    // Close all connector connections (use DO-managed list to survive hibernation)
+    for (const ws of this.state.getWebSockets()) {
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.isProvider === true) continue;
       try {
-        connector.close(1001, 'Connector tokens revoked.');
-      } catch (e) {
-        // Ignore close errors
+        ws.close(1001, 'Connector tokens revoked.');
+      } catch {
+        // Ignore
       }
     }
     this.connectors.clear();
@@ -717,33 +1009,54 @@ export class Relay extends DurableObject {
 
   async webSocketError(ws: WebSocket, error: Error) {
     console.error("WebSocket error:", error);
-    this.webSocketClose(ws);
+    await this.webSocketClose(ws);
   }
 
   async alarm() {
-    // Check if we still have no providers after 60s delay
-    if (this.providers.size === 0) {
-      const providerDisconnectTime = await this.storage.get('providerDisconnectTime') as number;
-      
-      // Only proceed if providers have been disconnected for at least 60 seconds
-      if (providerDisconnectTime && Date.now() - providerDisconnectTime >= 60 * 1000) {
-        // Delete all tokens (both provider and connector tokens)
-        const tokens = await this.storage.get('tokens') as string[] || [];
-        
-        for (const tokenName of tokens) {
-          const tokenHash = await this.sha256(tokenName);
-          await this.token.deleteToken(tokenHash);
-        }
-        
-        // Clear local storage
-        await this.storage.deleteAll();
-        
-        // Close all remaining connections
-        this.adminDisconnectAll('All providers disconnected, relay terminated');
-      }
-    } else {
-      // Providers reconnected, clear the disconnect time
+    this.syncFromState(true);
+
+    await this.flushTraffic(true).catch(console.error);
+
+    const providerCount = this.getActualProviderCount();
+    if (providerCount > 0) {
       await this.storage.delete('providerDisconnectTime');
+      return;
     }
+
+    const providerDisconnectTime = (await this.storage.get('providerDisconnectTime')) as number | undefined;
+    if (!providerDisconnectTime) return;
+
+    // Only proceed if providers have been disconnected for at least 60 seconds.
+    const elapsed = Date.now() - providerDisconnectTime;
+    const minWaitMs = Relay.PROVIDER_DISCONNECT_GRACE_MS;
+    if (elapsed < minWaitMs) {
+      // Ensure we run again once the minimum wait has elapsed.
+      await this.scheduleAlarmAt(Date.now() + (minWaitMs - elapsed));
+      return;
+    }
+
+    // Delete all tokens (both provider and connector tokens)
+    const tokens = (await this.storage.get('tokens')) as string[] || [];
+    for (const tokenName of tokens) {
+      const tokenKey = await this.toTokenKey(tokenName);
+      if (!tokenKey) continue;
+
+      await this.token.deleteToken(tokenKey);
+
+      // Clean up legacy double-hash entries (older versions hashed keys again).
+      if (this.isSha256Hex(tokenKey)) {
+        const doubleHashKey = await this.sha256(tokenKey);
+        const meta = await this.token.getRelayMetadata(doubleHashKey);
+        if (meta?.relayId === this.state.id.toString()) {
+          await this.token.deleteToken(doubleHashKey);
+        }
+      }
+    }
+
+    // Clear local storage
+    await this.storage.deleteAll();
+
+    // Close all remaining connections
+    this.adminDisconnectAll('All providers disconnected, relay terminated');
   }
 }
