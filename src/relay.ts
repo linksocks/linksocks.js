@@ -24,6 +24,7 @@ import { type Token } from "./token";
 
 export class Relay extends DurableObject {
   private static readonly PROVIDER_DISCONNECT_GRACE_MS = 60_000;
+  private static readonly CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS = 100;
   private static readonly TRAFFIC_FLUSH_IDLE_MS = 60_000;
   private static readonly TRAFFIC_PERSIST_INTERVAL_MS = 500;
   private static readonly TRAFFIC_PERSIST_BYTES_THRESHOLD = 256 * 1024;
@@ -1046,6 +1047,30 @@ export class Relay extends DurableObject {
     this.connectors.clear();
   }
 
+  private notifyConnectorsRelayTermination(): number {
+    const msg: LogMessage = {
+      level: "warn",
+      msg: `All providers in this relay group have been offline for more than ${Math.floor(Relay.PROVIDER_DISCONNECT_GRACE_MS / 1000)} seconds. This relay is terminating and all connector tokens in this group will be revoked. Please wait for a provider to reconnect and use a new connector token.`,
+      getType: () => MessageType.Log,
+    };
+
+    const encodedMsg = packMessage(msg);
+    let notified = 0;
+
+    for (const ws of this.state.getWebSockets()) {
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.isProvider === true) continue;
+      try {
+        ws.send(encodedMsg);
+        notified++;
+      } catch {
+        // Ignore send errors
+      }
+    }
+
+    return notified;
+  }
+
   async webSocketError(ws: WebSocket, error: Error) {
     console.error("WebSocket error:", error);
     await this.webSocketClose(ws);
@@ -1072,6 +1097,11 @@ export class Relay extends DurableObject {
       // Ensure we run again once the minimum wait has elapsed.
       await this.scheduleAlarmAt(Date.now() + (minWaitMs - elapsed));
       return;
+    }
+
+    const notifiedConnectors = this.notifyConnectorsRelayTermination();
+    if (notifiedConnectors > 0) {
+      await new Promise((resolve) => setTimeout(resolve, Relay.CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS));
     }
 
     // Delete all tokens (both provider and connector tokens)
