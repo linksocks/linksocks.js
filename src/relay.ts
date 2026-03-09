@@ -19,6 +19,7 @@ import {
   LogMessage,
 } from "./message";
 import { handleErrors } from "./common";
+import { describeCloudflareColo } from "./colo";
 import { type Token } from "./token";
 
 export class Relay extends DurableObject {
@@ -194,6 +195,15 @@ export class Relay extends DurableObject {
     for (const ws of this.state.getWebSockets()) {
       const meta = this.safeDeserializeAttachment(ws);
       if (meta.isProvider === true) count++;
+    }
+    return count;
+  }
+
+  private getActualConnectorCount(): number {
+    let count = 0;
+    for (const ws of this.state.getWebSockets()) {
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.isProvider !== true) count++;
     }
     return count;
   }
@@ -466,6 +476,9 @@ export class Relay extends DurableObject {
         // Save session data for hibernation
         server.serializeAttachment({ isProvider, actualToken } satisfies WebsocketMeta);
 
+        const currentProviders = this.getActualProviderCount();
+        const currentConnectors = this.getActualConnectorCount();
+
         const response: AuthResponseMessage = {
           success: true,
           token: actualToken,
@@ -473,34 +486,18 @@ export class Relay extends DurableObject {
         };
         server.send(packMessage(response));
 
-        // Fetch IP address from ipv4.ip.sb
-        fetch('https://ipinfo.io/ip')
-          .then(res => {
-            if (!res.ok) {
-              throw new Error(`Failed to retrieve IP: status ${res.status}`);
-            }
-            return res.text();
-          })
-          .then(ip => {
-            const colo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
-            const country = request.cf && request.cf.country ? String(request.cf.country) : 'unknown';
-            const log: LogMessage = {
-              level: "info",
-              msg: `Welcome to LinkSocks.js server (colo = ${colo}, country = ${country}, ip = ${ip.trim()})`,
-              getType: () => MessageType.Log,
-            };
-            server.send(packMessage(log));
-          })
-          .catch(err => {
-            const colo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
-            const country = request.cf && request.cf.country ? String(request.cf.country) : 'unknown';
-            const log: LogMessage = {
-              level: "info",
-              msg: `Welcome to LinkSocks.js server (colo = ${colo}, country = ${country}, ip = failed to retrieve: ${err})`,
-              getType: () => MessageType.Log,
-            };
-            server.send(packMessage(log));
-          });
+        const relayColo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
+        const relayColoDescription = describeCloudflareColo(relayColo);
+        const clientCountry = request.headers.get('CF-IPCountry') || (request.cf && request.cf.country ? String(request.cf.country) : 'unknown');
+        const clientIp = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
+        const providerLabel = currentProviders === 1 ? 'provider' : 'providers';
+        const connectorLabel = currentConnectors === 1 ? 'connector' : 'connectors';
+        const log: LogMessage = {
+          level: "info",
+          msg: `Welcome to LinkSocks.js relay server. This server is running in datacenter: ${relayColoDescription}. Your connection comes from ${clientCountry} (${clientIp}). After you connected, this relay group has ${currentProviders} ${providerLabel} and ${currentConnectors} ${connectorLabel}.`,
+          getType: () => MessageType.Log,
+        };
+        server.send(packMessage(log));
 
         // Send partners count after auth response
         if (isProvider) {
