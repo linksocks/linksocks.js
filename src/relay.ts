@@ -27,6 +27,7 @@ export class Relay extends DurableObject {
   private static readonly TRAFFIC_FLUSH_IDLE_MS = 60_000;
   private static readonly TRAFFIC_PERSIST_INTERVAL_MS = 500;
   private static readonly TRAFFIC_PERSIST_BYTES_THRESHOLD = 256 * 1024;
+  private static readonly DEFAULT_CONNECTOR_WAIT_PROVIDER_MS = 5_000;
 
   private providerChannels: Map<string, WebSocket>;
   private connectorChannels: Map<string, WebSocket>;
@@ -610,8 +611,8 @@ export class Relay extends DurableObject {
     }
   }
 
-  private getNextProvider(): WebSocket | null {
-    this.syncFromState();
+  private getNextProvider(forceSync: boolean = false): WebSocket | null {
+    this.syncFromState(forceSync);
     const providers = Array.from(this.providers);
     if (providers.length === 0) return null;
 
@@ -622,6 +623,24 @@ export class Relay extends DurableObject {
     const ws = providers[this.currentProviderIndex];
     this.currentProviderIndex = (this.currentProviderIndex + 1) % providers.length;
     return ws;
+  }
+
+  private async waitForNextProvider(timeoutMs: number): Promise<WebSocket | null> {
+    let provider = this.getNextProvider(true);
+    if (provider || timeoutMs <= 0) {
+      return provider;
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      provider = this.getNextProvider(true);
+      if (provider) {
+        return provider;
+      }
+    }
+
+    return null;
   }
 
   // WebSocket event handlers
@@ -708,7 +727,7 @@ export class Relay extends DurableObject {
             const connectMsg = msg as ConnectMessage;
             
             // Get round-robin provider
-            const provider = this.getNextProvider();
+            const provider = await this.waitForNextProvider(Relay.DEFAULT_CONNECTOR_WAIT_PROVIDER_MS);
             if (!provider) {
               const response: ConnectResponseMessage = {
                 success: false,
