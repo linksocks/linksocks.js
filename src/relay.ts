@@ -50,6 +50,8 @@ export class Relay extends DurableObject {
   private nextAlarmAt: number = 0;
   private alarmArmPromise: Promise<void> = Promise.resolve();
 
+  private ownColo: string | null = null;
+
   private trafficPersistPromise: Promise<void> | null = null;
   private lastTrafficPersistAt: number = 0;
   private lastPersistedAccumulator: number = 0;
@@ -137,6 +139,19 @@ export class Relay extends DurableObject {
     // We will use a simple interval check in webSocketMessage or similar, 
     // but for DO, we can just report periodically if there is activity.
     // Or just report on every N bytes to avoid too many RPC calls.
+  }
+
+  private async getOwnColo(): Promise<string> {
+    if (this.ownColo) return this.ownColo;
+    try {
+      const resp = await fetch('https://1.1.1.1/cdn-cgi/trace');
+      const text = await resp.text();
+      const match = text.match(/^colo=(.+)$/m);
+      this.ownColo = match ? match[1].trim() : 'unknown';
+    } catch {
+      this.ownColo = 'unknown';
+    }
+    return this.ownColo;
   }
 
   private safeDeserializeAttachment(ws: WebSocket): WebsocketMeta {
@@ -488,15 +503,23 @@ export class Relay extends DurableObject {
         };
         server.send(packMessage(response));
 
-        const relayColo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
-        const relayColoDescription = describeCloudflareColo(relayColo);
+        const edgeColo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
+        const edgeColoDescription = describeCloudflareColo(edgeColo);
+        const doColo = await this.getOwnColo();
+        const doColoDescription = describeCloudflareColo(doColo);
         const clientCountry = request.headers.get('CF-IPCountry') || (request.cf && request.cf.country ? String(request.cf.country) : 'unknown');
         const clientIp = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
         const providerLabel = currentProviders === 1 ? 'provider' : 'providers';
         const connectorLabel = currentConnectors === 1 ? 'connector' : 'connectors';
+        let datacenterInfo: string;
+        if (edgeColo === doColo) {
+          datacenterInfo = `datacenter: ${edgeColoDescription}`;
+        } else {
+          datacenterInfo = `edge: ${edgeColoDescription}, relay: ${doColoDescription}`;
+        }
         const log: LogMessage = {
           level: "info",
-          msg: `Welcome to LinkSocks.js relay server. This server is running in datacenter: ${relayColoDescription}. Your connection comes from ${clientCountry} (${clientIp}). After you connected, this relay group has ${currentProviders} ${providerLabel} and ${currentConnectors} ${connectorLabel}.`,
+          msg: `Welcome to LinkSocks.js relay server. This server is running in ${datacenterInfo}. Your connection comes from ${clientCountry} (${clientIp}). After you connected, this relay group has ${currentProviders} ${providerLabel} and ${currentConnectors} ${connectorLabel}.`,
           getType: () => MessageType.Log,
         };
         server.send(packMessage(log));
