@@ -275,17 +275,23 @@ export default {
       border: 1px solid rgba(255,255,255,0.12);
       background: rgba(255,255,255,0.06);
       color: rgba(255,255,255,0.9);
-      padding: 6px 12px;
+      padding: 0 12px;
       border-radius: 8px;
       font-size: 11.5px;
+      line-height: 1;
       font-weight: 600;
       cursor: pointer;
       user-select: none;
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
       flex-shrink: 0;
       transition: all 0.2s;
       white-space: nowrap;
       min-width: 48px;
+      height: 27px;
       text-align: center;
+      position: relative;
     }
     .copyBtn:hover {
       background: rgba(255,255,255,0.15);
@@ -296,6 +302,21 @@ export default {
     .copyBtn.copied {
       border-color: rgba(34,197,94,0.45);
       background: rgba(34,197,94,0.16);
+      color: transparent;
+    }
+    .copyBtn.copied::after {
+      content: "";
+      position: absolute;
+      width: 10px;
+      height: 6px;
+      border-left: 2px solid #fff;
+      border-bottom: 2px solid #fff;
+      transform: rotate(-45deg);
+      transform-origin: center;
+    }
+    .copyBtn.copyFailed {
+      border-color: rgba(251,113,133,0.45);
+      background: rgba(251,113,133,0.14);
       color: #fff;
     }
 
@@ -472,8 +493,9 @@ export default {
         const previousLabel = btn.getAttribute('data-aria-label') || btn.getAttribute('aria-label') || 'Copy';
         btn.setAttribute('data-label', previous);
         btn.setAttribute('data-aria-label', previousLabel);
-        btn.textContent = ok ? '✓' : 'Failed';
+        btn.textContent = ok ? previous : 'Failed';
         btn.classList.toggle('copied', ok);
+        btn.classList.toggle('copyFailed', !ok);
         btn.setAttribute('aria-label', ok ? 'Copied' : 'Copy failed');
 
         const existingTimer = timers.get(btn);
@@ -481,6 +503,7 @@ export default {
         timers.set(btn, setTimeout(() => {
           btn.textContent = btn.getAttribute('data-label') || 'Copy';
           btn.classList.remove('copied');
+          btn.classList.remove('copyFailed');
           btn.setAttribute('aria-label', btn.getAttribute('data-aria-label') || 'Copy');
           timers.delete(btn);
         }, 1200));
@@ -656,14 +679,7 @@ export default {
           }
 
           if (action === "deleteRelayTokens" && relayId) {
-            const all = await tokenDO.getAllRelayTokens();
-            for (const t of all) {
-              const meta = await tokenDO.getRelayMetadata(t);
-              if (meta?.relayId === relayId) {
-                await tokenDO.deleteToken(t);
-              }
-            }
-            await tokenDO.markRelayDeleted(relayId);
+            await tokenDO.deleteRelay(relayId);
             // Disconnect all connections for this relay
             const relay = env.RELAY.get(env.RELAY.idFromString(relayId));
             await relay.adminDisconnectAll("Token deleted");
@@ -692,22 +708,8 @@ export default {
           }
 
           if (action === "clearAllRelays") {
-            const all = await tokenDO.getAllRelayTokens();
-            const relayIds = new Set<string>();
-            
-            for (const t of all) {
-              const meta = await tokenDO.getRelayMetadata(t);
-              if (meta?.relayId) {
-                relayIds.add(meta.relayId);
-              }
-              await tokenDO.deleteToken(t);
-            }
-            
-            for (const relayId of relayIds) {
-              await tokenDO.markRelayDeleted(relayId);
-              const relay = env.RELAY.get(env.RELAY.idFromString(relayId));
-              await relay.adminDisconnectAll("Token deleted");
-            }
+            const relayIds = await tokenDO.clearAllRelays();
+            ctx.waitUntil(disconnectRelaysInBackground(env, relayIds, "Token deleted"));
           }
 
           if (action === "calibrateStats") {
@@ -1557,4 +1559,19 @@ async function handleWebsocket(request: Request, env: Env, token: string, isProv
 
   // Forward to relay
   return await relay.fetch(new Request(newUrl, request));
+}
+
+async function disconnectRelaysInBackground(env: Env, relayIds: string[], reason: string): Promise<void> {
+  const uniqueRelayIds = Array.from(new Set(relayIds.filter((relayId) => relayId.trim())));
+  const concurrency = 16;
+
+  for (let i = 0; i < uniqueRelayIds.length; i += concurrency) {
+    const batch = uniqueRelayIds.slice(i, i + concurrency);
+    await Promise.allSettled(
+      batch.map(async (relayId) => {
+        const relay = env.RELAY.get(env.RELAY.idFromString(relayId));
+        await relay.adminDisconnectAll(reason);
+      }),
+    );
+  }
 }

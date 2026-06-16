@@ -113,6 +113,39 @@ export class Token extends DurableObject {
     await this.markRelayDeleted(id);
   }
 
+  async clearAllRelays(): Promise<string[]> {
+    const listed = await this.storage.list({ prefix: "relay:" });
+    const relayIds = new Set<string>();
+    const keysToDelete: string[] = [];
+
+    for (const [key, value] of listed.entries()) {
+      if (typeof key !== "string") continue;
+      keysToDelete.push(key);
+
+      const metadata = value as RelayMetadata | null;
+      if (metadata?.relayId) {
+        relayIds.add(metadata.relayId);
+      }
+    }
+
+    for (let i = 0; i < keysToDelete.length; i += 128) {
+      await this.storage.delete(keysToDelete.slice(i, i + 128));
+    }
+
+    await this.storage.put('relayTokens', []);
+    await this.storage.put("relayTokensRepaired", true);
+
+    const now = Date.now();
+    const raw = (await this.storage.get("revokedRelays")) as RevokedRelayMap | undefined;
+    const map: RevokedRelayMap = raw && typeof raw === "object" ? { ...raw } : {};
+    for (const relayId of relayIds) {
+      map[relayId] = now;
+    }
+    await this.storage.put("revokedRelays", map);
+
+    return Array.from(relayIds);
+  }
+
   async getRelayOldestCreatedAt(relayId: string): Promise<number | null> {
     const id = (relayId || "").trim();
     if (!id) return null;
