@@ -19,13 +19,16 @@ import {
   LogMessage,
 } from "./message";
 import { handleErrors } from "./common";
+import { describeCloudflareColo } from "./colo";
 import { type Token } from "./token";
 
 export class Relay extends DurableObject {
   private static readonly PROVIDER_DISCONNECT_GRACE_MS = 60_000;
+  private static readonly CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS = 100;
   private static readonly TRAFFIC_FLUSH_IDLE_MS = 60_000;
   private static readonly TRAFFIC_PERSIST_INTERVAL_MS = 500;
   private static readonly TRAFFIC_PERSIST_BYTES_THRESHOLD = 256 * 1024;
+  private static readonly DEFAULT_CONNECTOR_WAIT_PROVIDER_MS = 5_000;
 
   private providerChannels: Map<string, WebSocket>;
   private connectorChannels: Map<string, WebSocket>;
@@ -46,6 +49,8 @@ export class Relay extends DurableObject {
 
   private nextAlarmAt: number = 0;
   private alarmArmPromise: Promise<void> = Promise.resolve();
+
+  private ownColo: string | null = null;
 
   private trafficPersistPromise: Promise<void> | null = null;
   private lastTrafficPersistAt: number = 0;
@@ -136,6 +141,19 @@ export class Relay extends DurableObject {
     // Or just report on every N bytes to avoid too many RPC calls.
   }
 
+  private async getOwnColo(): Promise<string> {
+    if (this.ownColo) return this.ownColo;
+    try {
+      const resp = await fetch('https://1.1.1.1/cdn-cgi/trace');
+      const text = await resp.text();
+      const match = text.match(/^colo=(.+)$/m);
+      this.ownColo = match ? match[1].trim() : 'unknown';
+    } catch {
+      this.ownColo = 'unknown';
+    }
+    return this.ownColo;
+  }
+
   private safeDeserializeAttachment(ws: WebSocket): WebsocketMeta {
     try {
       const meta = ws.deserializeAttachment() as WebsocketMeta;
@@ -194,6 +212,15 @@ export class Relay extends DurableObject {
     for (const ws of this.state.getWebSockets()) {
       const meta = this.safeDeserializeAttachment(ws);
       if (meta.isProvider === true) count++;
+    }
+    return count;
+  }
+
+  private getActualConnectorCount(): number {
+    let count = 0;
+    for (const ws of this.state.getWebSockets()) {
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.isProvider !== true) count++;
     }
     return count;
   }
@@ -474,6 +501,9 @@ export class Relay extends DurableObject {
         // Save session data for hibernation
         server.serializeAttachment({ isProvider, actualToken } satisfies WebsocketMeta);
 
+        const currentProviders = this.getActualProviderCount();
+        const currentConnectors = this.getActualConnectorCount();
+
         const response: AuthResponseMessage = {
           success: true,
           token: actualToken,
@@ -481,34 +511,26 @@ export class Relay extends DurableObject {
         };
         server.send(packMessage(response));
 
-        // Fetch IP address from ipv4.ip.sb
-        fetch('https://ipinfo.io/ip')
-          .then(res => {
-            if (!res.ok) {
-              throw new Error(`Failed to retrieve IP: status ${res.status}`);
-            }
-            return res.text();
-          })
-          .then(ip => {
-            const colo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
-            const country = request.cf && request.cf.country ? String(request.cf.country) : 'unknown';
-            const log: LogMessage = {
-              level: "info",
-              msg: `Welcome to LinkSocks.js server (colo = ${colo}, country = ${country}, ip = ${ip.trim()})`,
-              getType: () => MessageType.Log,
-            };
-            server.send(packMessage(log));
-          })
-          .catch(err => {
-            const colo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
-            const country = request.cf && request.cf.country ? String(request.cf.country) : 'unknown';
-            const log: LogMessage = {
-              level: "info",
-              msg: `Welcome to LinkSocks.js server (colo = ${colo}, country = ${country}, ip = failed to retrieve: ${err})`,
-              getType: () => MessageType.Log,
-            };
-            server.send(packMessage(log));
-          });
+        const edgeColo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
+        const edgeColoDescription = describeCloudflareColo(edgeColo);
+        const doColo = await this.getOwnColo();
+        const doColoDescription = describeCloudflareColo(doColo);
+        const clientCountry = request.headers.get('CF-IPCountry') || (request.cf && request.cf.country ? String(request.cf.country) : 'unknown');
+        const clientIp = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
+        const providerLabel = currentProviders === 1 ? 'provider' : 'providers';
+        const connectorLabel = currentConnectors === 1 ? 'connector' : 'connectors';
+        let datacenterInfo: string;
+        if (edgeColo === doColo) {
+          datacenterInfo = `datacenter: ${edgeColoDescription}`;
+        } else {
+          datacenterInfo = `edge: ${edgeColoDescription}, relay: ${doColoDescription}`;
+        }
+        const log: LogMessage = {
+          level: "info",
+          msg: `Welcome to LinkSocks.js relay server. This server is running in ${datacenterInfo}. Your connection comes from ${clientCountry} (${clientIp}). After you connected, this relay group has ${currentProviders} ${providerLabel} and ${currentConnectors} ${connectorLabel}.`,
+          getType: () => MessageType.Log,
+        };
+        server.send(packMessage(log));
 
         // Send partners count after auth response
         if (isProvider) {
@@ -621,8 +643,8 @@ export class Relay extends DurableObject {
     }
   }
 
-  private getNextProvider(): WebSocket | null {
-    this.syncFromState();
+  private getNextProvider(forceSync: boolean = false): WebSocket | null {
+    this.syncFromState(forceSync);
     const providers = Array.from(this.providers);
     if (providers.length === 0) return null;
 
@@ -633,6 +655,24 @@ export class Relay extends DurableObject {
     const ws = providers[this.currentProviderIndex];
     this.currentProviderIndex = (this.currentProviderIndex + 1) % providers.length;
     return ws;
+  }
+
+  private async waitForNextProvider(timeoutMs: number): Promise<WebSocket | null> {
+    let provider = this.getNextProvider(true);
+    if (provider || timeoutMs <= 0) {
+      return provider;
+    }
+
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 100));
+      provider = this.getNextProvider(true);
+      if (provider) {
+        return provider;
+      }
+    }
+
+    return null;
   }
 
   // WebSocket event handlers
@@ -719,7 +759,7 @@ export class Relay extends DurableObject {
             const connectMsg = msg as ConnectMessage;
             
             // Get round-robin provider
-            const provider = this.getNextProvider();
+            const provider = await this.waitForNextProvider(Relay.DEFAULT_CONNECTOR_WAIT_PROVIDER_MS);
             if (!provider) {
               const response: ConnectResponseMessage = {
                 success: false,
@@ -911,6 +951,29 @@ export class Relay extends DurableObject {
           this.disconnectChannel(channelId);
           break;
         }
+
+        case MessageType.DirectCapabilities:
+        case MessageType.DirectRendezvous:
+        case MessageType.DirectStatus: {
+          if (isProvider) {
+            for (const connector of this.connectors) {
+              try {
+                connector.send(message);
+              } catch (e) {
+                // Ignore send errors
+              }
+            }
+          } else {
+            for (const provider of this.providers) {
+              try {
+                provider.send(message);
+              } catch (e) {
+                // Ignore send errors
+              }
+            }
+          }
+          break;
+        }
       }
     } catch (err) {
       console.error("Error handling message:", err);
@@ -1037,6 +1100,30 @@ export class Relay extends DurableObject {
     await this.token.deleteRelay(relayId);
   }
 
+  private notifyConnectorsRelayTermination(): number {
+    const msg: LogMessage = {
+      level: "warn",
+      msg: `All providers in this relay group have been offline for more than ${Math.floor(Relay.PROVIDER_DISCONNECT_GRACE_MS / 1000)} seconds. This relay is terminating and all connector tokens in this group will be revoked. Please wait for a provider to reconnect and use a new connector token.`,
+      getType: () => MessageType.Log,
+    };
+
+    const encodedMsg = packMessage(msg);
+    let notified = 0;
+
+    for (const ws of this.state.getWebSockets()) {
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.isProvider === true) continue;
+      try {
+        ws.send(encodedMsg);
+        notified++;
+      } catch {
+        // Ignore send errors
+      }
+    }
+
+    return notified;
+  }
+
   async webSocketError(ws: WebSocket, error: Error) {
     console.error("WebSocket error:", error);
     await this.webSocketClose(ws);
@@ -1063,6 +1150,11 @@ export class Relay extends DurableObject {
       // Ensure we run again once the minimum wait has elapsed.
       await this.scheduleAlarmAt(Date.now() + (minWaitMs - elapsed));
       return;
+    }
+
+    const notifiedConnectors = this.notifyConnectorsRelayTermination();
+    if (notifiedConnectors > 0) {
+      await new Promise((resolve) => setTimeout(resolve, Relay.CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS));
     }
 
     await this.deleteRelayRecords();
