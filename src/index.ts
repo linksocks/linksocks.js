@@ -307,11 +307,13 @@ export default {
     .copyBtn.copied::after {
       content: "";
       position: absolute;
+      left: 50%;
+      top: 50%;
       width: 10px;
       height: 6px;
       border-left: 2px solid #fff;
       border-bottom: 2px solid #fff;
-      transform: rotate(-45deg);
+      transform: translate(-50%, -60%) rotate(-45deg);
       transform-origin: center;
     }
     .copyBtn.copyFailed {
