@@ -237,8 +237,16 @@ export class Relay extends DurableObject {
     const providerDisconnectTime = (await this.storage.get('providerDisconnectTime')) as number | undefined;
     const now = Date.now();
     if (!providerDisconnectTime) {
-      await this.storage.put('providerDisconnectTime', now);
-      await this.scheduleAlarmAt(now + Relay.PROVIDER_DISCONNECT_GRACE_MS);
+      const hasNoWebSockets = this.state.getWebSockets().length === 0;
+      const oldestCreatedAt = hasNoWebSockets
+        ? await this.token.getRelayOldestCreatedAt(this.state.id.toString())
+        : null;
+      const cleanupStartAt = oldestCreatedAt && oldestCreatedAt < now ? oldestCreatedAt : now;
+      await this.storage.put('providerDisconnectTime', cleanupStartAt);
+      const elapsed = now - cleanupStartAt;
+      await this.scheduleAlarmAt(elapsed >= Relay.PROVIDER_DISCONNECT_GRACE_MS
+        ? now
+        : now + (Relay.PROVIDER_DISCONNECT_GRACE_MS - elapsed));
       return;
     }
 
@@ -1007,6 +1015,28 @@ export class Relay extends DurableObject {
     this.connectors.clear();
   }
 
+  private async deleteRelayRecords() {
+    const relayId = this.state.id.toString();
+    const tokens = (await this.storage.get('tokens')) as string[] || [];
+
+    for (const tokenName of tokens) {
+      const tokenKey = await this.toTokenKey(tokenName);
+      if (!tokenKey) continue;
+
+      await this.token.deleteToken(tokenKey);
+
+      if (this.isSha256Hex(tokenKey)) {
+        const doubleHashKey = await this.sha256(tokenKey);
+        const meta = await this.token.getRelayMetadata(doubleHashKey);
+        if (meta?.relayId === relayId) {
+          await this.token.deleteToken(doubleHashKey);
+        }
+      }
+    }
+
+    await this.token.deleteRelay(relayId);
+  }
+
   async webSocketError(ws: WebSocket, error: Error) {
     console.error("WebSocket error:", error);
     await this.webSocketClose(ws);
@@ -1035,23 +1065,7 @@ export class Relay extends DurableObject {
       return;
     }
 
-    // Delete all tokens (both provider and connector tokens)
-    const tokens = (await this.storage.get('tokens')) as string[] || [];
-    for (const tokenName of tokens) {
-      const tokenKey = await this.toTokenKey(tokenName);
-      if (!tokenKey) continue;
-
-      await this.token.deleteToken(tokenKey);
-
-      // Clean up legacy double-hash entries (older versions hashed keys again).
-      if (this.isSha256Hex(tokenKey)) {
-        const doubleHashKey = await this.sha256(tokenKey);
-        const meta = await this.token.getRelayMetadata(doubleHashKey);
-        if (meta?.relayId === this.state.id.toString()) {
-          await this.token.deleteToken(doubleHashKey);
-        }
-      }
-    }
+    await this.deleteRelayRecords();
 
     // Clear local storage
     await this.storage.deleteAll();

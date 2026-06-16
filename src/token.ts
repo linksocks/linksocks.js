@@ -81,6 +81,55 @@ export class Token extends DurableObject {
     await this.storage.put('relayTokens', relayTokens.filter(t => t !== token));
   }
 
+  async deleteRelay(relayId: string) {
+    const id = (relayId || "").trim();
+    if (!id) return;
+
+    const storedTokens = ((await this.storage.get('relayTokens')) as string[]) || [];
+    const knownTokens = new Set(storedTokens.filter((t) => typeof t === "string" && t.trim()));
+    const tokensToDelete = new Set<string>();
+
+    const listed = await this.storage.list({ prefix: "relay:" });
+    for (const [key, value] of listed.entries()) {
+      if (typeof key !== "string") continue;
+      const token = key.slice("relay:".length);
+      if (!token) continue;
+      knownTokens.add(token);
+
+      const metadata = value as RelayMetadata | null;
+      if (metadata?.relayId === id) {
+        tokensToDelete.add(token);
+      }
+    }
+
+    for (const token of tokensToDelete) {
+      await this.storage.delete(`relay:${token}`);
+    }
+
+    await this.storage.put(
+      'relayTokens',
+      Array.from(knownTokens).filter((token) => !tokensToDelete.has(token)),
+    );
+    await this.markRelayDeleted(id);
+  }
+
+  async getRelayOldestCreatedAt(relayId: string): Promise<number | null> {
+    const id = (relayId || "").trim();
+    if (!id) return null;
+
+    let oldest: number | null = null;
+    const listed = await this.storage.list({ prefix: "relay:" });
+    for (const value of listed.values()) {
+      const metadata = value as RelayMetadata | null;
+      if (metadata?.relayId !== id || typeof metadata.createdAt !== "number") continue;
+      if (oldest === null || metadata.createdAt < oldest) {
+        oldest = metadata.createdAt;
+      }
+    }
+
+    return oldest;
+  }
+
   async getAllRelayTokens(): Promise<string[]> {
     const stored = ((await this.storage.get('relayTokens')) as string[]) || [];
     const cleaned = stored.filter((t) => typeof t === "string" && t.trim());

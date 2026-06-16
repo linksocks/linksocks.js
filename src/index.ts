@@ -284,6 +284,8 @@ export default {
       flex-shrink: 0;
       transition: all 0.2s;
       white-space: nowrap;
+      min-width: 48px;
+      text-align: center;
     }
     .copyBtn:hover {
       background: rgba(255,255,255,0.15);
@@ -291,6 +293,11 @@ export default {
       color: #fff;
     }
     .copyBtn:active { transform: translateY(1px); }
+    .copyBtn.copied {
+      border-color: rgba(34,197,94,0.45);
+      background: rgba(34,197,94,0.16);
+      color: #fff;
+    }
 
     .qsSteps {
       margin: 0 0 24px 0;
@@ -456,19 +463,27 @@ export default {
     </div>
   </div>
 
-  <div id="toast" class="toast" role="status" aria-live="polite">Copied</div>
-
   <script>
     (function () {
-      const toast = document.getElementById('toast');
-      let toastTimer = 0;
+      const timers = new WeakMap();
 
-      function showToast(text) {
-        if (!toast) return;
-        toast.textContent = text;
-        toast.classList.add('show');
-        if (toastTimer) clearTimeout(toastTimer);
-        toastTimer = setTimeout(() => toast.classList.remove('show'), 1200);
+      function setCopyState(btn, ok) {
+        const previous = btn.getAttribute('data-label') || btn.textContent || 'Copy';
+        const previousLabel = btn.getAttribute('data-aria-label') || btn.getAttribute('aria-label') || 'Copy';
+        btn.setAttribute('data-label', previous);
+        btn.setAttribute('data-aria-label', previousLabel);
+        btn.textContent = ok ? '✓' : 'Failed';
+        btn.classList.toggle('copied', ok);
+        btn.setAttribute('aria-label', ok ? 'Copied' : 'Copy failed');
+
+        const existingTimer = timers.get(btn);
+        if (existingTimer) clearTimeout(existingTimer);
+        timers.set(btn, setTimeout(() => {
+          btn.textContent = btn.getAttribute('data-label') || 'Copy';
+          btn.classList.remove('copied');
+          btn.setAttribute('aria-label', btn.getAttribute('data-aria-label') || 'Copy');
+          timers.delete(btn);
+        }, 1200));
       }
 
       async function copyText(text) {
@@ -508,7 +523,7 @@ export default {
         const text = container.getAttribute('data-copy') || '';
         if (!text) return;
         const ok = await copyText(text);
-        showToast(ok ? 'Copied' : 'Copy failed');
+        setCopyState(btn, ok);
       });
     })();
   </script>
