@@ -819,10 +819,31 @@ export default {
               g.providerCount = runtime.providerCount;
               g.connectorCount = runtime.connectorCount;
             } catch (e) {
-              // Ignore
+              // Relay DO gone — mark for cleanup.
+              g.providerCount = 0;
+              g.connectorCount = 0;
+              g.channelCount = 0;
             }
           })
         );
+
+        // Filter out dead relays (0 providers + 0 connectors) and clean up their tokens in background.
+        const staleRelays = paginatedGroups.filter((g) => g.providerCount === 0 && g.connectorCount === 0);
+        if (staleRelays.length > 0) {
+          ctx.waitUntil(
+            (async () => {
+              for (const g of staleRelays) {
+                try {
+                  await tokenDO.deleteRelay(g.relayId);
+                } catch {
+                  // Best-effort
+                }
+              }
+            })(),
+          );
+        }
+
+        const liveRelays = paginatedGroups.filter((g) => g.providerCount > 0 || g.connectorCount > 0);
 
         const globalStats = await tokenDO.getStats();
         const totals = relayGroups.reduce(
@@ -1282,7 +1303,7 @@ export default {
             </tr>
           </thead>
           <tbody id="tbody">
-            ${paginatedGroups
+            ${liveRelays
               .map((g) => {
                 const connectorTokens = g.connectorTokens || [];
                 
@@ -1373,7 +1394,7 @@ export default {
             </tr>`;
               })
               .join("")}
-            ${paginatedGroups.length === 0 ? `<tr><td colspan="4" style="padding: 22px 16px; color: rgba(255,255,255,0.6);">No tokens found.</td></tr>` : ""}
+            ${liveRelays.length === 0 ? `<tr><td colspan="4" style="padding: 22px 16px; color: rgba(255,255,255,0.6);">No tokens found.</td></tr>` : ""}
           </tbody>
         </table>
       </div>

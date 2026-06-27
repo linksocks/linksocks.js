@@ -271,9 +271,12 @@ export class Relay extends DurableObject {
       const cleanupStartAt = oldestCreatedAt && oldestCreatedAt < now ? oldestCreatedAt : now;
       await this.storage.put('providerDisconnectTime', cleanupStartAt);
       const elapsed = now - cleanupStartAt;
-      await this.scheduleAlarmAt(elapsed >= Relay.PROVIDER_DISCONNECT_GRACE_MS
-        ? now
-        : now + (Relay.PROVIDER_DISCONNECT_GRACE_MS - elapsed));
+      if (elapsed >= Relay.PROVIDER_DISCONNECT_GRACE_MS) {
+        // Grace already expired — perform cleanup directly instead of relying on an alarm.
+        await this.performStaleRelayCleanup();
+        return;
+      }
+      await this.scheduleAlarmAt(now + (Relay.PROVIDER_DISCONNECT_GRACE_MS - elapsed));
       return;
     }
 
@@ -283,8 +286,28 @@ export class Relay extends DurableObject {
       return;
     }
 
-    // Grace already elapsed, schedule immediate execution.
-    await this.scheduleAlarmAt(now);
+    // Grace already elapsed — clean up directly instead of scheduling another alarm
+    // that may never fire (e.g. DO eviction or lost alarm).
+    await this.performStaleRelayCleanup();
+  }
+
+  /**
+   * Immediately terminate a stale relay: notify connectors, revoke tokens, clear storage.
+   * Safe to call multiple times — idempotent once storage is cleared.
+   */
+  private async performStaleRelayCleanup(): Promise<void> {
+    const notifiedConnectors = this.notifyConnectorsRelayTermination();
+    if (notifiedConnectors > 0) {
+      await new Promise((resolve) => setTimeout(resolve, Relay.CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS));
+    }
+
+    await this.deleteRelayRecords();
+
+    // Clear local storage
+    await this.storage.deleteAll();
+
+    // Close all remaining connections
+    this.adminDisconnectAll('All providers disconnected, relay terminated');
   }
 
   adminDisconnectAll(reason: string = "Admin disconnect") {
@@ -1152,17 +1175,17 @@ export class Relay extends DurableObject {
       return;
     }
 
-    const notifiedConnectors = this.notifyConnectorsRelayTermination();
-    if (notifiedConnectors > 0) {
-      await new Promise((resolve) => setTimeout(resolve, Relay.CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS));
+    try {
+      const notifiedConnectors = this.notifyConnectorsRelayTermination();
+      if (notifiedConnectors > 0) {
+        await new Promise((resolve) => setTimeout(resolve, Relay.CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS));
+      }
+
+      await this.performStaleRelayCleanup();
+    } catch (e) {
+      console.error("alarm: cleanup failed, rescheduling", e);
+      // Re-schedule so another attempt can clean up later.
+      await this.scheduleAlarmAt(Date.now() + 60_000);
     }
-
-    await this.deleteRelayRecords();
-
-    // Clear local storage
-    await this.storage.deleteAll();
-
-    // Close all remaining connections
-    this.adminDisconnectAll('All providers disconnected, relay terminated');
   }
 }
