@@ -26,8 +26,6 @@ export class Relay extends DurableObject {
   private static readonly PROVIDER_DISCONNECT_GRACE_MS = 60_000;
   private static readonly CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS = 100;
   private static readonly TRAFFIC_FLUSH_IDLE_MS = 60_000;
-  private static readonly TRAFFIC_PERSIST_INTERVAL_MS = 500;
-  private static readonly TRAFFIC_PERSIST_BYTES_THRESHOLD = 256 * 1024;
   private static readonly DEFAULT_CONNECTOR_WAIT_PROVIDER_MS = 5_000;
 
   private providerChannels: Map<string, WebSocket>;
@@ -52,9 +50,8 @@ export class Relay extends DurableObject {
 
   private ownColo: string | null = null;
 
-  private trafficPersistPromise: Promise<void> | null = null;
-  private lastTrafficPersistAt: number = 0;
-  private lastPersistedAccumulator: number = 0;
+  // Channel creation counter – flushed together with traffic to avoid per-channel Token DO writes.
+  private pendingChannelCreations: number = 0;
 
   private async getOwnerTokenKey(): Promise<string> {
     const v = (await this.storage.get("ownerTokenKey")) as string | undefined;
@@ -80,27 +77,6 @@ export class Relay extends DurableObject {
     return this.alarmArmPromise;
   }
 
-  private persistTrafficState() {
-    const now = Date.now();
-    const deltaBytes = Math.abs(this.trafficAccumulator - this.lastPersistedAccumulator);
-    const dueByTime = now - this.lastTrafficPersistAt >= Relay.TRAFFIC_PERSIST_INTERVAL_MS;
-    const dueByBytes = deltaBytes >= Relay.TRAFFIC_PERSIST_BYTES_THRESHOLD;
-    if (!dueByTime && !dueByBytes) return;
-    if (this.trafficPersistPromise) return;
-
-    this.lastTrafficPersistAt = now;
-    this.lastPersistedAccumulator = this.trafficAccumulator;
-
-    this.trafficPersistPromise = this.storage
-      .put("trafficState", {
-        accumulator: this.trafficAccumulator,
-        lastTrafficReport: this.lastTrafficReport,
-      })
-      .finally(() => {
-        this.trafficPersistPromise = null;
-      });
-  }
-
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
 
@@ -122,15 +98,16 @@ export class Relay extends DurableObject {
       if (typeof alarm === "number") this.nextAlarmAt = alarm;
 
       const trafficState = (await this.storage.get("trafficState")) as
-        | { accumulator?: number; lastTrafficReport?: number }
+        | { accumulator?: number; lastTrafficReport?: number; pendingChannels?: number }
         | undefined;
 
       if (trafficState && typeof trafficState === "object") {
         if (typeof trafficState.accumulator === "number") this.trafficAccumulator = trafficState.accumulator;
         if (typeof trafficState.lastTrafficReport === "number") this.lastTrafficReport = trafficState.lastTrafficReport;
+        if (typeof trafficState.pendingChannels === "number") this.pendingChannelCreations = trafficState.pendingChannels;
       }
 
-      if (this.trafficAccumulator > 0) {
+      if (this.trafficAccumulator > 0 || this.pendingChannelCreations > 0) {
         await this.scheduleAlarmAt(Date.now() + Relay.TRAFFIC_FLUSH_IDLE_MS);
       }
     });
@@ -428,38 +405,42 @@ export class Relay extends DurableObject {
         while (true) {
           const now = Date.now();
           const bytesToReport = this.trafficAccumulator;
+          const channelsToReport = this.pendingChannelCreations;
 
           if (!force) {
             const overSize = bytesToReport >= 1024 * 1024;
             const overTime = now - this.lastTrafficReport >= Relay.TRAFFIC_FLUSH_IDLE_MS;
-            if (!overSize && !(overTime && bytesToReport > 0)) break;
+            if (!overSize && !(overTime && (bytesToReport > 0 || channelsToReport > 0))) break;
           }
 
-          if (bytesToReport <= 0) {
+          if (bytesToReport <= 0 && channelsToReport <= 0) {
             this.lastTrafficReport = now;
             break;
           }
 
           // Snapshot and reset BEFORE awaiting to avoid losing bytes due to interleaving.
           this.trafficAccumulator = 0;
+          this.pendingChannelCreations = 0;
           this.lastTrafficReport = now;
 
           try {
-            await this.token.reportTraffic(bytesToReport);
+            await this.token.reportUsage(bytesToReport, channelsToReport);
           } catch (err) {
-            // Restore bytes so we can retry later.
+            // Restore so we can retry later.
             this.trafficAccumulator += bytesToReport;
+            this.pendingChannelCreations += channelsToReport;
             throw err;
           }
 
           if (!force) break;
-          if (this.trafficAccumulator <= 0) break;
+          if (this.trafficAccumulator <= 0 && this.pendingChannelCreations <= 0) break;
         }
       } finally {
-        // Persist to avoid losing pending bytes on eviction.
+        // Persist to avoid losing pending bytes/channels on eviction.
         await this.storage.put("trafficState", {
           accumulator: this.trafficAccumulator,
           lastTrafficReport: this.lastTrafficReport,
+          pendingChannels: this.pendingChannelCreations,
         });
       }
     })().finally(() => {
@@ -481,8 +462,6 @@ export class Relay extends DurableObject {
     } else if (this.trafficAccumulator > 0) {
       this.scheduleAlarmAt(now + Relay.TRAFFIC_FLUSH_IDLE_MS).catch(console.error);
     }
-
-    this.persistTrafficState();
   }
 
   async fetch(request: Request) {
@@ -799,8 +778,8 @@ export class Relay extends DurableObject {
             this.providerChannels.set(channelId, provider);
             this.connectorChannels.set(channelId, ws);
 
-            // Report channel creation
-            this.token.reportChannelCreated().catch(console.error);
+            // Report channel creation (batched — flushed together with traffic)
+            this.pendingChannelCreations++;
 
             // Update metadata for both WebSockets
             const providerMeta = provider.deserializeAttachment() as WebsocketMeta;

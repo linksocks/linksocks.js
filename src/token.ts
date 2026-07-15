@@ -301,25 +301,34 @@ export class Token extends DurableObject {
     return { currentConnections, dailyStats };
   }
 
-  async reportTraffic(bytes: number) {
+  async reportUsage(bytes: number, channels: number) {
     const now = Date.now();
-    
-    const existingEvent = this.memoryEvents[this.memoryEvents.length - 1];
-    if (existingEvent && now - existingEvent.timestamp < 60000 && (existingEvent.type ? existingEvent.type === "traffic" : existingEvent.bytes > 0)) {
-      existingEvent.bytes += bytes;
-    } else {
-      this.memoryEvents.push({ timestamp: now, bytes, type: "traffic" });
+
+    if (bytes > 0) {
+      const existingEvent = this.memoryEvents[this.memoryEvents.length - 1];
+      if (existingEvent && now - existingEvent.timestamp < 60000 && (existingEvent.type ? existingEvent.type === "traffic" : existingEvent.bytes > 0)) {
+        existingEvent.bytes += bytes;
+      } else {
+        this.memoryEvents.push({ timestamp: now, bytes, type: "traffic" });
+      }
     }
 
-    await this.storage.put("pendingEvents", this.memoryEvents);
-    await this.scheduleAlarm();
+    for (let i = 0; i < channels; i++) {
+      this.memoryEvents.push({ timestamp: now, bytes: 0, type: "channel" });
+    }
+
+    if (bytes > 0 || channels > 0) {
+      await this.storage.put("pendingEvents", this.memoryEvents);
+      await this.scheduleAlarm();
+    }
+  }
+
+  async reportTraffic(bytes: number) {
+    await this.reportUsage(bytes, 0);
   }
 
   async reportChannelCreated() {
-    const now = Date.now();
-    this.memoryEvents.push({ timestamp: now, bytes: 0, type: "channel" });
-    await this.storage.put("pendingEvents", this.memoryEvents);
-    await this.scheduleAlarm();
+    await this.reportUsage(0, 1);
   }
 
   private async scheduleAlarm() {
