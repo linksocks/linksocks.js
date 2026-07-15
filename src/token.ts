@@ -281,11 +281,11 @@ export class Token extends DurableObject {
     };
     
     // Calculate current connections by deduping on relayId.
-    const relayTokens = await this.getAllRelayTokens();
-
+    // Use a single list() to fetch all metadata in one row-read-batch operation
+    // instead of N individual get() calls (each costing a row read).
     const relayCounts = new Map<string, { providers: number; connectors: number }>();
-    for (const token of relayTokens) {
-      const metadata = await this.getRelayMetadata(token);
+    const listed = await this.storage.list<RelayMetadata>({ prefix: "relay:" });
+    for (const [key, metadata] of listed) {
       if (!metadata?.relayId) continue;
       const existing = relayCounts.get(metadata.relayId) || { providers: 0, connectors: 0 };
       existing.providers = Math.max(existing.providers, metadata.providerCount || 0);

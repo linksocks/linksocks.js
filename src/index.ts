@@ -78,10 +78,20 @@ export default {
       
       if (path[1] === "") {
         const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
-        const [stats, usage] = await Promise.all([
-          tokenDO.getStats(),
-          getDurableObjectUsage(env),
-        ]);
+        let statsError: string | null = null;
+        let stats: { currentConnections: number; dailyStats: { connections: number; transferBytes: number } };
+        try {
+          stats = await tokenDO.getStats();
+        } catch (e) {
+          statsError = e instanceof Error ? e.message : String(e);
+          stats = { currentConnections: 0, dailyStats: { connections: 0, transferBytes: 0 } };
+        }
+        let usage: Awaited<ReturnType<typeof getDurableObjectUsage>> = null;
+        try {
+          usage = await getDurableObjectUsage(env);
+        } catch {
+          usage = null;
+        }
 
         const html = `
 <!DOCTYPE html>
@@ -477,6 +487,16 @@ export default {
       border-radius: 20px;
       padding: 24px;
     }
+    .errBanner {
+      margin: 0 0 16px 0;
+      padding: 12px 16px;
+      border: 1px solid rgba(251,113,133,0.35);
+      background: rgba(251,113,133,0.12);
+      color: rgba(255,228,230,0.95);
+      border-radius: 12px;
+      font-size: 13px;
+      font-weight: 600;
+    }
     .usageTitle {
       margin: 0 0 18px 0;
       font-size: 14px;
@@ -540,6 +560,7 @@ export default {
       </div>
 
       <div class="heroBody">
+        ${statsError ? `<div class="errBanner">Stats temporarily unavailable: ${statsError}</div>` : ""}
         <div class="stats">
           <div class="stat">
             <p class="statValue">${stats.currentConnections}</p>
