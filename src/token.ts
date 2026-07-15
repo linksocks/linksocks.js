@@ -200,6 +200,29 @@ export class Token extends DurableObject {
     }
   }
 
+  /**
+   * Update providerCount/connectorCount for ALL tokens belonging to the same relay.
+   * Uses a single list() + batched put() to avoid N individual get/put pairs.
+   * Called by Relay DO once per connect/disconnect instead of N RPCs.
+   */
+  async updateRelayCounts(relayId: string, providerCount: number, connectorCount: number) {
+    const listed = await this.storage.list<RelayMetadata>({ prefix: "relay:" });
+    const toPut: [string, RelayMetadata][] = [];
+    for (const [key, metadata] of listed) {
+      if (!metadata || metadata.relayId !== relayId) continue;
+      if (metadata.providerCount === providerCount && metadata.connectorCount === connectorCount) continue;
+      metadata.providerCount = providerCount;
+      metadata.connectorCount = connectorCount;
+      toPut.push([key, metadata]);
+    }
+    if (toPut.length === 0) return;
+
+    // DurableObjectStorage.put supports a Record for batched writes.
+    const entries: Record<string, RelayMetadata> = {};
+    for (const [k, v] of toPut) entries[k] = v;
+    await this.storage.put(entries);
+  }
+
   async getRelayMetadata(token: string): Promise<RelayMetadata | null> {
     return await this.storage.get(`relay:${token}`) as RelayMetadata | null;
   }

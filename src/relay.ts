@@ -367,13 +367,11 @@ export class Relay extends DurableObject {
   }
 
   private async updateMetadata() {
-    const tokens = await this.storage.get('tokens') as string[] || [];
-    
     // Get actual WebSocket count from DO state (survives hibernation)
     const allWebSockets = this.state.getWebSockets();
     let actualProviderCount = 0;
     let actualConnectorCount = 0;
-    
+
     for (const ws of allWebSockets) {
       try {
         const meta = ws.deserializeAttachment() as WebsocketMeta;
@@ -386,15 +384,14 @@ export class Relay extends DurableObject {
         // Ignore deserialization errors
       }
     }
-    
-    for (const tokenName of tokens) {
-      const tokenKey = await this.toTokenKey(tokenName);
-      if (!tokenKey) continue;
-      await this.token.updateRelayMetadata(tokenKey, {
-        providerCount: actualProviderCount,
-        connectorCount: actualConnectorCount
-      });
-    }
+
+    // Single RPC to Token DO — it batches the update across all tokens in this relay
+    // via one list() + one put() instead of N individual RPCs.
+    await this.token.updateRelayCounts(
+      this.state.id.toString(),
+      actualProviderCount,
+      actualConnectorCount,
+    );
   }
 
   private flushTraffic(force: boolean = false): Promise<void> {
