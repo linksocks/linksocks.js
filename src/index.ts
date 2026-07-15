@@ -8,8 +8,10 @@ export { Token } from "./token";
 
 async function getDurableObjectUsage(env: Env): Promise<{
   requests: number;
-  durationSeconds: number;
+  durationGbS: number;
   storedBytes: number;
+  rowsRead: number;
+  rowsWritten: number;
 } | null> {
   if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return null;
 
@@ -21,9 +23,9 @@ async function getDurableObjectUsage(env: Env): Promise<{
           sum { requests }
         }
         durableObjectsPeriodicGroups(filter: { date: "${today}" }, limit: 1000) {
-          sum { cpuTime }
+          sum { duration rowsRead rowsWritten }
         }
-        durableObjectsStorageGroups(filter: { date: "${today}" }, limit: 1000) {
+        durableObjectsSqlStorageGroups(filter: { date: "${today}" }, limit: 1000) {
           max { storedBytes }
         }
       }
@@ -45,8 +47,8 @@ async function getDurableObjectUsage(env: Env): Promise<{
         viewer?: {
           accounts?: Array<{
             durableObjectsInvocationsAdaptiveGroups?: Array<{ sum?: { requests?: number } }>;
-            durableObjectsPeriodicGroups?: Array<{ sum?: { cpuTime?: number } }>;
-            durableObjectsStorageGroups?: Array<{ max?: { storedBytes?: number } }>;
+            durableObjectsPeriodicGroups?: Array<{ sum?: { duration?: number; rowsRead?: number; rowsWritten?: number } }>;
+            durableObjectsSqlStorageGroups?: Array<{ max?: { storedBytes?: number } }>;
           }>;
         };
       };
@@ -56,10 +58,13 @@ async function getDurableObjectUsage(env: Env): Promise<{
     if (!account) return null;
 
     const requests = account.durableObjectsInvocationsAdaptiveGroups?.[0]?.sum?.requests ?? 0;
-    const cpuTime = account.durableObjectsPeriodicGroups?.[0]?.sum?.cpuTime ?? 0;
-    const storedBytes = account.durableObjectsStorageGroups?.[0]?.max?.storedBytes ?? 0;
+    const periodic = account.durableObjectsPeriodicGroups?.[0]?.sum;
+    const durationGbS = periodic?.duration ?? 0;
+    const rowsRead = periodic?.rowsRead ?? 0;
+    const rowsWritten = periodic?.rowsWritten ?? 0;
+    const storedBytes = account.durableObjectsSqlStorageGroups?.[0]?.max?.storedBytes ?? 0;
 
-    return { requests, durationSeconds: cpuTime, storedBytes };
+    return { requests, durationGbS, storedBytes, rowsRead, rowsWritten };
   } catch {
     return null;
   }
@@ -481,7 +486,7 @@ export default {
     }
     .usageGrid {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
       gap: 16px;
     }
     .usageItem { display: flex; flex-direction: column; gap: 8px; }
@@ -567,9 +572,23 @@ export default {
             <div class="usageItem">
               <div class="usageHeader">
                 <span class="usageLabel">Duration</span>
-                <span class="usageVal">${usage.durationSeconds.toLocaleString()} / 13,000 GB-s</span>
+                <span class="usageVal">${usage.durationGbS.toLocaleString()} / 13,000 GB-s</span>
               </div>
-              <div class="usageBar"><div class="usageFill" style="width:${Math.min(usage.durationSeconds / 13000 * 100, 100).toFixed(1)}%"></div></div>
+              <div class="usageBar"><div class="usageFill" style="width:${Math.min(usage.durationGbS / 13000 * 100, 100).toFixed(1)}%"></div></div>
+            </div>
+            <div class="usageItem">
+              <div class="usageHeader">
+                <span class="usageLabel">Rows Read</span>
+                <span class="usageVal">${usage.rowsRead.toLocaleString()} / 5,000,000</span>
+              </div>
+              <div class="usageBar"><div class="usageFill" style="width:${Math.min(usage.rowsRead / 5000000 * 100, 100).toFixed(1)}%"></div></div>
+            </div>
+            <div class="usageItem">
+              <div class="usageHeader">
+                <span class="usageLabel">Rows Written</span>
+                <span class="usageVal">${usage.rowsWritten.toLocaleString()} / 100,000</span>
+              </div>
+              <div class="usageBar"><div class="usageFill" style="width:${Math.min(usage.rowsWritten / 100000 * 100, 100).toFixed(1)}%"></div></div>
             </div>
             <div class="usageItem">
               <div class="usageHeader">
