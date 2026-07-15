@@ -6,6 +6,65 @@ import { AuthResponseMessage, packMessage, MessageType } from "./message";
 export { Relay } from "./relay";
 export { Token } from "./token";
 
+async function getDurableObjectUsage(env: Env): Promise<{
+  requests: number;
+  durationSeconds: number;
+  storedBytes: number;
+} | null> {
+  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return null;
+
+  const today = new Date().toISOString().slice(0, 10);
+  const query = `{
+    viewer {
+      accounts(filter: { accountTag: "${env.CF_ACCOUNT_ID}" }) {
+        durableObjectsInvocationsAdaptiveGroups(filter: { date: "${today}" }, limit: 1000) {
+          sum { requests }
+        }
+        durableObjectsPeriodicGroups(filter: { date: "${today}" }, limit: 1000) {
+          sum { cpuTime }
+        }
+        durableObjectsStorageGroups(filter: { date: "${today}" }, limit: 1000) {
+          max { storedBytes }
+        }
+      }
+    }
+  }`;
+
+  try {
+    const resp = await fetch("https://api.cloudflare.com/client/v4/graphql", {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.CF_API_TOKEN}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ query }),
+    });
+
+    const json = await resp.json() as {
+      data?: {
+        viewer?: {
+          accounts?: Array<{
+            durableObjectsInvocationsAdaptiveGroups?: Array<{ sum?: { requests?: number } }>;
+            durableObjectsPeriodicGroups?: Array<{ sum?: { cpuTime?: number } }>;
+            durableObjectsStorageGroups?: Array<{ max?: { storedBytes?: number } }>;
+          }>;
+        };
+      };
+    };
+
+    const account = json.data?.viewer?.accounts?.[0];
+    if (!account) return null;
+
+    const requests = account.durableObjectsInvocationsAdaptiveGroups?.[0]?.sum?.requests ?? 0;
+    const cpuTime = account.durableObjectsPeriodicGroups?.[0]?.sum?.cpuTime ?? 0;
+    const storedBytes = account.durableObjectsStorageGroups?.[0]?.max?.storedBytes ?? 0;
+
+    return { requests, durationSeconds: cpuTime, storedBytes };
+  } catch {
+    return null;
+  }
+}
+
 export default {
   async fetch(request: Request, env: Env, ctx: ExecutionContext) {
     return await handleErrors(request, async () => {
@@ -14,7 +73,10 @@ export default {
       
       if (path[1] === "") {
         const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
-        const stats = await tokenDO.getStats();
+        const [stats, usage] = await Promise.all([
+          tokenDO.getStats(),
+          getDurableObjectUsage(env),
+        ]);
 
         const html = `
 <!DOCTYPE html>
@@ -402,6 +464,60 @@ export default {
       .grid { grid-template-columns: 1fr; }
       .heroTop { flex-direction: column; align-items: flex-start; }
     }
+
+    .usageSection {
+      margin-top: 24px;
+      border: 1px solid rgba(255,255,255,0.08);
+      background: rgba(0,0,0,0.18);
+      border-radius: 20px;
+      padding: 24px;
+    }
+    .usageTitle {
+      margin: 0 0 18px 0;
+      font-size: 14px;
+      font-weight: 700;
+      color: rgba(255,255,255,0.9);
+      letter-spacing: -0.01em;
+    }
+    .usageGrid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 16px;
+    }
+    .usageItem { display: flex; flex-direction: column; gap: 8px; }
+    .usageHeader {
+      display: flex;
+      justify-content: space-between;
+      align-items: baseline;
+    }
+    .usageLabel {
+      color: var(--muted2);
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+    .usageVal {
+      color: rgba(255,255,255,0.88);
+      font-size: 12.5px;
+      font-weight: 600;
+      font-family: var(--mono);
+    }
+    .usageBar {
+      height: 6px;
+      border-radius: 3px;
+      background: rgba(255,255,255,0.08);
+      overflow: hidden;
+    }
+    .usageFill {
+      height: 100%;
+      border-radius: 3px;
+      background: linear-gradient(90deg, var(--brand), var(--brand2));
+      transition: width 0.6s ease;
+    }
+    @media (max-width: 640px) {
+      .usageGrid { grid-template-columns: 1fr; }
+    }
   </style>
 </head>
 <body>
@@ -437,6 +553,33 @@ export default {
             <div class="statLabel">GB transferred</div>
           </div>
         </div>
+        ${usage ? `
+        <div class="usageSection">
+          <p class="usageTitle">Durable Objects · Free Tier Usage Today</p>
+          <div class="usageGrid">
+            <div class="usageItem">
+              <div class="usageHeader">
+                <span class="usageLabel">Requests</span>
+                <span class="usageVal">${usage.requests.toLocaleString()} / 100,000</span>
+              </div>
+              <div class="usageBar"><div class="usageFill" style="width:${Math.min(usage.requests / 100000 * 100, 100).toFixed(1)}%"></div></div>
+            </div>
+            <div class="usageItem">
+              <div class="usageHeader">
+                <span class="usageLabel">Duration</span>
+                <span class="usageVal">${usage.durationSeconds.toLocaleString()} / 13,000 GB-s</span>
+              </div>
+              <div class="usageBar"><div class="usageFill" style="width:${Math.min(usage.durationSeconds / 13000 * 100, 100).toFixed(1)}%"></div></div>
+            </div>
+            <div class="usageItem">
+              <div class="usageHeader">
+                <span class="usageLabel">Stored Data</span>
+                <span class="usageVal">${(usage.storedBytes / 1024 / 1024 / 1024).toFixed(3)} / 5 GB</span>
+              </div>
+              <div class="usageBar"><div class="usageFill" style="width:${Math.min(usage.storedBytes / (5 * 1024 * 1024 * 1024) * 100, 100).toFixed(1)}%"></div></div>
+            </div>
+          </div>
+        </div>` : ""}
 
         <div class="grid">
           <div class="panel">
@@ -1481,6 +1624,14 @@ export default {
 </html>`;
 
         return new Response(html, { status: 200, headers: { "Content-Type": "text/html" } });
+      }
+
+      if (path[1] === "api" && path[2] === "usage") {
+        const usage = await getDurableObjectUsage(env);
+        return new Response(JSON.stringify(usage), {
+          status: 200,
+          headers: { "Content-Type": "application/json", "Cache-Control": "no-store" },
+        });
       }
       
       if (path[1] === "socket" && request.headers.get("Upgrade") === "websocket") {

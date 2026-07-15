@@ -6,6 +6,8 @@ export interface Env {
   TOKEN: DurableObjectNamespace<Token>;
   API_KEY: string;
   ADMIN_PASSWORD?: string;
+  CF_API_TOKEN?: string;
+  CF_ACCOUNT_ID?: string;
 }
 
 export interface WebsocketMeta {

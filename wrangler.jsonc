@@ -1,6 +1,10 @@
 /**
  * For more details on how to configure Wrangler, refer to:
  * https://developers.cloudflare.com/workers/wrangler/configuration/
+ *
+ * Required secrets (set via `wrangler secret put <NAME>`):
+ *   CF_API_TOKEN   - Cloudflare API Token with Analytics: Read permission
+ *   CF_ACCOUNT_ID  - Your Cloudflare Account ID (32 hex chars)
  */
 {
   "$schema": "node_modules/wrangler/config-schema.json",
