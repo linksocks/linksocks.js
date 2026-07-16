@@ -347,7 +347,20 @@ export class Relay extends DurableObject {
     const stored = (await this.storage.get('tokens')) as string[] | undefined;
     const existing = Array.isArray(stored) ? stored : [];
 
-    // Canonicalize stored entries to keys (migrate older versions that stored raw tokens).
+    // Fast path: if every stored entry is already a valid hash key and the
+    // new key is already present, skip the write entirely.
+    const allCanonical = existing.every((t) => this.isSha256Hex(t));
+    if (allCanonical && existing.includes(tokenKey)) {
+      const metadata = await this.token.getRelayMetadata(tokenKey);
+      if (!metadata) {
+        await this.token.setRelay(tokenKey, this.state.id.toString());
+      } else if (!metadata.createdAt) {
+        await this.token.updateRelayMetadata(tokenKey, { createdAt: Date.now() });
+      }
+      return;
+    }
+
+    // Slow path: migrate older versions that stored raw tokens to canonical keys.
     const keySet = new Set<string>();
     for (const t of existing) {
       const k = await this.toTokenKey(t);
@@ -434,11 +447,19 @@ export class Relay extends DurableObject {
         }
       } finally {
         // Persist to avoid losing pending bytes/channels on eviction.
-        await this.storage.put("trafficState", {
-          accumulator: this.trafficAccumulator,
-          lastTrafficReport: this.lastTrafficReport,
-          pendingChannels: this.pendingChannelCreations,
-        });
+        // Skip when nothing pending — avoids a redundant row write per
+        // force-flush on connection close when accumulator already drained.
+        if (this.trafficAccumulator > 0 || this.pendingChannelCreations > 0) {
+          await this.storage.put("trafficState", {
+            accumulator: this.trafficAccumulator,
+            lastTrafficReport: this.lastTrafficReport,
+            pendingChannels: this.pendingChannelCreations,
+          });
+        } else {
+          // Clear stale trafficState so the next DO instantiation does not
+          // treat an old entry as pending work.
+          await this.storage.delete("trafficState");
+        }
       }
     })().finally(() => {
       this.trafficFlushPromise = null;

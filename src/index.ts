@@ -846,8 +846,9 @@ export default {
             // Best-effort: if this token is a connector token, remove it from its parent relay's connectorTokens list.
             if (meta?.relayId && key) {
               const all = await tokenDO.getAllRelayTokens();
+              const metaMap = await tokenDO.getRelayMetadataBatch(all);
               for (const t of all) {
-                const m = await tokenDO.getRelayMetadata(t);
+                const m = metaMap.get(t);
                 if (m?.relayId !== meta.relayId) continue;
                 if (Array.isArray(m.connectorTokens) && m.connectorTokens.includes(token)) {
                   await tokenDO.removeConnectorToken(t, token);
@@ -899,12 +900,11 @@ export default {
 
           if (action === "calibrateStats") {
             const allTokens = await tokenDO.getAllRelayTokens();
-            const tokenEntries = await Promise.all(
-              allTokens.map(async (t) => {
-                const meta = await tokenDO.getRelayMetadata(t);
-                return { token: t, meta };
-              }),
-            );
+            const metaMap = await tokenDO.getRelayMetadataBatch(allTokens);
+            const tokenEntries = allTokens.map((t) => ({
+              token: t,
+              meta: metaMap.get(t) || null,
+            }));
 
             const relayIds = new Set<string>();
             for (const e of tokenEntries) {
@@ -936,12 +936,11 @@ export default {
         }
 
         const relayTokens = await tokenDO.getAllRelayTokens();
-        const tokenEntries = await Promise.all(
-          relayTokens.map(async (t) => {
-            const meta = await tokenDO.getRelayMetadata(t);
-            return { token: t, meta };
-          }),
-        );
+        const metaMap = await tokenDO.getRelayMetadataBatch(relayTokens);
+        const tokenEntries = relayTokens.map((t) => ({
+          token: t,
+          meta: metaMap.get(t) || null,
+        }));
 
         const groups = new Map<
           string,

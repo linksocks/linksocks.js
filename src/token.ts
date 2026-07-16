@@ -227,6 +227,22 @@ export class Token extends DurableObject {
     return await this.storage.get(`relay:${token}`) as RelayMetadata | null;
   }
 
+  /**
+   * Batch-fetch metadata for a list of token keys in a single list() call,
+   * avoiding N individual get() row reads from admin pages.
+   */
+  async getRelayMetadataBatch(tokens: string[]): Promise<Map<string, RelayMetadata>> {
+    if (tokens.length === 0) return new Map();
+    const result = new Map<string, RelayMetadata>();
+    // Batched get(keys[]) reads multiple keys in one row-read operation.
+    const map = await this.storage.get<RelayMetadata>(tokens.map((t) => `relay:${t}`));
+    for (const [k, v] of map) {
+      const token = k.startsWith("relay:") ? k.slice("relay:".length) : k;
+      result.set(token, v as RelayMetadata);
+    }
+    return result;
+  }
+
   async addConnectorToken(relayToken: string, connectorToken: string) {
     // Ensure the relay token is indexed so admin UI can enumerate it even if it existed
     // before relayTokens tracking was introduced.
