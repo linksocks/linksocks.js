@@ -212,6 +212,16 @@ export class Relay extends DurableObject {
     return count;
   }
 
+  private getActualConnectorCountExcluding(exclude: WebSocket): number {
+    let count = 0;
+    for (const ws of this.state.getWebSockets()) {
+      if (ws === exclude) continue;
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.isProvider !== true) count++;
+    }
+    return count;
+  }
+
   async adminGetRuntimeInfo(): Promise<{ providerCount: number; connectorCount: number; channelCount: number }> {
     this.syncFromState(true);
     // Get actual WebSocket count from DO state (survives hibernation)
@@ -573,22 +583,13 @@ export class Relay extends DurableObject {
     });
   }
 
-  // Helper method to broadcast partners count to all connectors
-  private broadcastPartnersCountToConnectors() {
+  // Helper method to broadcast partners count to all connectors.
+  // exclude: optional WebSocket to ignore while counting (e.g. a socket mid-close).
+  private broadcastPartnersCountToConnectors(exclude?: WebSocket) {
     // Get actual provider count from DO state (survives hibernation)
-    const allWebSockets = this.state.getWebSockets();
-    let actualProviderCount = 0;
-    
-    for (const ws of allWebSockets) {
-      try {
-        const meta = ws.deserializeAttachment() as WebsocketMeta;
-        if (meta.isProvider) {
-          actualProviderCount++;
-        }
-      } catch (e) {
-        // Ignore
-      }
-    }
+    const actualProviderCount = exclude
+      ? this.getActualProviderCountExcluding(exclude)
+      : this.getActualProviderCount();
     
     const partnersMsg: PartnersMessage = {
       count: actualProviderCount,
@@ -596,6 +597,7 @@ export class Relay extends DurableObject {
     };
     const encodedMsg = packMessage(partnersMsg);
     for (const connector of this.connectors) {
+      if (exclude && connector === exclude) continue;
       try {
         connector.send(encodedMsg);
       } catch (e) {
@@ -604,22 +606,13 @@ export class Relay extends DurableObject {
     }
   }
 
-  // Helper method to broadcast partners count to all providers
-  private broadcastPartnersCountToProviders() {
+  // Helper method to broadcast partners count to all providers.
+  // exclude: optional WebSocket to ignore while counting (e.g. a socket mid-close).
+  private broadcastPartnersCountToProviders(exclude?: WebSocket) {
     // Get actual connector count from DO state (survives hibernation)
-    const allWebSockets = this.state.getWebSockets();
-    let actualConnectorCount = 0;
-    
-    for (const ws of allWebSockets) {
-      try {
-        const meta = ws.deserializeAttachment() as WebsocketMeta;
-        if (!meta.isProvider) {
-          actualConnectorCount++;
-        }
-      } catch (e) {
-        // Ignore
-      }
-    }
+    const actualConnectorCount = exclude
+      ? this.getActualConnectorCountExcluding(exclude)
+      : this.getActualConnectorCount();
     
     const partnersMsg: PartnersMessage = {
       count: actualConnectorCount,
@@ -627,6 +620,7 @@ export class Relay extends DurableObject {
     };
     const encodedMsg = packMessage(partnersMsg);
     for (const provider of this.providers) {
+      if (exclude && provider === exclude) continue;
       try {
         provider.send(encodedMsg);
       } catch (e) {
@@ -1039,8 +1033,9 @@ export class Relay extends DurableObject {
     // Remove from providers/connectors set
     if (meta.isProvider === true) {
       this.providers.delete(ws);
-      // Broadcast updated providers count to connectors
-      this.broadcastPartnersCountToConnectors();
+      // Broadcast updated providers count to connectors.
+      // Pass the closing socket so it is not counted while still present in state.getWebSockets().
+      this.broadcastPartnersCountToConnectors(ws);
       
       // If all providers have disconnected, schedule connector token invalidation after 60s
       // Note: during the close event, the closing socket can still appear in state.getWebSockets().
@@ -1051,8 +1046,8 @@ export class Relay extends DurableObject {
       }
     } else {
       this.connectors.delete(ws);
-      // Broadcast updated connectors count to providers
-      this.broadcastPartnersCountToProviders();
+      // Broadcast updated connectors count to providers (exclude the closing connector).
+      this.broadcastPartnersCountToProviders(ws);
     }
 
     // Update metadata after connection close
