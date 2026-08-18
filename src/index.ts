@@ -1,4 +1,4 @@
-import type { Env } from "./types";
+import type { DurableObjectUsage, Env, HealthStatusCache, HealthStatusResponse } from "./types";
 import zxcvbn from "zxcvbn";
 
 import { handleErrors } from "./common";
@@ -6,13 +6,11 @@ import { AuthResponseMessage, packMessage, MessageType } from "./message";
 export { Relay } from "./relay";
 export { Token } from "./token";
 
-async function getDurableObjectUsage(env: Env): Promise<{
-  requests: number;
-  durationGbS: number;
-  storedBytes: number;
-  rowsRead: number;
-  rowsWritten: number;
-} | null> {
+const HEALTH_CACHE_TTL_MS = 60 * 60 * 1000;
+const HEALTH_REFRESH_WINDOW_MS = 10 * 60 * 1000;
+const HEALTH_STORAGE_LIMIT_BYTES = 5 * 1024 * 1024 * 1024;
+
+async function getDurableObjectUsage(env: Env): Promise<DurableObjectUsage | null> {
   if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID) return null;
 
   const today = new Date().toISOString().slice(0, 10);
@@ -68,6 +66,110 @@ async function getDurableObjectUsage(env: Env): Promise<{
   } catch {
     return null;
   }
+}
+
+async function fetchWithTimeout(request: RequestInfo | URL, init: RequestInit = {}, timeoutMs = 10_000): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+
+  try {
+    return await fetch(request, {
+      ...init,
+      signal: controller.signal,
+    });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
+async function buildHealthStatus(env: Env, origin: string): Promise<HealthStatusCache> {
+  const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
+  const checkedAt = Date.now();
+
+  const [doAccessResult, storageRoundTripResult, workerRequestResult, usageResult] = await Promise.allSettled([
+    tokenDO.pingHealthAccess(),
+    tokenDO.probeHealthStorageRoundTrip(),
+    fetchWithTimeout(new URL("/api/health/ping", origin), {
+      method: "GET",
+      headers: {
+        "Cache-Control": "no-cache",
+      },
+    }),
+    getDurableObjectUsage(env),
+  ]);
+
+  const checks = {
+    durableObjectAccess: doAccessResult.status === "fulfilled" && doAccessResult.value,
+    storageRoundTrip: storageRoundTripResult.status === "fulfilled" && storageRoundTripResult.value,
+    workerRequest: workerRequestResult.status === "fulfilled" && workerRequestResult.value.ok,
+    storedDataWithinLimit: false,
+  };
+
+  const usage = usageResult.status === "fulfilled" ? usageResult.value : null;
+  if (usage) {
+    checks.storedDataWithinLimit = usage.storedBytes < HEALTH_STORAGE_LIMIT_BYTES;
+  }
+
+  const failureReasons: string[] = [];
+  if (!checks.durableObjectAccess) failureReasons.push("durable object access failed");
+  if (!checks.storageRoundTrip) failureReasons.push("durable object storage round-trip failed");
+  if (!checks.workerRequest) failureReasons.push("worker self-request failed");
+  if (!usage) {
+    failureReasons.push("usage metrics unavailable");
+  } else if (!checks.storedDataWithinLimit) {
+    failureReasons.push(`stored data exceeds limit (${usage.storedBytes} bytes)`);
+  }
+
+  const healthy = checks.durableObjectAccess && checks.storageRoundTrip && checks.workerRequest && checks.storedDataWithinLimit && usage !== null;
+
+  return {
+    active: healthy,
+    checkedAt,
+    cacheExpiresAt: checkedAt + HEALTH_CACHE_TTL_MS,
+    refreshAfter: checkedAt + HEALTH_CACHE_TTL_MS - HEALTH_REFRESH_WINDOW_MS,
+    origin,
+    checks,
+    usage,
+    reason: failureReasons.length > 0 ? failureReasons.join("; ") : null,
+  };
+}
+
+async function resolveHealthStatus(env: Env, origin: string, refreshIfNearExpiry: boolean, forceRefresh: boolean = false): Promise<HealthStatusResponse> {
+  const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
+  const now = Date.now();
+  let cached: HealthStatusCache | null = null;
+
+  try {
+    cached = await tokenDO.getHealthCache();
+  } catch {
+    cached = null;
+  }
+
+  const cacheIsFresh = cached && cached.cacheExpiresAt > now;
+  const needsRefresh = forceRefresh || !cached || !cacheIsFresh || (refreshIfNearExpiry && cached.cacheExpiresAt - now < HEALTH_REFRESH_WINDOW_MS);
+
+  if (!needsRefresh && cached) {
+    return {
+      ...cached,
+      cached: true,
+      refreshed: false,
+      cacheAgeMs: now - cached.checkedAt,
+    };
+  }
+
+  const fresh = await buildHealthStatus(env, origin);
+  try {
+    await tokenDO.setHealthCache(fresh);
+  } catch {
+    // Return the fresh result even if persistence fails so the monitor still gets a signal.
+  }
+
+  return {
+    ...fresh,
+    cached: false,
+    refreshed: true,
+    cacheAgeMs: 0,
+  };
 }
 
 export default {
@@ -952,6 +1054,8 @@ export default {
             connectorTokens: string[];
             channelCount?: number;
             createdAt?: number;
+            providerIPs?: string[];
+            connectorIPs?: string[];
           }
         >();
 
@@ -993,7 +1097,7 @@ export default {
         const paginatedGroups = relayGroups.slice(startIdx, endIdx);
 
         await Promise.all(
-          paginatedGroups.map(async (g) => {
+          relayGroups.map(async (g) => {
             try {
               const relay = env.RELAY.get(env.RELAY.idFromString(g.relayId));
               const runtime = await relay.adminGetRuntimeInfo();
@@ -1001,7 +1105,6 @@ export default {
               g.providerCount = runtime.providerCount;
               g.connectorCount = runtime.connectorCount;
             } catch (e) {
-              // Relay DO gone — mark for cleanup.
               g.providerCount = 0;
               g.connectorCount = 0;
               g.channelCount = 0;
@@ -1009,8 +1112,22 @@ export default {
           })
         );
 
+        await Promise.all(
+          paginatedGroups.map(async (g) => {
+            try {
+              const relay = env.RELAY.get(env.RELAY.idFromString(g.relayId));
+              const details = await relay.adminGetConnectionDetails();
+              g.providerIPs = details.providerIPs;
+              g.connectorIPs = details.connectorIPs;
+            } catch {
+              g.providerIPs = [];
+              g.connectorIPs = [];
+            }
+          })
+        );
+
         // Filter out dead relays (0 providers + 0 connectors) and clean up their tokens in background.
-        const staleRelays = paginatedGroups.filter((g) => g.providerCount === 0 && g.connectorCount === 0);
+        const staleRelays = relayGroups.filter((g) => g.providerCount === 0 && g.connectorCount === 0);
         if (staleRelays.length > 0) {
           ctx.waitUntil(
             (async () => {
@@ -1459,7 +1576,7 @@ export default {
     </div>
 
     <div class="grid">
-      <div class="metric"><p class="mVal">${globalStats.currentConnections}</p><div class="mLab">Current connections</div></div>
+      <div class="metric"><p class="mVal">${totals.providers + totals.connectors}</p><div class="mLab">Current connections</div></div>
       <div class="metric"><p class="mVal">${globalStats.dailyStats.connections}</p><div class="mLab">Connections today</div></div>
       <div class="metric"><p class="mVal">${(globalStats.dailyStats.transferBytes / 1024 / 1024).toFixed(2)}</p><div class="mLab">MB transferred today</div></div>
       <div class="metric"><p class="mVal">${relayGroups.length}</p><div class="mLab">Active relays</div></div>
@@ -1538,8 +1655,8 @@ export default {
                   </div>
                   <!-- Inline Badges -->
                   <div style="display:flex; gap:6px; flex-wrap:wrap; opacity:0.8;">
-                    <span class="badge"><b>P</b> ${g.providerCount}</span>
-                    <span class="badge"><b>C</b> ${g.connectorCount}</span>
+                    <span class="badge" title="${(g.providerIPs && g.providerIPs.length > 0) ? 'IPs: ' + g.providerIPs.join(', ') : 'No connections'}"><b>P</b> ${g.providerCount}</span>
+                    <span class="badge" title="${(g.connectorIPs && g.connectorIPs.length > 0) ? 'IPs: ' + g.connectorIPs.join(', ') : 'No connections'}"><b>C</b> ${g.connectorCount}</span>
                     <span class="badge"><b>CH</b> ${typeof g.channelCount === "number" ? g.channelCount : "-"}</span>
                   </div>
                 </div>
@@ -1665,6 +1782,26 @@ export default {
         return new Response(html, { status: 200, headers: { "Content-Type": "text/html" } });
       }
 
+      if (path[1] === "api" && path[2] === "health" && path[3] === "ping") {
+        return new Response(null, {
+          status: 204,
+          headers: { "Cache-Control": "no-store" },
+        });
+      }
+
+      if (path[1] === "api" && path[2] === "health") {
+        const refreshIfNearExpiry = path[3] === "poll";
+        const forceRefresh = url.searchParams.get("force") === "1";
+        const health = await resolveHealthStatus(env, url.origin, refreshIfNearExpiry, forceRefresh);
+        return new Response(JSON.stringify(health), {
+          status: health.active ? 200 : 503,
+          headers: {
+            "Content-Type": "application/json",
+            "Cache-Control": "no-store",
+          },
+        });
+      }
+
       if (path[1] === "api" && path[2] === "usage") {
         const usage = await getDurableObjectUsage(env);
         return new Response(JSON.stringify(usage), {
@@ -1705,6 +1842,18 @@ function isTokenComplexEnough(token: string): { valid: boolean; reason?: string 
   return { valid: true };
 }
 
+function isSha256Hex(value: string): boolean {
+  return /^[0-9a-f]{64}$/i.test(value);
+}
+
+async function sha256Hex(input: string): Promise<string> {
+  const data = new TextEncoder().encode(input);
+  const hash = await crypto.subtle.digest("SHA-256", data);
+  return Array.from(new Uint8Array(hash))
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
+}
+
 function rejectWithMessage(message: string): Response {
   const pair = new WebSocketPair();
   const [client, server] = [pair[0], pair[1]];
@@ -1738,20 +1887,37 @@ async function handleWebsocket(request: Request, env: Env, token: string, isProv
     }
     relayId = env.RELAY.idFromString(relayStr);
   } else {
-    // For provider: validate token complexity (except "anonymous")
-    if (token !== ANONYMOUS_TOKEN_HASH) {
+    const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
+
+    // Resolve a hashed token back to the original token assigned by the
+    // server, so anonymous providers can reconnect to the same relay.
+    let isKnownHash = false;
+    if (isSha256Hex(token)) {
+      const original = await tokenDO.getTokenByHash(token);
+      if (original) {
+        actualToken = original;
+        isKnownHash = true;
+      }
+    }
+
+    // For provider: validate token complexity (except "anonymous" and known hashes)
+    if (token !== ANONYMOUS_TOKEN_HASH && !isKnownHash) {
       const validation = isTokenComplexEnough(token);
       if (!validation.valid) {
         return rejectWithMessage(validation.reason!);
       }
     }
-    
+
     if (token === ANONYMOUS_TOKEN_HASH) {
       actualToken = crypto.randomUUID();
+      relayId = env.RELAY.idFromName(actualToken);
+      // Remember the mapping so reconnects can reuse the same relay
+      const hash = await sha256Hex(actualToken);
+      await tokenDO.setTokenHashMapping(hash, actualToken, relayId.toString());
+    } else {
+      relayId = env.RELAY.idFromName(actualToken);
     }
-    relayId = env.RELAY.idFromName(actualToken);
 
-    const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
     const tombstoned = await tokenDO.isRelayDeleted(relayId.toString());
     if (tombstoned) {
       return rejectWithMessage("relay has been deleted");

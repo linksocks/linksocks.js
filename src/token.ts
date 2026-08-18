@@ -1,5 +1,5 @@
 import { DurableObject } from "cloudflare:workers";
-import { Env } from "./types";
+import type { Env, HealthStatusCache } from "./types";
 
 interface RelayMetadata {
   relayId: string;
@@ -35,6 +35,8 @@ export class Token extends DurableObject {
   private alarmScheduled: boolean = false;
 
   private static readonly RELAY_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+  private static readonly HEALTH_CACHE_KEY = "healthStatusCache";
+  private static readonly HEALTH_PROBE_KEY = "healthStorageProbe";
 
   constructor(state: DurableObjectState, env: Env) {
     super(state, env);
@@ -81,9 +83,35 @@ export class Token extends DurableObject {
     await this.storage.put('relayTokens', relayTokens.filter(t => t !== token));
   }
 
+  async setTokenHashMapping(tokenHash: string, originalToken: string, relayId: string) {
+    if (!tokenHash || !originalToken || !relayId) return;
+    await this.storage.put(`tokenHash:${tokenHash}`, originalToken);
+    const hashes = ((await this.storage.get(`relayHashIndex:${relayId}`)) as string[]) || [];
+    if (!hashes.includes(tokenHash)) {
+      hashes.push(tokenHash);
+      await this.storage.put(`relayHashIndex:${relayId}`, hashes);
+    }
+  }
+
+  async getTokenByHash(tokenHash: string): Promise<string | null> {
+    const original = await this.storage.get(`tokenHash:${tokenHash}`);
+    return typeof original === "string" && original ? original : null;
+  }
+
+  private async cleanupTokenHashMappings(relayId: string) {
+    const hashes = ((await this.storage.get(`relayHashIndex:${relayId}`)) as string[]) || [];
+    for (const hash of hashes) {
+      await this.storage.delete(`tokenHash:${hash}`);
+    }
+    await this.storage.delete(`relayHashIndex:${relayId}`);
+  }
+
   async deleteRelay(relayId: string) {
     const id = (relayId || "").trim();
     if (!id) return;
+
+    // Clean up reverse token hash mappings bound to this relay
+    await this.cleanupTokenHashMappings(id);
 
     const storedTokens = ((await this.storage.get('relayTokens')) as string[]) || [];
     const knownTokens = new Set(storedTokens.filter((t) => typeof t === "string" && t.trim()));
@@ -126,6 +154,10 @@ export class Token extends DurableObject {
       if (metadata?.relayId) {
         relayIds.add(metadata.relayId);
       }
+    }
+
+    for (const relayId of relayIds) {
+      await this.cleanupTokenHashMappings(relayId);
     }
 
     for (let i = 0; i < keysToDelete.length; i += 128) {
@@ -296,6 +328,37 @@ export class Token extends DurableObject {
     return true;
   }
 
+  async getHealthCache(): Promise<HealthStatusCache | null> {
+    const cached = await this.storage.get(Token.HEALTH_CACHE_KEY) as HealthStatusCache | null;
+    if (!cached || typeof cached !== "object") return null;
+    if (typeof cached.checkedAt !== "number" || typeof cached.cacheExpiresAt !== "number") return null;
+    return cached;
+  }
+
+  async pingHealthAccess(): Promise<boolean> {
+    return true;
+  }
+
+  async setHealthCache(status: HealthStatusCache): Promise<void> {
+    await this.storage.put(Token.HEALTH_CACHE_KEY, status);
+  }
+
+  async probeHealthStorageRoundTrip(): Promise<boolean> {
+    const probeValue = `${Date.now()}:${crypto.randomUUID()}`;
+
+    try {
+      await this.storage.put(Token.HEALTH_PROBE_KEY, probeValue);
+      const storedValue = await this.storage.get(Token.HEALTH_PROBE_KEY) as string | undefined;
+      return storedValue === probeValue;
+    } finally {
+      try {
+        await this.storage.delete(Token.HEALTH_PROBE_KEY);
+      } catch {
+        // Ignore cleanup failures; the probe result has already been determined.
+      }
+    }
+  }
+
   async getStats(): Promise<GlobalStats> {
     const now = Date.now();
     const oneDayAgo = now - 24 * 60 * 60 * 1000;
@@ -319,24 +382,29 @@ export class Token extends DurableObject {
       transferBytes: recentEvents.filter(isTrafficEvent).reduce((sum, e) => sum + e.bytes, 0)
     };
     
-    // Calculate current connections by deduping on relayId.
-    // Use a single list() to fetch all metadata in one row-read-batch operation
-    // instead of N individual get() calls (each costing a row read).
-    const relayCounts = new Map<string, { providers: number; connectors: number }>();
+    // Collect unique relayIds from stored metadata.
+    const relayIds = new Set<string>();
     const listed = await this.storage.list<RelayMetadata>({ prefix: "relay:" });
-    for (const [key, metadata] of listed) {
-      if (!metadata?.relayId) continue;
-      const existing = relayCounts.get(metadata.relayId) || { providers: 0, connectors: 0 };
-      existing.providers = Math.max(existing.providers, metadata.providerCount || 0);
-      existing.connectors = Math.max(existing.connectors, metadata.connectorCount || 0);
-      relayCounts.set(metadata.relayId, existing);
+    for (const metadata of listed.values()) {
+      if (metadata?.relayId) relayIds.add(metadata.relayId);
     }
 
+    // Query each Relay DO for live connection counts.
     let currentConnections = 0;
-    for (const v of relayCounts.values()) {
-      currentConnections += v.providers + v.connectors;
+    const liveResults = await Promise.allSettled(
+      Array.from(relayIds).map(async (relayId) => {
+        const relay = this.env.RELAY.get(this.env.RELAY.idFromString(relayId));
+        const info = await relay.adminGetRuntimeInfo();
+        return info.providerCount + info.connectorCount;
+      }),
+    );
+
+    for (const result of liveResults) {
+      if (result.status === "fulfilled") {
+        currentConnections += result.value;
+      }
     }
-    
+
     return { currentConnections, dailyStats };
   }
 

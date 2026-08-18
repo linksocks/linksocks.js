@@ -121,7 +121,9 @@ export class Relay extends DurableObject {
   private async getOwnColo(): Promise<string> {
     if (this.ownColo) return this.ownColo;
     try {
-      const resp = await fetch('https://1.1.1.1/cdn-cgi/trace');
+      const resp = await fetch('https://1.1.1.1/cdn-cgi/trace', {
+        signal: AbortSignal.timeout(3000),
+      });
       const text = await resp.text();
       const match = text.match(/^colo=(.+)$/m);
       this.ownColo = match ? match[1].trim() : 'unknown';
@@ -245,6 +247,23 @@ export class Relay extends DurableObject {
       connectorCount: actualConnectorCount,
       channelCount: this.providerChannels.size,
     };
+  }
+
+  async adminGetConnectionDetails(): Promise<{ providerIPs: string[]; connectorIPs: string[] }> {
+    const providerIPs: string[] = [];
+    const connectorIPs: string[] = [];
+
+    for (const ws of this.state.getWebSockets()) {
+      const meta = this.safeDeserializeAttachment(ws);
+      const ip = meta.clientIp || "unknown";
+      if (meta.isProvider === true) {
+        providerIPs.push(ip);
+      } else {
+        connectorIPs.push(ip);
+      }
+    }
+
+    return { providerIPs, connectorIPs };
   }
 
   private async ensureCleanupScheduled() {
@@ -528,8 +547,10 @@ export class Relay extends DurableObject {
           }
         }
 
+        const clientIp = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
+
         // Save session data for hibernation
-        server.serializeAttachment({ isProvider, actualToken } satisfies WebsocketMeta);
+        server.serializeAttachment({ isProvider, actualToken, clientIp } satisfies WebsocketMeta);
 
         const currentProviders = this.getActualProviderCount();
         const currentConnectors = this.getActualConnectorCount();
@@ -546,7 +567,6 @@ export class Relay extends DurableObject {
         const doColo = await this.getOwnColo();
         const doColoDescription = describeCloudflareColo(doColo);
         const clientCountry = request.headers.get('CF-IPCountry') || (request.cf && request.cf.country ? String(request.cf.country) : 'unknown');
-        const clientIp = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
         const providerLabel = currentProviders === 1 ? 'provider' : 'providers';
         const connectorLabel = currentConnectors === 1 ? 'connector' : 'connectors';
         let datacenterInfo: string;

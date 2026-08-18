@@ -51,3 +51,64 @@ Configure your browser or applications to use this SOCKS5 proxy to access intern
 This service uses Cloudflare Durable Objects which has free tier limitations (13,000 GB-s / day).
 For more information on limits and pricing, see: https://developers.cloudflare.com/durable-objects/platform/pricing/
 
+## Health Check API
+
+The worker exposes a health status API for external monitoring. Health results are cached for 1 hour in the Durable Object and refreshed when the cache is close to expiring.
+
+### `GET /api/health`
+
+Returns the current cached health status. If no cache exists or it has expired, a fresh probe is run automatically.
+
+**Status codes:**
+
+- `200` — healthy (all checks passed)
+- `503` — unhealthy (one or more checks failed)
+
+**Response fields:**
+
+| Field | Type | Description |
+|---|---|---|
+| `active` | `boolean` | `true` when all checks pass |
+| `checkedAt` | `number` | Timestamp (ms) when the check ran |
+| `cacheExpiresAt` | `number` | Timestamp (ms) when the cache expires |
+| `refreshAfter` | `number` | Timestamp (ms) after which a poll request will trigger a refresh |
+| `origin` | `string` | Worker origin used for the self-request probe |
+| `checks` | `object` | Individual check results (see below) |
+| `usage` | `object\|null` | Current-day Durable Object usage from GraphQL, or `null` if unavailable |
+| `reason` | `string\|null` | Semicolon-separated failure reasons, or `null` if healthy |
+| `cached` | `boolean` | Whether this response was served from cache |
+| `refreshed` | `boolean` | Whether a fresh probe was run for this response |
+| `cacheAgeMs` | `number` | Milliseconds since the cached check ran (0 if freshly refreshed) |
+
+**`checks` object:**
+
+| Field | Type | Description |
+|---|---|---|
+| `durableObjectAccess` | `boolean` | Successfully called a method on the Token Durable Object |
+| `storageRoundTrip` | `boolean` | Wrote a value to DO storage and read it back |
+| `workerRequest` | `boolean` | Worker fetched its own `/api/health/ping` endpoint |
+| `storedDataWithinLimit` | `boolean` | `storedBytes` is below 5 GB |
+
+**Example:**
+
+```bash
+curl https://your-worker.example.com/api/health
+```
+
+### `GET /api/health/poll`
+
+Polling endpoint designed for external uptime monitors. Behaves the same as `/api/health`, but additionally checks whether the cache is close to expiring (within 10 minutes). If so, a fresh probe is run before returning.
+
+Typical usage: configure your monitoring tool to poll every 5 minutes. The cache will auto-refresh once per hour, and near-expiry polls will keep it fresh.
+
+```bash
+curl https://your-worker.example.com/api/health/poll
+```
+
+#### Force Refresh
+
+Append `?force=1` to skip the cache entirely and run a fresh probe immediately:
+
+```bash
+curl https://your-worker.example.com/api/health/poll?force=1
+```

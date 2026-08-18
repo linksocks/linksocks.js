@@ -6,30 +6,37 @@
  *   CF_API_TOKEN   - Cloudflare API Token with Analytics: Read permission
  *   CF_ACCOUNT_ID  - Your Cloudflare Account ID (32 hex chars)
  */
-{
+ {
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "linksocks",
   "main": "src/index.ts",
   "compatibility_date": "2025-04-13",
+
   "observability": {
-    "enabled": true,
+    "enabled": true
   },
+
   "durable_objects": {
     "bindings": [
       {
         "name": "RELAY",
-        "class_name": "Relay",
+        "class_name": "Relay"
       },
       {
         "name": "TOKEN",
-        "class_name": "Token",
-      },
-    ],
+        "class_name": "Token"
+      }
+    ]
   },
-  "migrations": [
-    {
-      "tag": "v1",
-      "new_sqlite_classes": ["Relay", "Token"]
+
+  "exports": {
+    "Relay": {
+      "type": "durable-object",
+      "storage": "sqlite"
     },
-  ],
+    "Token": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    }
+  }
 }
