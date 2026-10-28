@@ -53,13 +53,15 @@ function textResponse(message: string, status = 400): Response {
   });
 }
 
-async function requireDb(env: Env): Promise<boolean> {
-  if (!env.DB) return false;
+async function requireDb(env: Env): Promise<string | null> {
+  if (!env.DB) return "D1 binding DB is not configured";
   try {
     await ensureSchema(env);
-    return true;
-  } catch {
-    return false;
+    return null;
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    console.error("control plane initialization failed:", reason);
+    return reason;
   }
 }
 
@@ -226,8 +228,9 @@ function buildOverview(
 }
 
 export async function handleAdmin(request: Request, env: Env, url: URL): Promise<Response> {
-  if (!(await requireDb(env))) {
-    return textResponse("Web control plane requires a D1 database binding named DB.", 503);
+  const dbError = await requireDb(env);
+  if (dbError) {
+    return textResponse(`Web control plane unavailable: ${dbError}`, 503);
   }
 
   if (url.searchParams.has("logout")) {
@@ -484,8 +487,9 @@ async function disconnectHost(env: Env, relayId: string, host: string): Promise<
 }
 
 export async function handleDashboard(request: Request, env: Env, url: URL): Promise<Response> {
-  if (!(await requireDb(env))) {
-    return textResponse("Web control plane requires a D1 database binding named DB.", 503);
+  const dbError = await requireDb(env);
+  if (dbError) {
+    return textResponse(`Web control plane unavailable: ${dbError}`, 503);
   }
 
   if (url.searchParams.has("logout")) {
@@ -648,8 +652,9 @@ async function handleDashboardAction(
 }
 
 export async function handleRegister(request: Request, env: Env, url: URL): Promise<Response> {
-  if (!(await requireDb(env))) {
-    return textResponse("Web control plane requires a D1 database binding named DB.", 503);
+  const dbError = await requireDb(env);
+  if (dbError) {
+    return textResponse(`Web control plane unavailable: ${dbError}`, 503);
   }
   const global = await getAnonymousSettings(env);
   if (!global.allowRegistration) {

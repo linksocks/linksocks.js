@@ -75,6 +75,14 @@ test("administrator can enable and disable policy checkboxes", { timeout: 20000 
   assert.equal(created.status, 303);
   const userId = new URL(created.headers.get("location")).searchParams.get("user");
   assert.ok(userId);
+
+  // The Workers runtime rejects PBKDF2 iteration counts above 100000, so a
+  // higher value would break every dashboard login in production while still
+  // passing under Miniflare. Pin the parameters here.
+  const db = await worker.getD1Database("DB");
+  const stored = await db.prepare("SELECT password_hash FROM users WHERE id = ?").bind(userId).first();
+  const [, iterations] = String(stored?.password_hash || "").split("$");
+  assert.equal(Number(iterations), 100000, "password hashing must stay within the Workers PBKDF2 limit");
   const userPage = await worker.dispatchFetch(`http://localhost/admin?tab=users&user=${userId}`, { headers });
   const userHtml = await userPage.text();
   const policyForm = userHtml.split('name="action" value="saveSettings"')[1]?.split("</form>")[0] || "";

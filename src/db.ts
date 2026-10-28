@@ -242,7 +242,12 @@ async function ensureAdminUser(env: Env): Promise<void> {
 /* Passwords and sessions                                                     */
 /* -------------------------------------------------------------------------- */
 
-const PBKDF2_ITERATIONS = 120_000;
+// The Workers runtime rejects PBKDF2 iteration counts above 100,000
+// ("iteration counts above 100000 are not supported"). Local Miniflare uses a
+// different WebCrypto implementation and accepts more, so this ceiling is
+// enforced by the platform, not by choice: hashing fails at runtime if raised.
+const PBKDF2_ITERATIONS = 100_000;
+const PBKDF2_MAX_ITERATIONS = 100_000;
 
 function toBase64(bytes: Uint8Array): string {
   let binary = "";
@@ -286,21 +291,29 @@ export async function verifyPassword(password: string, stored: string): Promise<
   if (parts.length !== 4 || parts[0] !== "pbkdf2") return false;
   const iterations = Number(parts[1]);
   if (!Number.isFinite(iterations) || iterations < 1000) return false;
+  // A hash produced with parameters the runtime cannot replay (for example an
+  // iteration count above the platform ceiling) must fail closed instead of
+  // turning every login into a 500.
+  if (iterations > PBKDF2_MAX_ITERATIONS) return false;
   const salt = fromBase64(parts[2]);
   const expected = parts[3];
-  const key = await crypto.subtle.importKey(
-    "raw",
-    new TextEncoder().encode(password),
-    "PBKDF2",
-    false,
-    ["deriveBits"],
-  );
-  const bits = await crypto.subtle.deriveBits(
-    { name: "PBKDF2", hash: "SHA-256", salt, iterations },
-    key,
-    256,
-  );
-  return constantTimeEqual(toBase64(new Uint8Array(bits)), expected);
+  try {
+    const key = await crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(password),
+      "PBKDF2",
+      false,
+      ["deriveBits"],
+    );
+    const bits = await crypto.subtle.deriveBits(
+      { name: "PBKDF2", hash: "SHA-256", salt, iterations },
+      key,
+      256,
+    );
+    return constantTimeEqual(toBase64(new Uint8Array(bits)), expected);
+  } catch {
+    return false;
+  }
 }
 
 export function parseCookies(request: Request): Record<string, string> {
