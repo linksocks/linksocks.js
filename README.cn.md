@@ -110,3 +110,134 @@ curl https://your-worker.example.com/api/health/poll
 ```bash
 curl https://your-worker.example.com/api/health/poll?force=1
 ```
+
+## 网站反向代理（Web 模式）
+
+除 SOCKS5 中转外，linksocks.js 现在还可以把本地网站直接发布到 Cloudflare 边缘：
+
+```bash
+# 在本机运行，将 127.0.0.1:8080 发布为 https://<随机>.example.com
+linksocks web -u wss://your-worker.example.com -l http://127.0.0.1:8080
+```
+
+服务端不再直接访问你的内网：Cloudflare 收到 HTTP 请求后，通过现有的 WebSocket 隧道
+把请求转发给 `linksocks web` 进程，由它访问本地后端并把响应流回边缘。因此不需要公网
+IP、不需要开放入站端口，也不需要在 Worker 中配置任何源站地址。
+
+### 服务端准备
+
+1. 创建 D1 数据库并写入 `wrangler.jsonc`：
+
+   ```bash
+   wrangler d1 create linksocks
+   # 把输出的 database_id 填入 wrangler.jsonc 的 d1_databases[0].database_id
+   ```
+
+   首次访问时 Worker 会自动建表；也可以执行 `wrangler d1 migrations apply linksocks`。
+
+2. 设置密钥与变量：
+
+   ```bash
+   wrangler secret put ADMIN_PASSWORD    # 管理员密码，首次启动自动创建管理员
+   wrangler secret put SESSION_SECRET    # 可选，登录会话签名
+   ```
+
+   `wrangler.jsonc` 中的变量：
+
+   | 变量 | 说明 |
+   |---|---|
+   | `WEB_ZONE` | 生成域名使用的基础域，例如 `example.com` |
+   | `BASE_HOST` | Control Plane 所在主机名，例如 `linksocks.example.com`；为空时回退到 `WEB_ZONE` |
+   | `ADMIN_USERNAME` | 初始管理员用户名，默认 `admin` |
+
+3. DNS：把 `example.com` 与 `*.example.com` 都指向这个 Worker（自定义域或路由），
+   这样自动生成的临时域名才能被访问。
+
+4. 部署：
+
+   ```bash
+   wrangler deploy
+   ```
+
+### 命令行
+
+```bash
+linksocks web -u <server> -l <local-url> [选项]
+```
+
+| 参数 | 说明 |
+|---|---|
+| `-t, --token` | 在 `/dashboard` 创建的 Provider Token；省略时为匿名 |
+| `-u, --url` | linksocks.js 服务地址，支持 `ws://`、`wss://`、`http://`、`https://` |
+| `-l, --local` | 本地后端地址，可重复指定以在同一 Provider 内做负载均衡 |
+| `--domain` | 自定义远程域名（必须是 `WEB_ZONE` 的子域，且服务端允许自定义域名） |
+| `--insecure` | 本地后端为 `https://` 时跳过证书校验 |
+| `-R, --no-reconnect` | 服务端断开后不再重连 |
+| `-d, --debug` | 调试日志（`-dd` 为 trace） |
+
+示例：
+
+```bash
+# 匿名发布一个临时域名
+linksocks web -u wss://linksocks.example.com -l http://127.0.0.1:3000
+
+# 使用账号令牌发布固定域名，并配置两个源站
+linksocks web -u wss://linksocks.example.com -t ls_xxx \
+  --domain blog.example.com \
+  -l http://127.0.0.1:3000 -l http://127.0.0.1:3001
+```
+
+### 用户系统（基于 D1）
+
+- `/admin`：管理员控制台。首次启动时根据 `ADMIN_USERNAME` / `ADMIN_PASSWORD`
+  自动创建管理员账号，登录后可以管理用户、令牌、站点与全局匿名策略。
+- `/dashboard`：普通用户面板，只能看到自己的站点、令牌、流量与源站状态。
+- `/register`：用户自助注册，受全局设置 `allowRegistration` 控制。
+- 用户在 `/dashboard` 生成 Token 后，用 `-t <token>` 运行的 Provider 会自动绑定到该账号；
+  面板中会显示站点归属、临时域名徽章、到期倒计时、源站数量与在线 Provider 数量。
+- 管理员可以在“Settings”中配置匿名访问开关、是否允许自定义域名、是否允许用户注册、
+  是否允许用户编辑自己的策略；在用户详情页可以查看/覆盖该用户的策略。
+
+### 配额与临时域名
+
+每个站点在创建时冻结一份策略：
+
+| 设置 | 说明 |
+|---|---|
+| `autoRotateSeconds` | 自动生成域名的有效期；Provider 会在到期前自动请求新域名 |
+| `quotaBytes` | 转发字节上限（请求 + 响应，0 表示不限） |
+| `quotaRequests` | 请求数上限（0 表示不限） |
+| `quotaDurationSeconds` | 站点最长存活时间（0 表示不限） |
+| `maxSites` | 每个账号 / 每个匿名令牌可创建的站点数 |
+| `maxBackends` | 单次注册允许的源站数量 |
+
+自动生成的域名永远标记为 `temporary`，界面会显示剩余有效期；自定义域名默认长期有效。
+超过配额时边缘会直接返回 `429`，临时域名过期后返回 `410`。
+
+### 负载均衡
+
+- 同一个 Provider 用多个 `-l` 指定多个本地后端，`linksocks web` 内部轮询。
+- 同一个域名用多个 `linksocks web` 进程（相同 Token）注册时，边缘在不同 Provider
+  之间轮询；面板中的“源站数量/在线 Provider”会分别统计。
+
+### 新增协议消息
+
+二进制消息类型 0x12–0x18（与 Go 客户端共用）：
+
+| 类型 | 方向 | 说明 |
+|---|---|---|
+| `web_register` (0x12) | Provider → Relay | 上报域名（可空）、源站列表、TLS 校验与轮换意图 |
+| `web_register_response` (0x13) | Relay → Provider | 返回最终域名、是否临时、到期时间、源站数量 |
+| `web_request` (0x14) | Relay → Provider | 请求方法、路径、头部、请求体长度等元数据 |
+| `web_response` (0x15) | Provider → Relay | 响应状态码与响应头 |
+| `web_data` (0x16) | 双向 | 请求体 / 响应体分片，末片带 `end` 标志 |
+| `web_cancel` (0x17) | 双向 | 取消某个通道 |
+| `web_rotate` (0x18) | Relay → Provider | 通知域名已轮换 |
+
+### 已知限制
+
+- 通过网站代理的 WebSocket Upgrade 暂不支持（返回 `501`），需要 WebSocket 时请使用
+  SOCKS5 / relay 模式。
+- 请求体上限 16 MB；响应体为流式转发。
+- 每个临时域名有失效时间，过期后必须重新注册才能获得新域名。
+

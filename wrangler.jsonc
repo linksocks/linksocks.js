@@ -16,6 +16,27 @@
     "enabled": true
   },
 
+  "vars": {
+    // Base domain for generated hosts, e.g. "example.com". Required for
+    // automatic hostnames and custom-host validation.
+    "WEB_ZONE": "",
+    // Public hostname of this Worker (used to separate control-plane routes
+    // from proxied websites). Defaults to WEB_ZONE when empty.
+    "BASE_HOST": "",
+    // Initial administrator username. ADMIN_PASSWORD must be set as a secret.
+    "ADMIN_USERNAME": "admin"
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "linksocks",
+      // Replace with the id from `wrangler d1 create linksocks`.
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations"
+    }
+  ],
+
   "durable_objects": {
     "bindings": [
       {

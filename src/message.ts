@@ -1,7 +1,9 @@
 import { gzip, ungzip } from "pako";
 
-// Protocol version
-export const PROTOCOL_VERSION = 0x01;
+// Add a message type or make a compatible protocol change: bump the minor version.
+// Before bumping the major version for a format change that breaks old parsers,
+// ask the project owner for approval. Feature minimums are separate from this version.
+export const PROTOCOL_VERSION = 0x03;
 
 function protocolMajor(v: number): number {
   return (v >> 4) & 0x0f;
@@ -22,6 +24,17 @@ export const enum BinaryType {
   DirectCapabilities = 0x0B,
   DirectRendezvous = 0x0C,
   DirectStatus = 0x0D,
+  ChannelBind = 0x0E,
+  ChannelMigrate = 0x0F,
+  ChannelMigrateAck = 0x10,
+  ChannelDataAck = 0x11,
+  WebRegister = 0x12,
+  WebRegisterResponse = 0x13,
+  WebRequest = 0x14,
+  WebResponse = 0x15,
+  WebData = 0x16,
+  WebCancel = 0x17,
+  WebRotate = 0x18,
 }
 
 // Protocol types
@@ -51,6 +64,17 @@ export const enum MessageType {
   DirectCapabilities = "direct_capabilities",
   DirectRendezvous = "direct_rendezvous",
   DirectStatus = "direct_status",
+  ChannelBind = "channel_bind",
+  ChannelMigrate = "channel_migrate",
+  ChannelMigrateAck = "channel_migrate_ack",
+  ChannelDataAck = "channel_data_ack",
+  WebRegister = "web_register",
+  WebRegisterResponse = "web_register_response",
+  WebRequest = "web_request",
+  WebResponse = "web_response",
+  WebData = "web_data",
+  WebCancel = "web_cancel",
+  WebRotate = "web_rotate",
   Unknown = "unknown",
 }
 
@@ -157,6 +181,94 @@ export interface DirectStatusMessage extends BaseMessage {
   sessionId: string;
   status: string;
   metrics?: DirectMetrics;
+}
+
+export interface ChannelBindMessage extends BaseMessage {
+  channelId: string;
+  protocol: string;
+  peerSessionId?: string;
+}
+
+export interface ChannelMigrateMessage extends BaseMessage {
+  channelId: string;
+  reason?: string;
+}
+
+export interface ChannelMigrateAckMessage extends BaseMessage {
+  channelId: string;
+  success: boolean;
+  error?: string;
+}
+
+export interface ChannelDataAckMessage extends BaseMessage {
+  channelId: string;
+  sequence: number;
+}
+
+export interface WebBackend {
+  url: string;
+  weight?: number;
+}
+
+export interface WebRegisterMessage extends BaseMessage {
+  /** Requested custom host. Empty means the server should generate one. */
+  host?: string;
+  backends: WebBackend[];
+  /** Skip TLS certificate verification for https backends (provider side). */
+  insecure?: boolean;
+  /** Ask the server to replace the previous temporary host. */
+  rotate?: boolean;
+  label?: string;
+}
+
+export interface WebRegisterResponseMessage extends BaseMessage {
+  success: boolean;
+  error?: string;
+  host?: string;
+  url?: string;
+  temporary?: boolean;
+  expiresAt?: number;
+  rotateSeconds?: number;
+  backendCount?: number;
+  owner?: string;
+}
+
+export interface WebRequestMessage extends BaseMessage {
+  channelId: string;
+  method: string;
+  /** Path plus query string, e.g. /foo?bar=1. */
+  path: string;
+  headers: Array<[string, string]>;
+  hasBody: boolean;
+  bodyLength?: number;
+  clientIp?: string;
+  scheme?: string;
+  host?: string;
+}
+
+export interface WebResponseMessage extends BaseMessage {
+  channelId: string;
+  status: number;
+  headers: Array<[string, string]>;
+  bodyLength?: number;
+}
+
+export interface WebDataMessage extends BaseMessage {
+  channelId: string;
+  data: Uint8Array;
+  end: boolean;
+}
+
+export interface WebCancelMessage extends BaseMessage {
+  channelId: string;
+  reason?: string;
+}
+
+export interface WebRotateMessage extends BaseMessage {
+  host: string;
+  url: string;
+  expiresAt?: number;
+  rotateSeconds?: number;
 }
 
 export interface UnknownMessage extends BaseMessage {
@@ -494,9 +606,233 @@ export function packMessage(msg: BaseMessage): Uint8Array {
       return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
     }
 
+    case MessageType.ChannelBind: {
+      const bindMsg = msg as ChannelBindMessage;
+      const payloadBody = {
+        channel_id: bindMsg.channelId,
+        protocol: bindMsg.protocol,
+        peer_session_id: bindMsg.peerSessionId,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.ChannelBind,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.ChannelMigrate: {
+      const migrateMsg = msg as ChannelMigrateMessage;
+      const payloadBody = {
+        channel_id: migrateMsg.channelId,
+        reason: migrateMsg.reason,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.ChannelMigrate,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.ChannelMigrateAck: {
+      const ackMsg = msg as ChannelMigrateAckMessage;
+      const payloadBody = {
+        channel_id: ackMsg.channelId,
+        success: ackMsg.success,
+        error: ackMsg.error,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.ChannelMigrateAck,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.ChannelDataAck: {
+      const dataAckMsg = msg as ChannelDataAckMessage;
+      const payloadBody = {
+        channel_id: dataAckMsg.channelId,
+        sequence: dataAckMsg.sequence,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.ChannelDataAck,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.WebRegister: {
+      const registerMsg = msg as WebRegisterMessage;
+      const payloadBody = {
+        host: registerMsg.host || "",
+        backends: registerMsg.backends,
+        insecure: Boolean(registerMsg.insecure),
+        rotate: Boolean(registerMsg.rotate),
+        label: registerMsg.label || "",
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.WebRegister,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.WebRegisterResponse: {
+      const responseMsg = msg as WebRegisterResponseMessage;
+      const payloadBody = {
+        success: responseMsg.success,
+        error: responseMsg.error,
+        host: responseMsg.host,
+        url: responseMsg.url,
+        temporary: responseMsg.temporary,
+        expires_at: responseMsg.expiresAt,
+        rotate_seconds: responseMsg.rotateSeconds,
+        backend_count: responseMsg.backendCount,
+        owner: responseMsg.owner,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.WebRegisterResponse,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.WebRequest: {
+      const requestMsg = msg as WebRequestMessage;
+      const payloadBody = {
+        channel_id: requestMsg.channelId,
+        method: requestMsg.method,
+        path: requestMsg.path,
+        headers: requestMsg.headers,
+        has_body: requestMsg.hasBody,
+        body_length: requestMsg.bodyLength,
+        client_ip: requestMsg.clientIp,
+        scheme: requestMsg.scheme,
+        host: requestMsg.host,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.WebRequest,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.WebResponse: {
+      const responseMsg = msg as WebResponseMessage;
+      const payloadBody = {
+        channel_id: responseMsg.channelId,
+        status: responseMsg.status,
+        headers: responseMsg.headers,
+        body_length: responseMsg.bodyLength,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.WebResponse,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.WebData: {
+      const dataMsg = msg as WebDataMessage;
+      const channelIdBytes = uuidToBytes(dataMsg.channelId);
+      const payload = [
+        BinaryType.WebData,
+        ...channelIdBytes,
+        dataMsg.end ? 1 : 0,
+        (dataMsg.data.length >> 24) & 0xff,
+        (dataMsg.data.length >> 16) & 0xff,
+        (dataMsg.data.length >> 8) & 0xff,
+        dataMsg.data.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), dataMsg.data);
+    }
+
+    case MessageType.WebCancel: {
+      const cancelMsg = msg as WebCancelMessage;
+      const payloadBody = {
+        channel_id: cancelMsg.channelId,
+        reason: cancelMsg.reason,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.WebCancel,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.WebRotate: {
+      const rotateMsg = msg as WebRotateMessage;
+      const payloadBody = {
+        host: rotateMsg.host,
+        url: rotateMsg.url,
+        expires_at: rotateMsg.expiresAt,
+        rotate_seconds: rotateMsg.rotateSeconds,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.WebRotate,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
     default:
       throw new Error("Unsupported message type for binary serialization");
   }
+}
+
+function parseJsonPayload(payload: Uint8Array, name: string): Record<string, any> {
+  if (payload.length < 4) {
+    throw new Error(`Invalid ${name} message`);
+  }
+  const dataLen =
+    (payload[0] << 24) |
+    (payload[1] << 16) |
+    (payload[2] << 8) |
+    payload[3];
+  if (payload.length < 4 + dataLen) {
+    throw new Error(`Invalid ${name} message length`);
+  }
+  const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
+  return JSON.parse(jsonData);
 }
 
 export function parseMessageWithVersion(data: Uint8Array): ParsedMessageWithVersion {
@@ -872,6 +1208,222 @@ export function parseMessageWithVersion(data: Uint8Array): ParsedMessageWithVers
             : undefined,
           getType: () => MessageType.DirectStatus,
         } as DirectStatusMessage,
+      };
+    }
+
+    case BinaryType.ChannelBind: {
+      if (payload.length < 4) {
+        throw new Error("Invalid channel bind message");
+      }
+      const dataLen =
+        (payload[0] << 24) |
+        (payload[1] << 16) |
+        (payload[2] << 8) |
+        payload[3];
+      if (payload.length < 4 + dataLen) {
+        throw new Error("Invalid channel bind message length");
+      }
+      const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
+      const parsed = JSON.parse(jsonData);
+      return {
+        version,
+        message: {
+          channelId: parsed.channel_id,
+          protocol: parsed.protocol,
+          peerSessionId: parsed.peer_session_id,
+          getType: () => MessageType.ChannelBind,
+        } as ChannelBindMessage,
+      };
+    }
+
+    case BinaryType.ChannelMigrate: {
+      if (payload.length < 4) {
+        throw new Error("Invalid channel migrate message");
+      }
+      const dataLen =
+        (payload[0] << 24) |
+        (payload[1] << 16) |
+        (payload[2] << 8) |
+        payload[3];
+      if (payload.length < 4 + dataLen) {
+        throw new Error("Invalid channel migrate message length");
+      }
+      const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
+      const parsed = JSON.parse(jsonData);
+      return {
+        version,
+        message: {
+          channelId: parsed.channel_id,
+          reason: parsed.reason,
+          getType: () => MessageType.ChannelMigrate,
+        } as ChannelMigrateMessage,
+      };
+    }
+
+    case BinaryType.ChannelMigrateAck: {
+      if (payload.length < 4) {
+        throw new Error("Invalid channel migrate ack message");
+      }
+      const dataLen =
+        (payload[0] << 24) |
+        (payload[1] << 16) |
+        (payload[2] << 8) |
+        payload[3];
+      if (payload.length < 4 + dataLen) {
+        throw new Error("Invalid channel migrate ack message length");
+      }
+      const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
+      const parsed = JSON.parse(jsonData);
+      return {
+        version,
+        message: {
+          channelId: parsed.channel_id,
+          success: parsed.success,
+          error: parsed.error,
+          getType: () => MessageType.ChannelMigrateAck,
+        } as ChannelMigrateAckMessage,
+      };
+    }
+
+    case BinaryType.ChannelDataAck: {
+      if (payload.length < 4) {
+        throw new Error("Invalid channel data ack message");
+      }
+      const dataLen =
+        (payload[0] << 24) |
+        (payload[1] << 16) |
+        (payload[2] << 8) |
+        payload[3];
+      if (payload.length < 4 + dataLen) {
+        throw new Error("Invalid channel data ack message length");
+      }
+      const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
+      const parsed = JSON.parse(jsonData);
+      return {
+        version,
+        message: {
+          channelId: parsed.channel_id,
+          sequence: parsed.sequence,
+          getType: () => MessageType.ChannelDataAck,
+        } as ChannelDataAckMessage,
+      };
+    }
+
+    case BinaryType.WebRegister: {
+      const parsed = parseJsonPayload(payload, "web register");
+      return {
+        version,
+        message: {
+          host: parsed.host || "",
+          backends: Array.isArray(parsed.backends) ? parsed.backends : [],
+          insecure: Boolean(parsed.insecure),
+          rotate: Boolean(parsed.rotate),
+          label: parsed.label || "",
+          getType: () => MessageType.WebRegister,
+        } as WebRegisterMessage,
+      };
+    }
+
+    case BinaryType.WebRegisterResponse: {
+      const parsed = parseJsonPayload(payload, "web register response");
+      return {
+        version,
+        message: {
+          success: Boolean(parsed.success),
+          error: parsed.error,
+          host: parsed.host,
+          url: parsed.url,
+          temporary: Boolean(parsed.temporary),
+          expiresAt: parsed.expires_at,
+          rotateSeconds: parsed.rotate_seconds,
+          backendCount: parsed.backend_count,
+          owner: parsed.owner,
+          getType: () => MessageType.WebRegisterResponse,
+        } as WebRegisterResponseMessage,
+      };
+    }
+
+    case BinaryType.WebRequest: {
+      const parsed = parseJsonPayload(payload, "web request");
+      return {
+        version,
+        message: {
+          channelId: parsed.channel_id,
+          method: parsed.method || "GET",
+          path: parsed.path || "/",
+          headers: Array.isArray(parsed.headers) ? parsed.headers : [],
+          hasBody: Boolean(parsed.has_body),
+          bodyLength: parsed.body_length,
+          clientIp: parsed.client_ip,
+          scheme: parsed.scheme,
+          host: parsed.host,
+          getType: () => MessageType.WebRequest,
+        } as WebRequestMessage,
+      };
+    }
+
+    case BinaryType.WebResponse: {
+      const parsed = parseJsonPayload(payload, "web response");
+      return {
+        version,
+        message: {
+          channelId: parsed.channel_id,
+          status: Number(parsed.status) || 502,
+          headers: Array.isArray(parsed.headers) ? parsed.headers : [],
+          bodyLength: parsed.body_length,
+          getType: () => MessageType.WebResponse,
+        } as WebResponseMessage,
+      };
+    }
+
+    case BinaryType.WebData: {
+      if (payload.length < 21) {
+        throw new Error("Invalid web data message");
+      }
+      const channelId = bytesToUUID(payload.slice(0, 16));
+      const end = Boolean(payload[16] & 0x01);
+      const dataLen =
+        (payload[17] << 24) |
+        (payload[18] << 16) |
+        (payload[19] << 8) |
+        payload[20];
+      if (payload.length < 21 + dataLen) {
+        throw new Error("Invalid web data message length");
+      }
+      return {
+        version,
+        message: {
+          channelId,
+          data: payload.slice(21, 21 + dataLen),
+          end,
+          getType: () => MessageType.WebData,
+        } as WebDataMessage,
+      };
+    }
+
+    case BinaryType.WebCancel: {
+      const parsed = parseJsonPayload(payload, "web cancel");
+      return {
+        version,
+        message: {
+          channelId: parsed.channel_id,
+          reason: parsed.reason,
+          getType: () => MessageType.WebCancel,
+        } as WebCancelMessage,
+      };
+    }
+
+    case BinaryType.WebRotate: {
+      const parsed = parseJsonPayload(payload, "web rotate");
+      return {
+        version,
+        message: {
+          host: parsed.host || "",
+          url: parsed.url || "",
+          expiresAt: parsed.expires_at,
+          rotateSeconds: parsed.rotate_seconds,
+          getType: () => MessageType.WebRotate,
+        } as WebRotateMessage,
       };
     }
 

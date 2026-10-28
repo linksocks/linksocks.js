@@ -3,6 +3,10 @@ import zxcvbn from "zxcvbn";
 
 import { handleErrors } from "./common";
 import { AuthResponseMessage, packMessage, MessageType } from "./message";
+import { getSite, normalizeHost } from "./db";
+import { ensureSchema } from "./db";
+import { handleAdmin, handleDashboard, handleRegister } from "./panel";
+import { renderErrorPage, renderExpiredPage } from "./ui";
 export { Relay } from "./relay";
 export { Token } from "./token";
 
@@ -177,7 +181,26 @@ export default {
     return await handleErrors(request, async () => {
       const url = new URL(request.url);
       const path = url.pathname.split("/");
-      
+      const requestHost = normalizeHost(url.hostname);
+
+      // Custom hostnames are served by the web reverse proxy. Internal
+      // control-plane routes only exist on the configured base host(s).
+      if (!isInternalRequestHost(requestHost, env)) {
+        return await handleSiteProxy(request, env, url, requestHost);
+      }
+
+      if (path[1] === "admin" && env.DB) {
+        return await handleAdmin(request, env, url);
+      }
+
+      if (path[1] === "dashboard" && env.DB) {
+        return await handleDashboard(request, env, url);
+      }
+
+      if (path[1] === "register" && env.DB) {
+        return await handleRegister(request, env, url);
+      }
+
       if (path[1] === "") {
         const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
         let statsError: string | null = null;
@@ -846,7 +869,9 @@ export default {
         });
       }
 
-      if (path[1] === "admin") {
+      // Legacy password-only admin UI. Kept as a fallback for deployments
+      // without a D1 binding; the D1-backed console at /admin supersedes it.
+      if (path[1] === "admin" && !env.DB) {
         if (!env.ADMIN_PASSWORD) {
           return new Response("Missing ADMIN_PASSWORD", {
             status: 500,
@@ -1813,12 +1838,23 @@ export default {
       if (path[1] === "socket" && request.headers.get("Upgrade") === "websocket") {
         const token = url.searchParams.get("token");
         const reverse = url.searchParams.get("reverse");
+        const web = url.searchParams.get("web") === "1" || url.searchParams.get("web") === "true";
         
         if (!token) {
           throw Error('Missing token parameter.');
         }
+
+        if (web && !env.DB) {
+          return rejectWithMessage("Web proxy requires a D1 database binding named DB");
+        }
         
-        return await handleWebsocket(request, env, token, reverse === "1" || reverse === "true");
+        return await handleWebsocket(
+          request,
+          env,
+          token,
+          reverse === "1" || reverse === "true" || web,
+          web,
+        );
       }
 
       return new Response("Not found", { status: 404 });
@@ -1867,12 +1903,13 @@ function rejectWithMessage(message: string): Response {
   return new Response(null, { status: 101, webSocket: client });
 }
 
-async function handleWebsocket(request: Request, env: Env, token: string, isProvider: boolean): Promise<Response> {
+async function handleWebsocket(request: Request, env: Env, token: string, isProvider: boolean, web = false): Promise<Response> {
   // Validate request
   if (request.headers.get("Upgrade") !== "websocket") {
     return new Response("Expected WebSocket", { status: 426 });
   }
 
+  const requestUrl = new URL(request.url);
   let relayId: DurableObjectId;
   let actualToken = token;
 
@@ -1922,6 +1959,22 @@ async function handleWebsocket(request: Request, env: Env, token: string, isProv
     if (tombstoned) {
       return rejectWithMessage("relay has been deleted");
     }
+
+    // Remember sha256(actualToken) -> actualToken so clients that send the
+    // hashed token in the query (the Go client does this on every reconnect)
+    // resolve back to the same relay and the same D1 user binding.
+    try {
+      const tokenHash = isSha256Hex(actualToken)
+        ? actualToken.toLowerCase()
+        : await sha256Hex(actualToken);
+      await tokenDO.setTokenHashMapping(
+        await sha256Hex(tokenHash),
+        actualToken,
+        relayId.toString(),
+      );
+    } catch {
+      // Best-effort; the relay still works for the current connection.
+    }
   }
 
   // Check if the request is from APAC region and set locationHint accordingly
@@ -1933,8 +1986,11 @@ async function handleWebsocket(request: Request, env: Env, token: string, isProv
 
   // Add provider/connector information to the URL for the relay
   const newUrl = new URL(request.url);
-  newUrl.pathname = isProvider ? "/provider" : "/connector";
+  newUrl.pathname = isProvider ? (web ? "/web-provider" : "/provider") : "/connector";
   newUrl.searchParams.set("actualToken", actualToken);
+  if (web) {
+    newUrl.searchParams.set("baseHost", requestUrl.hostname);
+  }
 
   // Forward to relay
   return await relay.fetch(new Request(newUrl, request));
@@ -1954,3 +2010,115 @@ async function disconnectRelaysInBackground(env: Env, relayIds: string[], reason
     );
   }
 }
+
+/**
+ * Internal control-plane routes live on BASE_HOST / WEB_ZONE and on the
+ * workers.dev / localhost hosts. Everything else is treated as a proxied
+ * website hostname.
+ */
+function isInternalRequestHost(host: string, env: Env): boolean {
+  const bases = [env.BASE_HOST, env.WEB_ZONE]
+    .map((value) => normalizeHost(value || ""))
+    .filter(Boolean);
+  if (bases.length === 0) return true;
+  if (bases.includes(host)) return true;
+  if (host === "localhost" || host === "127.0.0.1" || host.endsWith(".workers.dev")) {
+    return true;
+  }
+  return false;
+}
+
+async function handleSiteProxy(
+  request: Request,
+  env: Env,
+  url: URL,
+  host: string,
+): Promise<Response> {
+  if (!env.DB) {
+    return new Response(
+      renderErrorPage("Web proxy unavailable", "This server has no D1 database binding.", "503"),
+      { status: 503, headers: { "Content-Type": "text/html; charset=utf-8" } },
+    );
+  }
+
+  let site: Awaited<ReturnType<typeof getSite>> = null;
+  try {
+    await ensureSchema(env);
+    site = await getSite(env, host);
+  } catch {
+    site = null;
+  }
+  if (!site) {
+    return new Response(
+      renderErrorPage("Unknown site", `No site is configured for ${host}.`, "404"),
+      { status: 404, headers: { "Content-Type": "text/html; charset=utf-8" } },
+    );
+  }
+
+  if (site.expires_at && site.expires_at <= Date.now()) {
+    return new Response(renderExpiredPage(host, site.expires_at), {
+      status: 410,
+      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  }
+
+  if (request.headers.get("Upgrade") === "websocket") {
+    return new Response(
+      renderErrorPage(
+        "WebSocket not supported",
+        "WebSocket upgrades through the web proxy are not supported yet. Use the SOCKS/relay mode for WebSocket traffic.",
+        "501",
+      ),
+      { status: 501, headers: { "Content-Type": "text/html; charset=utf-8" } },
+    );
+  }
+
+  let relay: Awaited<ReturnType<typeof env.RELAY.get>> | null = null;
+  try {
+    relay = env.RELAY.get(env.RELAY.idFromString(site.relay_id));
+  } catch {
+    return new Response(
+      renderErrorPage("Site unavailable", "The site is bound to an invalid relay.", "503"),
+      { status: 503, headers: { "Content-Type": "text/html; charset=utf-8" } },
+    );
+  }
+  if (!relay) {
+    return new Response(
+      renderErrorPage("Site unavailable", "The site relay could not be resolved.", "503"),
+      { status: 503, headers: { "Content-Type": "text/html; charset=utf-8" } },
+    );
+  }
+
+  const headers = new Headers(request.headers);
+  headers.set("X-LS-Site-Host", host);
+  headers.set("X-LS-Original-Path", `${url.pathname}${url.search}`);
+  headers.set("X-LS-Original-Proto", url.protocol.replace(":", ""));
+  headers.delete("X-LS-Internal");
+
+  const relayUrl = new URL(request.url);
+  relayUrl.pathname = "/web";
+  relayUrl.search = "";
+
+  const init: RequestInit = {
+    method: request.method,
+    headers,
+    redirect: "manual",
+  };
+  if (request.method !== "GET" && request.method !== "HEAD") {
+    init.body = request.body;
+  }
+
+  try {
+    return await relay.fetch(new Request(relayUrl, init));
+  } catch (err) {
+    return new Response(
+      renderErrorPage(
+        "Origin error",
+        err instanceof Error ? err.message : "The relay could not process this request.",
+        "502",
+      ),
+      { status: 502, headers: { "Content-Type": "text/html; charset=utf-8" } },
+    );
+  }
+}
+

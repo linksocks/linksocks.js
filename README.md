@@ -112,3 +112,143 @@ Append `?force=1` to skip the cache entirely and run a fresh probe immediately:
 ```bash
 curl https://your-worker.example.com/api/health/poll?force=1
 ```
+
+## Web Reverse Proxy (Web Mode)
+
+Besides SOCKS5 relaying, linksocks.js can publish a local website directly from
+the Cloudflare edge:
+
+```bash
+# Run locally: publishes 127.0.0.1:8080 as https://<random>.example.com
+linksocks web -u wss://your-worker.example.com -l http://127.0.0.1:8080
+```
+
+Cloudflare never dials your intranet. Incoming HTTP requests are forwarded over
+the existing WebSocket tunnel to the `linksocks web` process, which calls the
+local backend and streams the response back to the edge. No public IP, no inbound
+port, and no origin address stored in the Worker.
+
+### Server Setup
+
+1. Create a D1 database and wire it into `wrangler.jsonc`:
+
+   ```bash
+   wrangler d1 create linksocks
+   # put the printed database_id into d1_databases[0].database_id
+   ```
+
+   Tables are created lazily on first use. You can also run
+   `wrangler d1 migrations apply linksocks`.
+
+2. Configure secrets and variables:
+
+   ```bash
+   wrangler secret put ADMIN_PASSWORD    # auto-creates the admin account
+   wrangler secret put SESSION_SECRET    # optional session signing secret
+   ```
+
+   Variables in `wrangler.jsonc`:
+
+   | Variable | Description |
+   |---|---|
+   | `WEB_ZONE` | Base domain for generated hosts, e.g. `example.com` |
+   | `BASE_HOST` | Hostname of the control plane, e.g. `linksocks.example.com` (falls back to `WEB_ZONE`) |
+   | `ADMIN_USERNAME` | Initial administrator username, defaults to `admin` |
+
+3. DNS: point both `example.com` and `*.example.com` at this Worker (custom
+   domain or routes) so generated temporary hosts resolve.
+
+4. Deploy:
+
+   ```bash
+   wrangler deploy
+   ```
+
+### CLI
+
+```bash
+linksocks web -u <server> -l <local-url> [options]
+```
+
+| Flag | Description |
+|---|---|
+| `-t, --token` | Provider token from `/dashboard`; anonymous when omitted |
+| `-u, --url` | LinkSocks.js server (`ws://`, `wss://`, `http://`, `https://`) |
+| `-l, --local` | Local backend URL, repeatable for in-provider load balancing |
+| `--domain` | Custom remote hostname (must be a `WEB_ZONE` subdomain and allowed) |
+| `--insecure` | Skip TLS verification for `https://` backends |
+| `-R, --no-reconnect` | Stop when the server disconnects |
+| `-d, --debug` | Debug logs (`-dd` for trace) |
+
+Examples:
+
+```bash
+# Anonymous temporary host
+linksocks web -u wss://linksocks.example.com -l http://127.0.0.1:3000
+
+# Account-bound permanent host with two origins
+linksocks web -u wss://linksocks.example.com -t ls_xxx \
+  --domain blog.example.com \
+  -l http://127.0.0.1:3000 -l http://127.0.0.1:3001
+```
+
+### User System (D1)
+
+- `/admin` — administrator console. The admin account is auto-created from
+  `ADMIN_USERNAME` / `ADMIN_PASSWORD` on first boot. Manage users, tokens, sites
+  and the global anonymous policy.
+- `/dashboard` — user console limited to the signed-in user's sites, tokens,
+  traffic and origins.
+- `/register` — self-registration, gated by the global `allowRegistration`
+  setting.
+- Tokens created in `/dashboard` bind any provider that connects with
+  `-t <token>` to that account. The UI shows ownership, temporary badges,
+  expiry countdowns, origin counts and live provider counts.
+- Administrators can edit anonymous access, custom hostname allowance,
+  registration, and whether users may edit their own policy; per-user overrides
+  live on the user detail page.
+
+### Quotas and Temporary Hosts
+
+Each site freezes a policy at creation time:
+
+| Setting | Description |
+|---|---|
+| `autoRotateSeconds` | Lifetime of generated hosts; providers re-register before expiry |
+| `quotaBytes` | Transfer quota (request + response, 0 = unlimited) |
+| `quotaRequests` | Request quota (0 = unlimited) |
+| `quotaDurationSeconds` | Maximum site lifetime (0 = unlimited) |
+| `maxSites` | Sites per account / per anonymous token |
+| `maxBackends` | Origins allowed per registration |
+
+Auto-generated hosts are always `temporary` with a countdown in the UI; custom
+hosts are permanent by default. Quota overruns return `429` at the edge and
+expired temporary hosts return `410`.
+
+### Load Balancing
+
+- One provider with several `-l` backends round-robins locally.
+- Several providers registering the same hostname round-robin at the edge; the
+  dashboard shows origin count and online provider count separately.
+
+### Protocol Additions
+
+Binary message types 0x12–0x18 (shared with the Go client):
+
+| Type | Direction | Purpose |
+|---|---|---|
+| `web_register` (0x12) | Provider → Relay | Host, origins, TLS verification and rotation intent |
+| `web_register_response` (0x13) | Relay → Provider | Final host, temporary flag, expiry, origin count |
+| `web_request` (0x14) | Relay → Provider | Method, path, headers, body metadata |
+| `web_response` (0x15) | Provider → Relay | Status code and response headers |
+| `web_data` (0x16) | Both | Request/response body chunks; last chunk has `end` |
+| `web_cancel` (0x17) | Both | Cancel a channel |
+| `web_rotate` (0x18) | Relay → Provider | New hostname after rotation |
+
+### Known Limitations
+
+- WebSocket upgrades through the web proxy are not supported yet (`501`); use
+  SOCKS5/relay mode for WebSocket traffic.
+- Request bodies are capped at 16 MB; responses are streamed.
+- Temporary hosts must be re-registered after expiry.
+

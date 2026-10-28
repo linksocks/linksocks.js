@@ -1,5 +1,4 @@
 import { DurableObject } from "cloudflare:workers";
-import type { WebSocket } from "@cloudflare/workers-types";
 import zxcvbn from "zxcvbn";
 
 import type { Env, WebsocketMeta } from "./types";
@@ -12,15 +11,98 @@ import {
   type DisconnectMessage,
   type AuthMessage,
   type PartnersMessage,
-  parseMessage,
+  type ChannelBindMessage,
+  type ChannelMigrateMessage,
+  type ChannelMigrateAckMessage,
+  type ChannelDataAckMessage,
+  type WebRegisterMessage,
+  type WebRegisterResponseMessage,
+  type WebRequestMessage,
+  type WebResponseMessage,
+  type WebDataMessage,
+  type WebCancelMessage,
+  parseMessageWithVersion,
   packMessage,
   MessageType,
+  PROTOCOL_VERSION,
   AuthResponseMessage,
   LogMessage,
 } from "./message";
 import { handleErrors } from "./common";
 import { describeCloudflareColo } from "./colo";
+import { MIN_VERSION_WEB, supportsFeatureVersion } from "./feature-version";
 import { type Token } from "./token";
+import {
+  type Settings,
+  type SiteRow,
+  type UserRow,
+  deleteSite,
+  effectiveSettings,
+  ensureSchema,
+  findUserByTokenHash,
+  getSite,
+  isSiteHostForZone,
+  listSites,
+  normalizeHost,
+  randomHostLabel,
+  sha256Hex,
+  siteUrl,
+  upsertSite,
+} from "./db";
+import { renderExpiredPage, renderErrorPage } from "./ui";
+
+interface WebUsage {
+  requests: number;
+  bytes: number;
+  lastSeenAt: number;
+}
+
+interface WebPending {
+  host: string;
+  ws: WebSocket;
+  controller: ReadableStreamDefaultController<Uint8Array> | null;
+  responseReceived: boolean;
+  resolve: (msg: WebResponseMessage) => void;
+  reject: (err: Error) => void;
+  timeout: ReturnType<typeof setTimeout> | null;
+  bytes: number;
+}
+
+const MAX_WEB_BODY_BYTES = 16 * 1024 * 1024;
+const WEB_DATA_CHUNK_BYTES = 32 * 1024;
+const WEB_RESPONSE_TIMEOUT_MS = 30_000;
+const WEB_USAGE_FLUSH_DELAY_MS = 5_000;
+const SITE_CACHE_TTL_MS = 30_000;
+const WEB_MESSAGE_TYPES = new Set<string>([
+  MessageType.WebRegister,
+  MessageType.WebRegisterResponse,
+  MessageType.WebRequest,
+  MessageType.WebResponse,
+  MessageType.WebData,
+  MessageType.WebCancel,
+  MessageType.WebRotate,
+]);
+
+function isHopByHopHeader(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower === "connection" ||
+    lower === "keep-alive" ||
+    lower === "proxy-authenticate" ||
+    lower === "proxy-authorization" ||
+    lower === "proxy-connection" ||
+    lower === "te" ||
+    lower === "trailer" ||
+    lower === "transfer-encoding" ||
+    lower === "upgrade" ||
+    lower === "expect"
+  );
+}
+
+function isInternalHeader(name: string): boolean {
+  return name.toLowerCase().startsWith("x-ls-");
+}
+
 
 export class Relay extends DurableObject {
   private static readonly PROVIDER_DISCONNECT_GRACE_MS = 60_000;
@@ -52,6 +134,14 @@ export class Relay extends DurableObject {
 
   // Channel creation counter – flushed together with traffic to avoid per-channel Token DO writes.
   private pendingChannelCreations: number = 0;
+
+  // Web reverse proxy state.
+  private webProviders: Map<string, WebSocket[]> = new Map();
+  private webRoundRobin: Map<string, number> = new Map();
+  private webPending: Map<string, WebPending> = new Map();
+  private webUsage: Record<string, WebUsage> = {};
+  private webUsageTimer: ReturnType<typeof setTimeout> | null = null;
+  private siteCache: Map<string, { site: SiteRow | null; at: number }> = new Map();
 
   private async getOwnerTokenKey(): Promise<string> {
     const v = (await this.storage.get("ownerTokenKey")) as string | undefined;
@@ -107,6 +197,11 @@ export class Relay extends DurableObject {
         if (typeof trafficState.pendingChannels === "number") this.pendingChannelCreations = trafficState.pendingChannels;
       }
 
+      const storedWebUsage = (await this.storage.get("webUsage")) as Record<string, WebUsage> | undefined;
+      if (storedWebUsage && typeof storedWebUsage === "object") {
+        this.webUsage = storedWebUsage;
+      }
+
       if (this.trafficAccumulator > 0 || this.pendingChannelCreations > 0) {
         await this.scheduleAlarmAt(Date.now() + Relay.TRAFFIC_FLUSH_IDLE_MS);
       }
@@ -151,6 +246,7 @@ export class Relay extends DurableObject {
     this.connectors.clear();
     this.providerChannels.clear();
     this.connectorChannels.clear();
+    this.webProviders.clear();
 
     const providerByChannel = new Map<string, WebSocket>();
     const connectorByChannel = new Map<string, WebSocket>();
@@ -162,6 +258,16 @@ export class Relay extends DurableObject {
         this.providers.add(ws);
       } else {
         this.connectors.add(ws);
+      }
+
+      if (meta.web === true) {
+        const hosts = Array.isArray(meta.webHosts) ? meta.webHosts : [];
+        for (const host of hosts) {
+          if (typeof host !== "string" || !host) continue;
+          const list = this.webProviders.get(host) || [];
+          list.push(ws);
+          this.webProviders.set(host, list);
+        }
       }
 
       const channels = Array.isArray(meta.channels) ? meta.channels : [];
@@ -515,6 +621,10 @@ export class Relay extends DurableObject {
     return await handleErrors(request, async () => {
       const url = new URL(request.url);
 
+      if (url.pathname === "/web") {
+        return await this.handleWebHttp(request);
+      }
+
       if (request.headers.get("Upgrade") === "websocket") {
         const pair = new WebSocketPair();
         const [client, server] = [pair[0], pair[1]];
@@ -523,7 +633,8 @@ export class Relay extends DurableObject {
         this.state.acceptWebSocket(server);
 
         // Check is provider according to request URL
-        const isProvider = url.pathname === "/provider";
+        const isWebProvider = url.pathname === "/web-provider";
+        const isProvider = url.pathname === "/provider" || isWebProvider;
 
         // Add to providers/connectors set
         if (isProvider) {
@@ -536,6 +647,7 @@ export class Relay extends DurableObject {
 
         // Return the actual token for reconnection (especially for anonymous providers)
         const actualToken = url.searchParams.get("actualToken") || "";
+        const baseHost = url.searchParams.get("baseHost") || "";
 
         // Save token and update metadata when connection is established
         if (actualToken) {
@@ -550,7 +662,7 @@ export class Relay extends DurableObject {
         const clientIp = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
 
         // Save session data for hibernation
-        server.serializeAttachment({ isProvider, actualToken, clientIp } satisfies WebsocketMeta);
+        server.serializeAttachment({ isProvider, actualToken, clientIp, web: isWebProvider, baseHost } satisfies WebsocketMeta);
 
         const currentProviders = this.getActualProviderCount();
         const currentConnectors = this.getActualConnectorCount();
@@ -721,10 +833,26 @@ export class Relay extends DurableObject {
       // Report traffic (approximate size)
       this.reportTraffic(messageData.byteLength);
 
-      const msg = parseMessage(messageData);
-
+      const { message: msg, version } = parseMessageWithVersion(messageData);
       const meta = this.safeDeserializeAttachment(ws);
+      if (meta.peerProtocolVersion !== version) {
+        meta.peerProtocolVersion = version;
+        ws.serializeAttachment(meta);
+        if (version !== PROTOCOL_VERSION) {
+          const warning = `Protocol minor version mismatch: peer=0x${version.toString(16).padStart(2, "0")} relay=0x${PROTOCOL_VERSION.toString(16).padStart(2, "0")}; connection allowed but features may differ`;
+          console.warn(warning);
+          ws.send(packMessage({
+            level: "warn",
+            msg: warning,
+            getType: () => MessageType.Log,
+          } as LogMessage));
+        }
+      }
       const isProvider = meta.isProvider === true;
+      if (WEB_MESSAGE_TYPES.has(msg.getType()) && !supportsFeatureVersion(version, MIN_VERSION_WEB)) {
+        ws.close(1008, `Web messages require protocol 0x${MIN_VERSION_WEB.toString(16).padStart(2, "0")} or newer`);
+        return;
+      }
 
       switch (msg.getType()) {
         case MessageType.Auth: {
@@ -784,6 +912,28 @@ export class Relay extends DurableObject {
             getType: () => MessageType.AuthResponse,
           };
           ws.send(packMessage(response));
+          break;
+        }
+
+        case MessageType.WebRegister: {
+          if (meta.web === true && isProvider) {
+            await this.handleWebRegister(ws, msg as WebRegisterMessage);
+          }
+          break;
+        }
+
+        case MessageType.WebResponse: {
+          this.handleWebResponse(msg as WebResponseMessage);
+          break;
+        }
+
+        case MessageType.WebData: {
+          this.handleWebData(msg as WebDataMessage);
+          break;
+        }
+
+        case MessageType.WebCancel: {
+          this.handleWebCancel(msg as WebCancelMessage);
           break;
         }
 
@@ -986,6 +1136,45 @@ export class Relay extends DurableObject {
           break;
         }
 
+        case MessageType.ChannelBind: {
+          const bindMsg = msg as ChannelBindMessage;
+          const channelId = bindMsg.channelId;
+
+          // Record the sender as the channel peer so later control messages
+          // (migrate/data-ack) can be routed, mirroring the Go server.
+          if (isProvider) {
+            this.providerChannels.set(channelId, ws);
+          } else {
+            this.connectorChannels.set(channelId, ws);
+          }
+
+          const target = isProvider
+            ? this.connectorChannels.get(channelId)
+            : this.providerChannels.get(channelId);
+          if (target && target !== ws) {
+            target.send(message);
+          }
+          break;
+        }
+
+        case MessageType.ChannelMigrate:
+        case MessageType.ChannelMigrateAck:
+        case MessageType.ChannelDataAck: {
+          const controlMsg = msg as
+            | ChannelMigrateMessage
+            | ChannelMigrateAckMessage
+            | ChannelDataAckMessage;
+          const channelId = controlMsg.channelId;
+
+          const target = isProvider
+            ? this.connectorChannels.get(channelId)
+            : this.providerChannels.get(channelId);
+          if (target && target !== ws) {
+            target.send(message);
+          }
+          break;
+        }
+
         case MessageType.DirectCapabilities:
         case MessageType.DirectRendezvous:
         case MessageType.DirectStatus: {
@@ -1013,6 +1202,660 @@ export class Relay extends DurableObject {
       console.error("Error handling message:", err);
       ws.close(1011, err.toString());
     }
+  }
+
+  /* ---------------------------------------------------------------------- */
+  /* Web reverse proxy                                                      */
+  /* ---------------------------------------------------------------------- */
+
+  private async handleWebRegister(ws: WebSocket, msg: WebRegisterMessage): Promise<void> {
+    const meta = this.safeDeserializeAttachment(ws);
+    const reply = (
+      success: boolean,
+      error?: string,
+      extra: Partial<WebRegisterResponseMessage> = {},
+    ) => {
+      const response: WebRegisterResponseMessage = {
+        success,
+        error,
+        ...extra,
+        getType: () => MessageType.WebRegisterResponse,
+      };
+      try {
+        ws.send(packMessage(response));
+      } catch {
+        // The provider may have disconnected while registration was in flight.
+      }
+    };
+
+    if (meta.web !== true) {
+      reply(false, "This connection is not a web provider");
+      return;
+    }
+    if (!this.env.DB) {
+      reply(false, "Web proxy requires a D1 database binding named DB");
+      return;
+    }
+
+    try {
+      await ensureSchema(this.env);
+      const relayId = this.state.id.toString();
+      const actualToken = (meta.actualToken || "").trim();
+      let tokenHash = "";
+      let user: UserRow | null = null;
+      if (actualToken) {
+        tokenHash = this.isSha256Hex(actualToken)
+          ? actualToken.toLowerCase()
+          : await this.sha256(actualToken);
+        user = await findUserByTokenHash(this.env, tokenHash);
+      }
+
+      const settings: Settings = await effectiveSettings(this.env, user);
+      if (!user && !settings.allowAnonymous) {
+        reply(false, "Anonymous web providers are disabled on this server");
+        return;
+      }
+      if (user && user.disabled) {
+        reply(false, "This user account is disabled");
+        return;
+      }
+
+      const rawBackends = Array.isArray(msg.backends) ? msg.backends : [];
+      const backends: Array<{ url: string; weight?: number }> = [];
+      const seenBackends = new Set<string>();
+      for (const entry of rawBackends) {
+        const value = typeof entry === "string" ? entry : entry?.url;
+        if (typeof value !== "string" || !value.trim()) continue;
+        let parsed: URL;
+        try {
+          parsed = new URL(value.trim());
+        } catch {
+          continue;
+        }
+        if (parsed.protocol !== "http:" && parsed.protocol !== "https:") continue;
+        if (parsed.username || parsed.password) continue;
+        const normalized = parsed.toString().replace(/\/+$/, "");
+        if (seenBackends.has(normalized)) continue;
+        seenBackends.add(normalized);
+        backends.push({
+          url: normalized,
+          weight: typeof entry === "object" && Number.isFinite(entry?.weight) ? Number(entry.weight) : undefined,
+        });
+        if (backends.length >= settings.maxBackends) break;
+      }
+      if (backends.length === 0) {
+        reply(false, "At least one http:// or https:// backend is required");
+        return;
+      }
+
+      const zone = normalizeHost(this.env.WEB_ZONE || meta.baseHost || "");
+      const now = Date.now();
+      let requestedHost = normalizeHost(msg.host || "");
+      let existing = requestedHost ? await getSite(this.env, requestedHost) : null;
+      let ownsExisting = Boolean(
+        existing &&
+          existing.relay_id === relayId &&
+          (!existing.owner_id || existing.owner_id === (user?.id || null)),
+      );
+      let reclaimingTemporary = Boolean(
+        existing && existing.temporary === 1 && existing.relay_id === relayId,
+      );
+
+      if (
+        reclaimingTemporary &&
+        existing?.expires_at &&
+        existing.expires_at <= now
+      ) {
+        if (!msg.rotate) {
+          reply(false, "This temporary hostname has expired; re-register with rotation");
+          return;
+        }
+        await deleteSite(this.env, existing.host);
+        existing = null;
+        ownsExisting = false;
+        reclaimingTemporary = false;
+        requestedHost = "";
+      }
+
+      if (requestedHost) {
+        if (!settings.allowCustomHost && !ownsExisting) {
+          reply(false, "Custom hostnames are disabled for this account");
+          return;
+        }
+        if (!zone || !isSiteHostForZone(requestedHost, zone)) {
+          reply(false, `Hostname must be a subdomain of ${zone || "WEB_ZONE"}`);
+          return;
+        }
+        if (existing && existing.relay_id !== relayId) {
+          reply(false, "This hostname is already bound to another relay");
+          return;
+        }
+        if (existing?.owner_id && existing.owner_id !== (user?.id || null)) {
+          reply(false, "This hostname is owned by another user");
+          return;
+        }
+      }
+
+      if (msg.rotate && requestedHost) {
+        // The provider asked for a fresh temporary host. Ignore the old host
+        // and let the server generate a new one below.
+        requestedHost = "";
+        existing = null;
+        ownsExisting = false;
+        reclaimingTemporary = false;
+      }
+
+      let host = requestedHost;
+      if (!host) {
+        if (!zone) {
+          reply(false, "WEB_ZONE is not configured, so automatic hostnames are unavailable");
+          return;
+        }
+        for (let attempt = 0; attempt < 8; attempt++) {
+          const candidate = `${randomHostLabel()}.${zone}`;
+          if (!(await getSite(this.env, candidate))) {
+            host = candidate;
+            break;
+          }
+        }
+        if (!host) {
+          reply(false, "Could not allocate a hostname, please retry");
+          return;
+        }
+      }
+
+      if (!existing) {
+        existing = await getSite(this.env, host);
+      }
+      if (existing && existing.relay_id !== relayId) {
+        reply(false, "This hostname is already bound to another relay");
+        return;
+      }
+      if (existing?.owner_id && existing.owner_id !== (user?.id || null)) {
+        reply(false, "This hostname is owned by another user");
+        return;
+      }
+
+      if (!existing && settings.maxSites > 0) {
+        const ownerSites = user
+          ? await listSites(this.env, user.id)
+          : (await listSites(this.env)).filter(
+              (site) => site.anonymous === 1 && site.token_hash === (tokenHash || null),
+            );
+        const activeSites = ownerSites.filter(
+          (site) => !site.expires_at || site.expires_at > now,
+        );
+        if (activeSites.length >= settings.maxSites) {
+          reply(false, `Site limit reached (${settings.maxSites})`);
+          return;
+        }
+      }
+
+      const temporary = !requestedHost || reclaimingTemporary;
+      let expiresAt = existing?.expires_at ?? null;
+      if (temporary && (!expiresAt || expiresAt <= now || msg.rotate || !existing)) {
+        expiresAt = settings.autoRotateSeconds > 0
+          ? now + settings.autoRotateSeconds * 1000
+          : null;
+      }
+      if (settings.quotaDurationSeconds > 0) {
+        const durationExpiry = now + settings.quotaDurationSeconds * 1000;
+        expiresAt = expiresAt ? Math.min(expiresAt, durationExpiry) : durationExpiry;
+      }
+
+      const site: SiteRow = {
+        host,
+        relay_id: relayId,
+        owner_id: user?.id || null,
+        token_hash: tokenHash || null,
+        temporary: temporary ? 1 : 0,
+        expires_at: expiresAt,
+        rotate_seconds: temporary ? settings.autoRotateSeconds : 0,
+        backends_json: JSON.stringify(backends.map((backend) => backend.url)),
+        backend_count: backends.length,
+        insecure: msg.insecure ? 1 : 0,
+        anonymous: user ? 0 : 1,
+        quota_bytes: settings.quotaBytes,
+        quota_requests: settings.quotaRequests,
+        created_at: existing?.created_at ?? now,
+        updated_at: now,
+        last_seen_at: existing?.last_seen_at ?? null,
+      };
+      await upsertSite(this.env, site);
+      this.siteCache.delete(host);
+
+      const previousHosts = Array.isArray(meta.webHosts) ? meta.webHosts : [];
+      for (const oldHost of previousHosts) {
+        if (!oldHost || oldHost === host) continue;
+        const oldSite = await getSite(this.env, oldHost);
+        if (oldSite && oldSite.relay_id === relayId) {
+          await deleteSite(this.env, oldHost);
+          this.siteCache.delete(oldHost);
+        }
+      }
+
+      meta.webHosts = [host];
+      meta.webBackendCount = backends.length;
+      meta.webOwnerId = user?.id || null;
+      meta.webAnonymous = !user;
+      ws.serializeAttachment(meta);
+      this.syncFromState(true);
+
+      reply(true, undefined, {
+        host,
+        url: siteUrl(host),
+        temporary,
+        expiresAt: expiresAt ?? undefined,
+        rotateSeconds: temporary ? settings.autoRotateSeconds : 0,
+        backendCount: backends.length,
+        owner: user?.username,
+      });
+    } catch (err) {
+      reply(false, err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  private handleWebResponse(msg: WebResponseMessage): void {
+    const pending = this.webPending.get(msg.channelId);
+    if (!pending || pending.responseReceived) return;
+    pending.responseReceived = true;
+    if (pending.timeout) {
+      clearTimeout(pending.timeout);
+      pending.timeout = null;
+    }
+    // Give the body a generous idle window after headers arrive.
+    pending.timeout = setTimeout(() => {
+      this.finishWebPending(msg.channelId, new Error("Web response body timed out"));
+    }, 120_000);
+    pending.resolve(msg);
+  }
+
+  private handleWebData(msg: WebDataMessage): void {
+    const pending = this.webPending.get(msg.channelId);
+    if (!pending) return;
+    if (pending.timeout) {
+      clearTimeout(pending.timeout);
+      pending.timeout = setTimeout(() => {
+        this.finishWebPending(msg.channelId, new Error("Web response body timed out"));
+      }, 120_000);
+    }
+    if (msg.data.byteLength > 0) {
+      pending.bytes += msg.data.byteLength;
+      this.reportWebBytes(pending.host, msg.data.byteLength);
+      if (pending.controller) {
+        try {
+          pending.controller.enqueue(msg.data);
+        } catch {
+          // The client may have gone away.
+        }
+      }
+    }
+    if (msg.end) {
+      this.finishWebPending(msg.channelId);
+    }
+  }
+
+  private handleWebCancel(msg: WebCancelMessage): void {
+    this.finishWebPending(msg.channelId, new Error(msg.reason || "cancelled"));
+  }
+
+  private finishWebPending(channelId: string, error?: Error): void {
+    const pending = this.webPending.get(channelId);
+    if (!pending) return;
+    if (pending.timeout) {
+      clearTimeout(pending.timeout);
+      pending.timeout = null;
+    }
+    this.webPending.delete(channelId);
+    if (!pending.responseReceived) {
+      error ??= new Error("Web response ended before headers");
+      pending.reject(error);
+    }
+    try {
+      if (error) pending.controller?.error(error);
+      else pending.controller?.close();
+    } catch {
+      // Stream may already be closed/cancelled.
+    }
+    if (error) {
+      try {
+        pending.ws.send(
+          packMessage({
+            channelId,
+            reason: error.message,
+            getType: () => MessageType.WebCancel,
+          } as WebCancelMessage),
+        );
+      } catch {
+        // Ignore provider disconnect.
+      }
+    }
+  }
+
+  private cancelWebPending(channelId: string, reason: string): void {
+    this.finishWebPending(channelId, new Error(reason));
+  }
+
+  private getWebProviders(host: string): WebSocket[] {
+    this.syncFromState(true);
+    const list = this.webProviders.get(host) || [];
+    return list.filter((ws) => {
+      try {
+        const meta = ws.deserializeAttachment() as WebsocketMeta;
+        return meta.web === true && Array.isArray(meta.webHosts) && meta.webHosts.includes(host);
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  private getWebUsage(host: string): WebUsage {
+    let usage = this.webUsage[host];
+    if (!usage) {
+      usage = { requests: 0, bytes: 0, lastSeenAt: 0 };
+      this.webUsage[host] = usage;
+    }
+    return usage;
+  }
+
+  private incrementWebRequest(host: string): void {
+    const usage = this.getWebUsage(host);
+    usage.requests += 1;
+    usage.lastSeenAt = Date.now();
+    this.scheduleWebUsageFlush();
+  }
+
+  private reportWebBytes(host: string, bytes: number): void {
+    if (bytes <= 0) return;
+    const usage = this.getWebUsage(host);
+    usage.bytes += bytes;
+    usage.lastSeenAt = Date.now();
+    this.scheduleWebUsageFlush();
+  }
+
+  private scheduleWebUsageFlush(): void {
+    if (this.webUsageTimer) return;
+    this.webUsageTimer = setTimeout(() => {
+      this.webUsageTimer = null;
+      this.flushWebUsage().catch(console.error);
+    }, WEB_USAGE_FLUSH_DELAY_MS);
+    this.scheduleAlarmAt(Date.now() + 60_000).catch(console.error);
+  }
+
+  private async flushWebUsage(): Promise<void> {
+    if (Object.keys(this.webUsage).length === 0) return;
+    await this.storage.put("webUsage", this.webUsage);
+  }
+
+  private async getSiteCached(host: string): Promise<SiteRow | null> {
+    const cached = this.siteCache.get(host);
+    const now = Date.now();
+    if (cached && now - cached.at < SITE_CACHE_TTL_MS) return cached.site;
+    if (!this.env.DB) return null;
+    let site: SiteRow | null = null;
+    try {
+      await ensureSchema(this.env);
+      site = await getSite(this.env, host);
+    } catch {
+      site = null;
+    }
+    this.siteCache.set(host, { site, at: now });
+    return site;
+  }
+
+  private webQuotaResponse(site: SiteRow, kind: "requests" | "bytes"): Response {
+    const message =
+      kind === "requests"
+        ? `This site reached its request quota (${site.quota_requests.toLocaleString()}).`
+        : `This site reached its transfer quota.`;
+    return new Response(renderErrorPage("Quota exceeded", message, "429"), {
+      status: 429,
+      headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+    });
+  }
+
+  private async handleWebHttp(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const host = normalizeHost(
+      request.headers.get("X-LS-Site-Host") || url.searchParams.get("host") || "",
+    );
+    if (!host) {
+      return new Response("Missing site host", { status: 400 });
+    }
+
+    const site = await this.getSiteCached(host);
+    if (!site) {
+      return new Response(renderErrorPage("Unknown site", `No site is configured for ${host}.`, "404"), {
+        status: 404,
+        headers: { "Content-Type": "text/html; charset=utf-8" },
+      });
+    }
+
+    const now = Date.now();
+    if (site.expires_at && site.expires_at <= now) {
+      return new Response(renderExpiredPage(host, site.expires_at), {
+        status: 410,
+        headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" },
+      });
+    }
+
+    const usage = this.getWebUsage(host);
+    if (site.quota_requests > 0 && usage.requests >= site.quota_requests) {
+      return this.webQuotaResponse(site, "requests");
+    }
+    if (site.quota_bytes > 0 && usage.bytes >= site.quota_bytes) {
+      return this.webQuotaResponse(site, "bytes");
+    }
+
+    const providers = this.getWebProviders(host);
+    if (providers.length === 0) {
+      return new Response(
+        renderErrorPage("No origin online", `No provider is currently serving ${host}.`, "503"),
+        { status: 503, headers: { "Content-Type": "text/html; charset=utf-8", "Cache-Control": "no-store" } },
+      );
+    }
+
+    const declaredLength = Number(request.headers.get("Content-Length") || "0");
+    if (Number.isFinite(declaredLength) && declaredLength > MAX_WEB_BODY_BYTES) {
+      return new Response("Request body too large", { status: 413 });
+    }
+    let body = new Uint8Array(0);
+    if (request.body) {
+      const buffer = await request.arrayBuffer();
+      if (buffer.byteLength > MAX_WEB_BODY_BYTES) {
+        return new Response("Request body too large", { status: 413 });
+      }
+      body = new Uint8Array(buffer);
+    }
+
+    const index = (this.webRoundRobin.get(host) || 0) % providers.length;
+    this.webRoundRobin.set(host, index + 1);
+    const ws = providers[index];
+    const channelId = crypto.randomUUID();
+
+    let controller: ReadableStreamDefaultController<Uint8Array> | null = null;
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        controller = c;
+      },
+      cancel: () => {
+        this.cancelWebPending(channelId, "client disconnected");
+      },
+    });
+
+    let resolveResponse!: (msg: WebResponseMessage) => void;
+    let rejectResponse!: (err: Error) => void;
+    const responsePromise = new Promise<WebResponseMessage>((resolve, reject) => {
+      resolveResponse = resolve;
+      rejectResponse = reject;
+    });
+    void responsePromise.catch(() => undefined);
+
+    const pending: WebPending = {
+      host,
+      ws,
+      controller,
+      responseReceived: false,
+      resolve: resolveResponse,
+      reject: rejectResponse,
+      timeout: null,
+      bytes: 0,
+    };
+    this.webPending.set(channelId, pending);
+    this.incrementWebRequest(host);
+    this.reportWebBytes(host, body.byteLength + 512);
+
+    const headers: Array<[string, string]> = [];
+    for (const [name, value] of request.headers) {
+      const lower = name.toLowerCase();
+      if (isHopByHopHeader(lower) || isInternalHeader(lower)) continue;
+      if (lower === "host" || lower === "content-length") continue;
+      headers.push([name, value]);
+    }
+    const clientIp =
+      request.headers.get("CF-Connecting-IP") ||
+      request.headers.get("X-Forwarded-For")?.split(",")[0].trim() ||
+      "unknown";
+    const forwardedFor = request.headers.get("X-Forwarded-For");
+    headers.push(["X-Forwarded-For", forwardedFor ? `${forwardedFor}, ${clientIp}` : clientIp]);
+    headers.push(["X-Forwarded-Host", host]);
+    headers.push([
+      "X-Forwarded-Proto",
+      request.headers.get("X-LS-Original-Proto") || "https",
+    ]);
+
+    const webRequest: WebRequestMessage = {
+      channelId,
+      method: request.method,
+      path: request.headers.get("X-LS-Original-Path") || `${url.pathname}${url.search}`,
+      headers,
+      hasBody: body.byteLength > 0,
+      bodyLength: body.byteLength,
+      clientIp,
+      scheme: request.headers.get("X-LS-Original-Proto") || "https",
+      host,
+      getType: () => MessageType.WebRequest,
+    };
+
+    try {
+      ws.send(packMessage(webRequest));
+    } catch {
+      this.finishWebPending(channelId, new Error("Provider disconnected"));
+      return new Response("Origin disconnected", { status: 502 });
+    }
+
+    if (body.byteLength > 0) {
+      for (let offset = 0; offset < body.byteLength; offset += WEB_DATA_CHUNK_BYTES) {
+        const chunk = body.slice(offset, offset + WEB_DATA_CHUNK_BYTES);
+        const end = offset + chunk.byteLength >= body.byteLength;
+        try {
+          ws.send(
+            packMessage({
+              channelId,
+              data: chunk,
+              end,
+              getType: () => MessageType.WebData,
+            } as WebDataMessage),
+          );
+        } catch {
+          this.finishWebPending(channelId, new Error("Provider disconnected"));
+          return new Response("Origin disconnected", { status: 502 });
+        }
+      }
+    }
+
+    pending.timeout = setTimeout(() => {
+      this.cancelWebPending(channelId, "Web provider response timeout");
+    }, WEB_RESPONSE_TIMEOUT_MS);
+
+    const onAbort = () => this.cancelWebPending(channelId, "client aborted");
+    request.signal?.addEventListener?.("abort", onAbort);
+
+    let responseMsg: WebResponseMessage;
+    try {
+      responseMsg = await responsePromise;
+    } catch (err) {
+      this.cancelWebPending(channelId, err instanceof Error ? err.message : String(err));
+      return new Response(
+        renderErrorPage("Origin timeout", "The origin did not respond in time.", "504"),
+        { status: 504, headers: { "Content-Type": "text/html; charset=utf-8" } },
+      );
+    } finally {
+      request.signal?.removeEventListener?.("abort", onAbort);
+    }
+
+    const status = responseMsg.status >= 200 && responseMsg.status <= 599 ? responseMsg.status : 502;
+    const responseHeaders = new Headers();
+    for (const [name, value] of responseMsg.headers || []) {
+      const lower = String(name).toLowerCase();
+      if (isHopByHopHeader(lower)) continue;
+      try {
+        responseHeaders.append(String(name), String(value));
+      } catch {
+        // Ignore invalid header names/values from a provider.
+      }
+    }
+
+    if (request.method === "HEAD" || status === 204 || status === 304) {
+      this.finishWebPending(channelId);
+      return new Response(null, { status, headers: responseHeaders });
+    }
+
+    return new Response(stream, { status, headers: responseHeaders });
+  }
+
+  async adminGetWebInfo(): Promise<{
+    sites: Record<string, { providers: number; backends: number; requests: number; bytes: number; lastSeenAt: number }>;
+  }> {
+    this.syncFromState(true);
+    const sites: Record<
+      string,
+      { providers: number; backends: number; requests: number; bytes: number; lastSeenAt: number }
+    > = {};
+    for (const ws of this.state.getWebSockets()) {
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.web !== true) continue;
+      const hosts = Array.isArray(meta.webHosts) ? meta.webHosts : [];
+      for (const host of hosts) {
+        if (typeof host !== "string" || !host) continue;
+        const entry = sites[host] || { providers: 0, backends: 0, requests: 0, bytes: 0, lastSeenAt: 0 };
+        entry.providers += 1;
+        entry.backends += Number(meta.webBackendCount) || 0;
+        sites[host] = entry;
+      }
+    }
+    for (const [host, usage] of Object.entries(this.webUsage)) {
+      const entry = sites[host] || { providers: 0, backends: 0, requests: 0, bytes: 0, lastSeenAt: 0 };
+      entry.requests = usage.requests;
+      entry.bytes = usage.bytes;
+      entry.lastSeenAt = usage.lastSeenAt;
+      sites[host] = entry;
+    }
+    return { sites };
+  }
+
+  async adminDisconnectWebHost(host: string): Promise<void> {
+    const normalized = normalizeHost(host);
+    if (!normalized) return;
+    for (const ws of this.state.getWebSockets()) {
+      const meta = this.safeDeserializeAttachment(ws);
+      if (meta.web !== true) continue;
+      const hosts = Array.isArray(meta.webHosts) ? meta.webHosts : [];
+      if (!hosts.includes(normalized)) continue;
+      const remaining = hosts.filter((item) => item !== normalized);
+      if (remaining.length === 0) {
+        try {
+          ws.close(1012, "Site deleted by administrator");
+        } catch {
+          // Ignore close errors.
+        }
+      } else {
+        meta.webHosts = remaining;
+        ws.serializeAttachment(meta);
+      }
+    }
+    this.siteCache.delete(normalized);
+    this.syncFromState(true);
   }
 
   private disconnectChannel(channelId: string) {
@@ -1168,6 +2011,7 @@ export class Relay extends DurableObject {
     this.syncFromState(true);
 
     await this.flushTraffic(true).catch(console.error);
+    await this.flushWebUsage().catch(console.error);
 
     const providerCount = this.getActualProviderCount();
     if (providerCount > 0) {
