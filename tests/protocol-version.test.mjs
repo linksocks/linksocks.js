@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { createHash, randomBytes } from "node:crypto";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
@@ -66,6 +67,28 @@ function webCancelFrame(channelId) {
   return frame;
 }
 
+function connectorFrame(channel, token) {
+  const tokenBytes = new TextEncoder().encode(token);
+  const frame = new Uint8Array(2 + 16 + 1 + tokenBytes.length + 1);
+  frame.set([0x03, 0x07]);
+  frame.set(channel, 2);
+  frame[18] = tokenBytes.length;
+  frame.set(tokenBytes, 19);
+  frame[19 + tokenBytes.length] = 1;
+  return frame;
+}
+
+function connectFrame(channel) {
+  const address = new TextEncoder().encode("127.0.0.1");
+  const frame = new Uint8Array(2 + 1 + 16 + 1 + address.length + 2);
+  frame.set([0x03, 0x03, 0x01]);
+  frame.set(channel, 3);
+  frame[19] = address.length;
+  frame.set(address, 20);
+  frame.set([0x1f, 0x90], 20 + address.length);
+  return frame;
+}
+
 function messageInbox(socket) {
   const queued = [];
   const waiting = [];
@@ -86,6 +109,70 @@ function messageInbox(socket) {
     });
   };
 }
+
+async function nextType(inbox, type) {
+  for (let index = 0; index < 12; index++) {
+    const frame = await inbox();
+    if (frame[1] === type) return frame;
+  }
+  throw new Error(`did not receive message type ${type}`);
+}
+
+test("SOCKS connections never select a Web-only provider", { timeout: 20000 }, async (context) => {
+  const bundle = await build({
+    absWorkingDir: projectRoot,
+    entryPoints: ["src/index.ts"],
+    bundle: true,
+    format: "esm",
+    platform: "browser",
+    external: ["cloudflare:workers"],
+    write: false,
+  });
+  const worker = new Miniflare({
+    modules: true,
+    script: bundle.outputFiles[0].text,
+    compatibilityDate: "2025-04-13",
+    durableObjects: {
+      RELAY: { className: "Relay", useSQLite: true },
+      TOKEN: { className: "Token", useSQLite: true },
+    },
+    d1Databases: { DB: "provider-test" },
+    bindings: { WEB_ZONE: "example.com", BASE_HOST: "localhost" },
+    outboundService: () => new Response("colo=TEST\n"),
+  });
+  context.after(async () => worker.dispose());
+  const providerToken = randomBytes(24).toString("hex");
+  const connectorToken = randomBytes(24).toString("hex");
+  const hash = (value) => createHash("sha256").update(value).digest("hex");
+  async function open(token, reverse, web = false) {
+    const response = await worker.dispatchFetch(`http://localhost/socket?token=${hash(token)}&reverse=${reverse}&web=${web ? 1 : 0}`, {
+      headers: { Upgrade: "websocket" },
+    });
+    assert.equal(response.status, 101);
+    const socket = response.webSocket;
+    assert.ok(socket);
+    const inbox = messageInbox(socket);
+    socket.accept();
+    const auth = await nextType(inbox, 0x02);
+    assert.equal(auth[2], 1);
+    return { socket, inbox };
+  }
+
+  const network = await open(providerToken, true);
+  network.socket.send(connectorFrame(randomBytes(16), connectorToken));
+  const registration = await nextType(network.inbox, 0x08);
+  assert.equal(registration[18], 1);
+  const web = await open(providerToken, true, true);
+  web.socket.send(webRegisterFrame(0x03));
+  const website = await nextType(web.inbox, 0x13);
+  assert.equal(JSON.parse(new TextDecoder().decode(website.slice(6))).success, true);
+  const connector = await open(connectorToken, false);
+  for (let index = 0; index < 4; index++) connector.socket.send(connectFrame(randomBytes(16)));
+  for (let index = 0; index < 4; index++) assert.equal((await nextType(network.inbox, 0x03))[1], 0x03);
+  connector.socket.close();
+  web.socket.close();
+  network.socket.close();
+});
 
 test("worker checks versions and ends cancelled web requests", { timeout: 20000 }, async (context) => {
   const bundle = await build({
@@ -121,7 +208,7 @@ test("worker checks versions and ends cancelled web requests", { timeout: 20000 
   socket.accept();
 
   const auth = await nextMessage();
-  assert.equal(auth[0], 0x03);
+  assert.equal(auth[0], 0x04);
   assert.equal(auth[1], 0x02);
 
   socket.send(logFrame(0x01));
@@ -180,7 +267,7 @@ test("worker checks versions and ends cancelled web requests", { timeout: 20000 
   assert.ok(webSocket);
   const webInbox = messageInbox(webSocket);
   webSocket.accept();
-  assert.equal((await webInbox())[0], 0x03);
+  assert.equal((await webInbox())[0], 0x04);
   webSocket.send(webRegisterFrame(0x03));
   let registration;
   for (let index = 0; index < 5; index++) {

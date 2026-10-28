@@ -100,8 +100,8 @@ function redirectWithFlash(url: string, flash: Flash): Response {
 }
 
 function parseSettingsForm(form: FormData, current: Settings): Settings {
-  const bool = (name: string, fallback: boolean) =>
-    form.has(name) ? form.get(name) === "1" : fallback;
+  const global = String(form.get("scope") || "global") === "global";
+  const checked = (name: string) => form.get(name) === "1";
   const num = (name: string, fallback: number) => {
     if (!form.has(name)) return fallback;
     const value = Number(form.get(name));
@@ -109,10 +109,10 @@ function parseSettingsForm(form: FormData, current: Settings): Settings {
     return Math.floor(value);
   };
   return {
-    allowAnonymous: bool("allowAnonymous", current.allowAnonymous),
-    allowCustomHost: bool("allowCustomHost", current.allowCustomHost),
-    allowRegistration: bool("allowRegistration", current.allowRegistration),
-    allowUserSettings: bool("allowUserSettings", current.allowUserSettings),
+    allowAnonymous: global ? checked("allowAnonymous") : current.allowAnonymous,
+    allowCustomHost: checked("allowCustomHost"),
+    allowRegistration: global ? checked("allowRegistration") : current.allowRegistration,
+    allowUserSettings: global ? checked("allowUserSettings") : current.allowUserSettings,
     autoRotateSeconds: num("autoRotateSeconds", current.autoRotateSeconds),
     quotaBytes: num("quotaBytes", current.quotaBytes),
     quotaRequests: num("quotaRequests", current.quotaRequests),

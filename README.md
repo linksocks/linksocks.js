@@ -225,6 +225,11 @@ Auto-generated hosts are always `temporary` with a countdown in the UI; custom
 hosts are permanent by default. Quota overruns return `429` at the edge and
 expired temporary hosts return `410`.
 
+The byte and request quotas are hard limits shared by every site of the same
+principal (one account, or one anonymous provider token). SOCKS5 relay traffic
+and web proxy traffic draw from the same counter, so a transfer that already
+exhausted the budget blocks new pages and closes in-flight relay channels.
+
 ### Load Balancing
 
 - One provider with several `-l` backends round-robins locally.
@@ -233,7 +238,7 @@ expired temporary hosts return `410`.
 
 ### Protocol Additions
 
-Binary message types 0x12–0x18 (shared with the Go client):
+Binary message types 0x12–0x19 (shared with the Go client):
 
 | Type | Direction | Purpose |
 |---|---|---|
@@ -244,11 +249,19 @@ Binary message types 0x12–0x18 (shared with the Go client):
 | `web_data` (0x16) | Both | Request/response body chunks; last chunk has `end` |
 | `web_cancel` (0x17) | Both | Cancel a channel |
 | `web_rotate` (0x18) | Relay → Provider | New hostname after rotation |
+| `websocket_frame` (0x19) | Both | WebSocket text/binary frame payload |
+
+### WebSocket Traffic
+
+WebSocket upgrades on a proxied hostname are tunneled through the same Web
+provider: the origin's own upgrade response (including the negotiated
+subprotocol), text frames and binary frames are forwarded in both directions,
+and a clean close propagates to both sides. WebSocket payload bytes count
+toward the same transfer quota as HTTP traffic.
 
 ### Known Limitations
 
-- WebSocket upgrades through the web proxy are not supported yet (`501`); use
-  SOCKS5/relay mode for WebSocket traffic.
+- WebSocket permessage-deflate extensions are not negotiated through the proxy.
 - Request bodies are capped at 16 MB; responses are streamed.
 - Temporary hosts must be re-registered after expiry.
 

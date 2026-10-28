@@ -21,6 +21,7 @@ import {
   type WebResponseMessage,
   type WebDataMessage,
   type WebCancelMessage,
+  type WebSocketFrameMessage,
   parseMessageWithVersion,
   packMessage,
   MessageType,
@@ -30,12 +31,13 @@ import {
 } from "./message";
 import { handleErrors } from "./common";
 import { describeCloudflareColo } from "./colo";
-import { MIN_VERSION_WEB, supportsFeatureVersion } from "./feature-version";
+import { MIN_VERSION_WEB, MIN_VERSION_WEBSOCKET, supportsFeatureVersion } from "./feature-version";
 import { type Token } from "./token";
 import {
   type Settings,
   type SiteRow,
   type UserRow,
+  consumeQuota,
   deleteSite,
   effectiveSettings,
   ensureSchema,
@@ -44,6 +46,7 @@ import {
   isSiteHostForZone,
   listSites,
   normalizeHost,
+  quotaCanFit,
   randomHostLabel,
   sha256Hex,
   siteUrl,
@@ -57,9 +60,20 @@ interface WebUsage {
   lastSeenAt: number;
 }
 
+interface NetworkQuota {
+  principal: string;
+  bytes: number;
+  requests: number;
+  allowed: boolean;
+}
+
 interface WebPending {
   host: string;
   ws: WebSocket;
+  method: string;
+  quotaPrincipal: string;
+  quotaBytes: number;
+  quotaRequests: number;
   controller: ReadableStreamDefaultController<Uint8Array> | null;
   responseReceived: boolean;
   resolve: (msg: WebResponseMessage) => void;
@@ -67,6 +81,8 @@ interface WebPending {
   timeout: ReturnType<typeof setTimeout> | null;
   bytes: number;
 }
+
+class WebQuotaExceededError extends Error {}
 
 const MAX_WEB_BODY_BYTES = 16 * 1024 * 1024;
 const WEB_DATA_CHUNK_BYTES = 32 * 1024;
@@ -81,6 +97,7 @@ const WEB_MESSAGE_TYPES = new Set<string>([
   MessageType.WebData,
   MessageType.WebCancel,
   MessageType.WebRotate,
+  MessageType.WebSocketFrame,
 ]);
 
 function isHopByHopHeader(name: string): boolean {
@@ -139,6 +156,10 @@ export class Relay extends DurableObject {
   private webProviders: Map<string, WebSocket[]> = new Map();
   private webRoundRobin: Map<string, number> = new Map();
   private webPending: Map<string, WebPending> = new Map();
+  private webDataQueues: Map<string, Promise<void>> = new Map();
+  private networkQueues: Map<string, Promise<void>> = new Map();
+  private webSocketClients: Map<string, WebSocket> = new Map();
+  private webSocketProviders: Map<string, WebSocket> = new Map();
   private webUsage: Record<string, WebUsage> = {};
   private webUsageTimer: ReturnType<typeof setTimeout> | null = null;
   private siteCache: Map<string, { site: SiteRow | null; at: number }> = new Map();
@@ -247,12 +268,18 @@ export class Relay extends DurableObject {
     this.providerChannels.clear();
     this.connectorChannels.clear();
     this.webProviders.clear();
+    this.webSocketClients.clear();
+    this.webSocketProviders.clear();
 
     const providerByChannel = new Map<string, WebSocket>();
     const connectorByChannel = new Map<string, WebSocket>();
 
     for (const ws of this.state.getWebSockets()) {
       const meta = this.safeDeserializeAttachment(ws);
+      if (meta.webClient === true) {
+        if (meta.webChannelId) this.webSocketClients.set(meta.webChannelId, ws);
+        continue;
+      }
       const isProvider = meta.isProvider === true;
       if (isProvider) {
         this.providers.add(ws);
@@ -261,6 +288,9 @@ export class Relay extends DurableObject {
       }
 
       if (meta.web === true) {
+        for (const channelId of meta.webSocketChannels || []) {
+          if (typeof channelId === "string" && channelId) this.webSocketProviders.set(channelId, ws);
+        }
         const hosts = Array.isArray(meta.webHosts) ? meta.webHosts : [];
         for (const host of hosts) {
           if (typeof host !== "string" || !host) continue;
@@ -305,7 +335,7 @@ export class Relay extends DurableObject {
     let count = 0;
     for (const ws of this.state.getWebSockets()) {
       const meta = this.safeDeserializeAttachment(ws);
-      if (meta.isProvider !== true) count++;
+      if (meta.isProvider !== true && meta.webClient !== true) count++;
     }
     return count;
   }
@@ -325,7 +355,7 @@ export class Relay extends DurableObject {
     for (const ws of this.state.getWebSockets()) {
       if (ws === exclude) continue;
       const meta = this.safeDeserializeAttachment(ws);
-      if (meta.isProvider !== true) count++;
+      if (meta.isProvider !== true && meta.webClient !== true) count++;
     }
     return count;
   }
@@ -339,6 +369,7 @@ export class Relay extends DurableObject {
     
     for (const ws of allWebSockets) {
       const meta = this.safeDeserializeAttachment(ws);
+      if (meta.webClient === true) continue;
       if (meta.isProvider === true) actualProviderCount++;
       else actualConnectorCount++;
     }
@@ -361,6 +392,7 @@ export class Relay extends DurableObject {
 
     for (const ws of this.state.getWebSockets()) {
       const meta = this.safeDeserializeAttachment(ws);
+      if (meta.webClient === true) continue;
       const ip = meta.clientIp || "unknown";
       if (meta.isProvider === true) {
         providerIPs.push(ip);
@@ -523,6 +555,7 @@ export class Relay extends DurableObject {
     for (const ws of allWebSockets) {
       try {
         const meta = ws.deserializeAttachment() as WebsocketMeta;
+        if (meta.webClient === true) continue;
         if (meta.isProvider) {
           actualProviderCount++;
         } else {
@@ -622,6 +655,9 @@ export class Relay extends DurableObject {
       const url = new URL(request.url);
 
       if (url.pathname === "/web") {
+        if (request.headers.get("Upgrade")?.toLowerCase() === "websocket") {
+          return await this.handleWebSocketHttp(request);
+        }
         return await this.handleWebHttp(request);
       }
 
@@ -791,7 +827,7 @@ export class Relay extends DurableObject {
 
   private getNextProvider(forceSync: boolean = false): WebSocket | null {
     this.syncFromState(forceSync);
-    const providers = Array.from(this.providers);
+    const providers = Array.from(this.providers).filter((ws) => this.safeDeserializeAttachment(ws).web !== true);
     if (providers.length === 0) return null;
 
     if (this.currentProviderIndex < 0 || this.currentProviderIndex >= providers.length) {
@@ -825,6 +861,13 @@ export class Relay extends DurableObject {
   async webSocketMessage(ws: WebSocket, message: ArrayBuffer | string) {
     try {
       this.syncFromState();
+      const initialMeta = this.safeDeserializeAttachment(ws);
+      if (initialMeta.webClient === true) {
+        if (initialMeta.webChannelId) {
+          await this.queueWebAction(initialMeta.webChannelId, () => this.forwardWebSocketClient(ws, message, initialMeta));
+        }
+        return;
+      }
       const messageData =
         typeof message === "string"
           ? new TextEncoder().encode(message)
@@ -851,6 +894,10 @@ export class Relay extends DurableObject {
       const isProvider = meta.isProvider === true;
       if (WEB_MESSAGE_TYPES.has(msg.getType()) && !supportsFeatureVersion(version, MIN_VERSION_WEB)) {
         ws.close(1008, `Web messages require protocol 0x${MIN_VERSION_WEB.toString(16).padStart(2, "0")} or newer`);
+        return;
+      }
+      if (msg.getType() === MessageType.WebSocketFrame && !supportsFeatureVersion(version, MIN_VERSION_WEBSOCKET)) {
+        ws.close(1008, "WebSocket frames require protocol 0x04 or newer");
         return;
       }
 
@@ -923,17 +970,30 @@ export class Relay extends DurableObject {
         }
 
         case MessageType.WebResponse: {
-          this.handleWebResponse(msg as WebResponseMessage);
+          const response = msg as WebResponseMessage;
+          await this.queueWebAction(response.channelId, () => this.handleWebResponse(response));
           break;
         }
 
         case MessageType.WebData: {
-          this.handleWebData(msg as WebDataMessage);
+          const data = msg as WebDataMessage;
+          await this.queueWebAction(data.channelId, () => this.handleWebData(data));
           break;
         }
 
         case MessageType.WebCancel: {
-          this.handleWebCancel(msg as WebCancelMessage);
+          const cancel = msg as WebCancelMessage;
+          if (this.webSocketProviders.get(cancel.channelId) === ws) {
+            this.closeWebSocketChannel(cancel.channelId, cancel.code || 1000, cancel.reason || "", false);
+          } else {
+            this.handleWebCancel(cancel);
+          }
+          break;
+        }
+
+        case MessageType.WebSocketFrame: {
+          const frame = msg as WebSocketFrameMessage;
+          await this.queueWebAction(frame.channelId, () => this.forwardWebSocketProvider(ws, frame));
           break;
         }
 
@@ -955,6 +1015,18 @@ export class Relay extends DurableObject {
               break;
             }
 
+            const quota = await this.getNetworkQuota(provider);
+            if (quota && (!quota.allowed || !await consumeQuota(this.env, quota.principal, 0, 1, quota.bytes, quota.requests))) {
+              const response: ConnectResponseMessage = {
+                success: false,
+                error: quota.allowed ? "Quota exceeded" : "Anonymous providers are disabled",
+                channelId: connectMsg.channelId,
+                getType: () => MessageType.ConnectResponse,
+              };
+              ws.send(packMessage(response));
+              break;
+            }
+
             // Create a new channel
             const channelId = connectMsg.channelId;
             this.providerChannels.set(channelId, provider);
@@ -964,7 +1036,12 @@ export class Relay extends DurableObject {
             this.pendingChannelCreations++;
 
             // Update metadata for both WebSockets
-            const providerMeta = provider.deserializeAttachment() as WebsocketMeta;
+            const providerMeta = this.safeDeserializeAttachment(provider);
+            if (quota) {
+              providerMeta.quotaPrincipal = quota.principal;
+              providerMeta.quotaBytes = quota.bytes;
+              providerMeta.quotaRequests = quota.requests;
+            }
             providerMeta.channels = providerMeta.channels || [];
             providerMeta.channels.push(channelId);
             provider.serializeAttachment(providerMeta);
@@ -1100,39 +1177,23 @@ export class Relay extends DurableObject {
 
         case MessageType.Data: {
           const dataMsg = msg as DataMessage;
-          const channelId = dataMsg.channelId;
-
-          if (isProvider) {
-            const connector = this.connectorChannels.get(channelId);
-            if (connector) {
-              connector.send(message);
-            }
-          } else {
-            const provider = this.providerChannels.get(channelId);
-            if (provider) {
-              provider.send(message);
-            }
-          }
+          await this.queueNetworkAction(dataMsg.channelId, () => this.forwardNetworkData(ws, message, dataMsg, isProvider));
           break;
         }
 
         case MessageType.Disconnect: {
           const disconnectMsg = msg as DisconnectMessage;
           const channelId = disconnectMsg.channelId;
-
-          if (isProvider) {
-            const connector = this.connectorChannels.get(channelId);
-            if (connector) {
-              connector.send(message);
+          await this.queueNetworkAction(channelId, async () => {
+            if (isProvider) {
+              const connector = this.connectorChannels.get(channelId);
+              if (connector) connector.send(message);
+            } else {
+              const provider = this.providerChannels.get(channelId);
+              if (provider) provider.send(message);
             }
-          } else {
-            const provider = this.providerChannels.get(channelId);
-            if (provider) {
-              provider.send(message);
-            }
-          }
-          // Clean up the channel
-          this.disconnectChannel(channelId);
+            this.disconnectChannel(channelId);
+          });
           break;
         }
 
@@ -1207,6 +1268,65 @@ export class Relay extends DurableObject {
   /* ---------------------------------------------------------------------- */
   /* Web reverse proxy                                                      */
   /* ---------------------------------------------------------------------- */
+
+  private async getNetworkQuota(provider: WebSocket): Promise<NetworkQuota | null> {
+    if (!this.env.DB) return null;
+    const meta = this.safeDeserializeAttachment(provider);
+    if (!meta.actualToken) throw new Error("Missing provider token for quota enforcement");
+    await ensureSchema(this.env);
+    const tokenKey = await this.toTokenKey(meta.actualToken);
+    const user = await findUserByTokenHash(this.env, tokenKey);
+    const settings = await effectiveSettings(this.env, user);
+    return {
+      principal: user ? `user:${user.id}` : `anonymous:${tokenKey}`,
+      bytes: settings.quotaBytes,
+      requests: settings.quotaRequests,
+      allowed: Boolean(user) || settings.allowAnonymous,
+    };
+  }
+
+  private async queueNetworkAction(channelId: string, action: () => Promise<void>): Promise<void> {
+    const previous = this.networkQueues.get(channelId) || Promise.resolve();
+    const current = previous.catch(() => undefined).then(action);
+    this.networkQueues.set(channelId, current);
+    try {
+      await current;
+    } finally {
+      if (this.networkQueues.get(channelId) === current) this.networkQueues.delete(channelId);
+    }
+  }
+
+  private async forwardNetworkData(ws: WebSocket, message: ArrayBuffer | string, data: DataMessage, isProvider: boolean): Promise<void> {
+    const provider = this.providerChannels.get(data.channelId);
+    const connector = this.connectorChannels.get(data.channelId);
+    if (!provider || !connector || (isProvider ? provider !== ws : connector !== ws)) return;
+
+    let meta = this.safeDeserializeAttachment(provider);
+    if (this.env.DB && !meta.quotaPrincipal) {
+      const quota = await this.getNetworkQuota(provider);
+      if (quota) {
+        if (!quota.allowed) {
+          this.disconnectChannel(data.channelId);
+          return;
+        }
+        meta = this.safeDeserializeAttachment(provider);
+        meta.quotaPrincipal = quota.principal;
+        meta.quotaBytes = quota.bytes;
+        meta.quotaRequests = quota.requests;
+        provider.serializeAttachment(meta);
+      }
+    }
+    if (meta.quotaPrincipal && this.env.DB && !await consumeQuota(this.env, meta.quotaPrincipal,
+      data.data.byteLength, 0, meta.quotaBytes || 0, meta.quotaRequests || 0)) {
+      const disconnect = packMessage({ channelId: data.channelId, getType: () => MessageType.Disconnect } as DisconnectMessage);
+      try { provider.send(disconnect); } catch {}
+      try { connector.send(disconnect); } catch {}
+      this.disconnectChannel(data.channelId);
+      return;
+    }
+    if (this.providerChannels.get(data.channelId) !== provider || this.connectorChannels.get(data.channelId) !== connector) return;
+    (isProvider ? connector : provider).send(message);
+  }
 
   private async handleWebRegister(ws: WebSocket, msg: WebRegisterMessage): Promise<void> {
     const meta = this.safeDeserializeAttachment(ws);
@@ -1455,9 +1575,16 @@ export class Relay extends DurableObject {
     }
   }
 
-  private handleWebResponse(msg: WebResponseMessage): void {
+  private async handleWebResponse(msg: WebResponseMessage): Promise<void> {
     const pending = this.webPending.get(msg.channelId);
     if (!pending || pending.responseReceived) return;
+    if (pending.method !== "HEAD" && msg.status !== 204 && msg.status !== 304 &&
+      typeof msg.bodyLength === "number" && msg.bodyLength > 0 &&
+      !await quotaCanFit(this.env, pending.quotaPrincipal, msg.bodyLength, pending.quotaBytes)) {
+      this.finishWebPending(msg.channelId, new WebQuotaExceededError("Web transfer quota exceeded"));
+      return;
+    }
+    if (this.webPending.get(msg.channelId) !== pending) return;
     pending.responseReceived = true;
     if (pending.timeout) {
       clearTimeout(pending.timeout);
@@ -1470,7 +1597,18 @@ export class Relay extends DurableObject {
     pending.resolve(msg);
   }
 
-  private handleWebData(msg: WebDataMessage): void {
+  private async queueWebAction(channelId: string, action: () => Promise<void>): Promise<void> {
+    const previous = this.webDataQueues.get(channelId) || Promise.resolve();
+    const current = previous.then(action);
+    this.webDataQueues.set(channelId, current);
+    try {
+      await current;
+    } finally {
+      if (this.webDataQueues.get(channelId) === current) this.webDataQueues.delete(channelId);
+    }
+  }
+
+  private async handleWebData(msg: WebDataMessage): Promise<void> {
     const pending = this.webPending.get(msg.channelId);
     if (!pending) return;
     if (pending.timeout) {
@@ -1480,6 +1618,13 @@ export class Relay extends DurableObject {
       }, 120_000);
     }
     if (msg.data.byteLength > 0) {
+      const allowed = await consumeQuota(this.env, pending.quotaPrincipal, msg.data.byteLength, 0,
+        pending.quotaBytes, pending.quotaRequests);
+      if (!allowed) {
+        this.finishWebPending(msg.channelId, new Error("Web transfer quota exceeded"));
+        return;
+      }
+      if (this.webPending.get(msg.channelId) !== pending) return;
       pending.bytes += msg.data.byteLength;
       this.reportWebBytes(pending.host, msg.data.byteLength);
       if (pending.controller) {
@@ -1639,14 +1784,6 @@ export class Relay extends DurableObject {
       });
     }
 
-    const usage = this.getWebUsage(host);
-    if (site.quota_requests > 0 && usage.requests >= site.quota_requests) {
-      return this.webQuotaResponse(site, "requests");
-    }
-    if (site.quota_bytes > 0 && usage.bytes >= site.quota_bytes) {
-      return this.webQuotaResponse(site, "bytes");
-    }
-
     const providers = this.getWebProviders(host);
     if (providers.length === 0) {
       return new Response(
@@ -1666,6 +1803,12 @@ export class Relay extends DurableObject {
         return new Response("Request body too large", { status: 413 });
       }
       body = new Uint8Array(buffer);
+    }
+
+    const quotaPrincipal = site.owner_id ? `user:${site.owner_id}` : `anonymous:${site.token_hash || site.relay_id}`;
+    const allowed = await consumeQuota(this.env, quotaPrincipal, body.byteLength, 1, site.quota_bytes, site.quota_requests);
+    if (!allowed) {
+      return this.webQuotaResponse(site, site.quota_requests > 0 ? "requests" : "bytes");
     }
 
     const index = (this.webRoundRobin.get(host) || 0) % providers.length;
@@ -1694,6 +1837,10 @@ export class Relay extends DurableObject {
     const pending: WebPending = {
       host,
       ws,
+      method: request.method,
+      quotaPrincipal,
+      quotaBytes: site.quota_bytes,
+      quotaRequests: site.quota_requests,
       controller,
       responseReceived: false,
       resolve: resolveResponse,
@@ -1776,6 +1923,7 @@ export class Relay extends DurableObject {
       responseMsg = await responsePromise;
     } catch (err) {
       this.cancelWebPending(channelId, err instanceof Error ? err.message : String(err));
+      if (err instanceof WebQuotaExceededError) return this.webQuotaResponse(site, "bytes");
       return new Response(
         renderErrorPage("Origin timeout", "The origin did not respond in time.", "504"),
         { status: 504, headers: { "Content-Type": "text/html; charset=utf-8" } },
@@ -1802,6 +1950,145 @@ export class Relay extends DurableObject {
     }
 
     return new Response(stream, { status, headers: responseHeaders });
+  }
+
+  private async handleWebSocketHttp(request: Request): Promise<Response> {
+    const url = new URL(request.url);
+    const host = normalizeHost(request.headers.get("X-LS-Site-Host") || "");
+    const site = host ? await this.getSiteCached(host) : null;
+    if (!site) return new Response("Unknown site", { status: 404 });
+    if (site.expires_at && site.expires_at <= Date.now()) {
+      return new Response(renderExpiredPage(host, site.expires_at), { status: 410, headers: { "Content-Type": "text/html; charset=utf-8" } });
+    }
+    const providers = this.getWebProviders(host).filter((provider) =>
+      supportsFeatureVersion(this.safeDeserializeAttachment(provider).peerProtocolVersion || 0, MIN_VERSION_WEBSOCKET));
+    if (providers.length === 0) return new Response("No WebSocket-capable provider is online", { status: 503 });
+    const principal = site.owner_id ? `user:${site.owner_id}` : `anonymous:${site.token_hash || site.relay_id}`;
+    if (!await consumeQuota(this.env, principal, 0, 1, site.quota_bytes, site.quota_requests)) {
+      return this.webQuotaResponse(site, site.quota_requests > 0 ? "requests" : "bytes");
+    }
+    const index = (this.webRoundRobin.get(host) || 0) % providers.length;
+    this.webRoundRobin.set(host, index + 1);
+    const provider = providers[index];
+    const channelId = crypto.randomUUID();
+    let resolveResponse!: (msg: WebResponseMessage) => void;
+    let rejectResponse!: (err: Error) => void;
+    const responsePromise = new Promise<WebResponseMessage>((resolve, reject) => {
+      resolveResponse = resolve;
+      rejectResponse = reject;
+    });
+    void responsePromise.catch(() => undefined);
+    const pending: WebPending = {
+      host, ws: provider, method: "GET", quotaPrincipal: principal,
+      quotaBytes: site.quota_bytes, quotaRequests: site.quota_requests,
+      controller: null, responseReceived: false, resolve: resolveResponse, reject: rejectResponse,
+      timeout: null, bytes: 0,
+    };
+    this.webPending.set(channelId, pending);
+    this.incrementWebRequest(host);
+    const headers: Array<[string, string]> = [];
+    for (const [name, value] of request.headers) {
+      const lower = name.toLowerCase();
+      if (isHopByHopHeader(lower) || isInternalHeader(lower) || lower === "host" || lower === "content-length") continue;
+      headers.push([name, value]);
+    }
+    headers.push(["X-Forwarded-Host", host]);
+    headers.push(["X-Forwarded-Proto", request.headers.get("X-LS-Original-Proto") || "https"]);
+    const webRequest: WebRequestMessage = {
+      channelId, method: "GET", path: request.headers.get("X-LS-Original-Path") || `${url.pathname}${url.search}`,
+      headers, hasBody: false, host, webSocket: true, getType: () => MessageType.WebRequest,
+    };
+    try {
+      provider.send(packMessage(webRequest));
+    } catch {
+      this.finishWebPending(channelId, new Error("Provider disconnected"));
+      return new Response("Origin disconnected", { status: 502 });
+    }
+    pending.timeout = setTimeout(() => this.cancelWebPending(channelId, "WebSocket provider response timeout"), WEB_RESPONSE_TIMEOUT_MS);
+    let response: WebResponseMessage;
+    try {
+      response = await responsePromise;
+    } catch {
+      return new Response("Origin did not accept WebSocket", { status: 502 });
+    }
+    if (pending.timeout) clearTimeout(pending.timeout);
+    this.webPending.delete(channelId);
+    if (response.status !== 101) {
+      return new Response("Origin rejected WebSocket", { status: response.status >= 400 && response.status <= 599 ? response.status : 502 });
+    }
+    const responseHeaders = new Headers();
+    const offered = (request.headers.get("Sec-WebSocket-Protocol") || "").split(",").map((value) => value.trim()).filter(Boolean);
+    for (const [name, value] of response.headers || []) {
+      const lower = name.toLowerCase();
+      if (lower === "sec-websocket-protocol" && !offered.includes(value)) {
+        this.closeWebSocketChannel(channelId, 1002, "Invalid WebSocket subprotocol", true);
+        return new Response("Invalid WebSocket subprotocol", { status: 502 });
+      }
+      if (isHopByHopHeader(lower) || lower === "sec-websocket-extensions" || lower === "content-length") continue;
+      responseHeaders.append(name, value);
+    }
+    const pair = new WebSocketPair();
+    const [client, server] = [pair[0], pair[1]];
+    this.state.acceptWebSocket(server);
+    server.serializeAttachment({
+      webClient: true, webChannelId: channelId, webHost: host,
+      quotaPrincipal: principal, quotaBytes: site.quota_bytes, quotaRequests: site.quota_requests,
+    } satisfies WebsocketMeta);
+    const providerMeta = this.safeDeserializeAttachment(provider);
+    providerMeta.webSocketChannels = [...(providerMeta.webSocketChannels || []), channelId];
+    provider.serializeAttachment(providerMeta);
+    this.webSocketClients.set(channelId, server);
+    this.webSocketProviders.set(channelId, provider);
+    return new Response(null, { status: 101, webSocket: client, headers: responseHeaders });
+  }
+
+  private async forwardWebSocketClient(ws: WebSocket, message: ArrayBuffer | string, meta: WebsocketMeta): Promise<void> {
+    const channelId = meta.webChannelId || "";
+    const provider = this.webSocketProviders.get(channelId);
+    if (!provider || this.webSocketClients.get(channelId) !== ws || !meta.quotaPrincipal) {
+      this.closeWebSocketChannel(channelId, 1011, "Provider unavailable", true);
+      return;
+    }
+    const data = typeof message === "string" ? new TextEncoder().encode(message) : new Uint8Array(message);
+    if (!await consumeQuota(this.env, meta.quotaPrincipal, data.byteLength, 0, meta.quotaBytes || 0, meta.quotaRequests || 0)) {
+      this.closeWebSocketChannel(channelId, 1008, "Transfer quota exceeded", true);
+      return;
+    }
+    if (meta.webHost) this.reportWebBytes(meta.webHost, data.byteLength);
+    provider.send(packMessage({ channelId, opcode: typeof message === "string" ? 1 : 2, data, getType: () => MessageType.WebSocketFrame } as WebSocketFrameMessage));
+  }
+
+  private async forwardWebSocketProvider(ws: WebSocket, frame: WebSocketFrameMessage): Promise<void> {
+    const client = this.webSocketClients.get(frame.channelId);
+    if (!client || this.webSocketProviders.get(frame.channelId) !== ws) return;
+    const meta = this.safeDeserializeAttachment(client);
+    if (!meta.quotaPrincipal || !await consumeQuota(this.env, meta.quotaPrincipal, frame.data.byteLength, 0, meta.quotaBytes || 0, meta.quotaRequests || 0)) {
+      this.closeWebSocketChannel(frame.channelId, 1008, "Transfer quota exceeded", true);
+      return;
+    }
+    if (meta.webHost) this.reportWebBytes(meta.webHost, frame.data.byteLength);
+    client.send(frame.opcode === 1 ? new TextDecoder("utf-8", { fatal: true, ignoreBOM: false }).decode(frame.data) : frame.data);
+  }
+
+  private closeWebSocketChannel(channelId: string, code: number, reason: string, notifyProvider: boolean): void {
+    const client = this.webSocketClients.get(channelId);
+    const provider = this.webSocketProviders.get(channelId);
+    this.webSocketClients.delete(channelId);
+    this.webSocketProviders.delete(channelId);
+    if (provider) {
+      const meta = this.safeDeserializeAttachment(provider);
+      meta.webSocketChannels = (meta.webSocketChannels || []).filter((item) => item !== channelId);
+      try { provider.serializeAttachment(meta); } catch {}
+      if (notifyProvider) {
+        try { provider.send(packMessage({ channelId, code, reason, getType: () => MessageType.WebCancel } as WebCancelMessage)); } catch {}
+      }
+    }
+    if (client) {
+      const safeCode = code === 1000 || (code >= 1001 && code <= 1014 && ![1004, 1005, 1006].includes(code)) || (code >= 3000 && code <= 4999) ? code : 1011;
+      let safeReason = reason;
+      while (new TextEncoder().encode(safeReason).length > 123) safeReason = safeReason.slice(0, -1);
+      try { client.close(safeCode, safeReason); } catch {}
+    }
   }
 
   async adminGetWebInfo(): Promise<{
@@ -1885,8 +2172,20 @@ export class Relay extends DurableObject {
     this.connectorChannels.delete(channelId);
   }
 
-  async webSocketClose(ws: WebSocket) {
+  async webSocketClose(ws: WebSocket, code: number = 1000, reason: string = "") {
     this.syncFromState(true);
+
+    const closingMeta = this.safeDeserializeAttachment(ws);
+    if (closingMeta.webClient === true && closingMeta.webChannelId) {
+      this.closeWebSocketChannel(closingMeta.webChannelId, code, reason, true);
+      return;
+    }
+    for (const [channelId, provider] of this.webSocketProviders) {
+      if (provider === ws) this.closeWebSocketChannel(channelId, 1011, "Provider disconnected", false);
+    }
+    for (const [channelId, pending] of this.webPending) {
+      if (pending.ws === ws) this.finishWebPending(channelId, new Error("Provider disconnected"));
+    }
 
     // Flush pending bytes so short-lived traffic is not undercounted.
     await this.flushTraffic(true).catch(console.error);

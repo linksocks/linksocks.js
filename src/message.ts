@@ -3,7 +3,7 @@ import { gzip, ungzip } from "pako";
 // Add a message type or make a compatible protocol change: bump the minor version.
 // Before bumping the major version for a format change that breaks old parsers,
 // ask the project owner for approval. Feature minimums are separate from this version.
-export const PROTOCOL_VERSION = 0x03;
+export const PROTOCOL_VERSION = 0x04;
 
 function protocolMajor(v: number): number {
   return (v >> 4) & 0x0f;
@@ -35,6 +35,7 @@ export const enum BinaryType {
   WebData = 0x16,
   WebCancel = 0x17,
   WebRotate = 0x18,
+  WebSocketFrame = 0x19,
 }
 
 // Protocol types
@@ -75,6 +76,7 @@ export const enum MessageType {
   WebData = "web_data",
   WebCancel = "web_cancel",
   WebRotate = "web_rotate",
+  WebSocketFrame = "websocket_frame",
   Unknown = "unknown",
 }
 
@@ -244,6 +246,7 @@ export interface WebRequestMessage extends BaseMessage {
   clientIp?: string;
   scheme?: string;
   host?: string;
+  webSocket?: boolean;
 }
 
 export interface WebResponseMessage extends BaseMessage {
@@ -262,6 +265,13 @@ export interface WebDataMessage extends BaseMessage {
 export interface WebCancelMessage extends BaseMessage {
   channelId: string;
   reason?: string;
+  code?: number;
+}
+
+export interface WebSocketFrameMessage extends BaseMessage {
+  channelId: string;
+  opcode: number;
+  data: Uint8Array;
 }
 
 export interface WebRotateMessage extends BaseMessage {
@@ -732,6 +742,7 @@ export function packMessage(msg: BaseMessage): Uint8Array {
         client_ip: requestMsg.clientIp,
         scheme: requestMsg.scheme,
         host: requestMsg.host,
+        websocket: requestMsg.webSocket || undefined,
       };
       const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
       const payload = [
@@ -783,6 +794,7 @@ export function packMessage(msg: BaseMessage): Uint8Array {
       const payloadBody = {
         channel_id: cancelMsg.channelId,
         reason: cancelMsg.reason,
+        code: cancelMsg.code,
       };
       const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
       const payload = [
@@ -793,6 +805,18 @@ export function packMessage(msg: BaseMessage): Uint8Array {
         jsonData.length & 0xff,
       ];
       return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.WebSocketFrame: {
+      const frameMsg = msg as WebSocketFrameMessage;
+      if (frameMsg.opcode !== 1 && frameMsg.opcode !== 2) throw new Error("Invalid WebSocket frame opcode");
+      const length = frameMsg.data.length;
+      const payload = new Uint8Array(22);
+      payload[0] = BinaryType.WebSocketFrame;
+      payload.set(uuidToBytes(frameMsg.channelId), 1);
+      payload[17] = frameMsg.opcode;
+      new DataView(payload.buffer).setUint32(18, length);
+      return concatUint8Arrays(header, payload, frameMsg.data);
     }
 
     case MessageType.WebRotate: {
@@ -1357,6 +1381,7 @@ export function parseMessageWithVersion(data: Uint8Array): ParsedMessageWithVers
           clientIp: parsed.client_ip,
           scheme: parsed.scheme,
           host: parsed.host,
+          webSocket: parsed.websocket === true,
           getType: () => MessageType.WebRequest,
         } as WebRequestMessage,
       };
@@ -1408,8 +1433,26 @@ export function parseMessageWithVersion(data: Uint8Array): ParsedMessageWithVers
         message: {
           channelId: parsed.channel_id,
           reason: parsed.reason,
+          code: parsed.code,
           getType: () => MessageType.WebCancel,
         } as WebCancelMessage,
+      };
+    }
+
+    case BinaryType.WebSocketFrame: {
+      if (payload.length < 21) throw new Error("Invalid WebSocket frame message");
+      const opcode = payload[16];
+      if (opcode !== 1 && opcode !== 2) throw new Error("Invalid WebSocket frame opcode");
+      const length = new DataView(payload.buffer, payload.byteOffset + 17, 4).getUint32(0);
+      if (length !== payload.length - 21) throw new Error("Invalid WebSocket frame message length");
+      return {
+        version,
+        message: {
+          channelId: bytesToUUID(payload.slice(0, 16)),
+          opcode,
+          data: payload.slice(21),
+          getType: () => MessageType.WebSocketFrame,
+        } as WebSocketFrameMessage,
       };
     }
 

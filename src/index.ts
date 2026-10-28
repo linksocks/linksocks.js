@@ -2062,17 +2062,6 @@ async function handleSiteProxy(
     });
   }
 
-  if (request.headers.get("Upgrade") === "websocket") {
-    return new Response(
-      renderErrorPage(
-        "WebSocket not supported",
-        "WebSocket upgrades through the web proxy are not supported yet. Use the SOCKS/relay mode for WebSocket traffic.",
-        "501",
-      ),
-      { status: 501, headers: { "Content-Type": "text/html; charset=utf-8" } },
-    );
-  }
-
   let relay: Awaited<ReturnType<typeof env.RELAY.get>> | null = null;
   try {
     relay = env.RELAY.get(env.RELAY.idFromString(site.relay_id));

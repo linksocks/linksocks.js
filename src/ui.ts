@@ -352,6 +352,7 @@ function settingsForm(opts: {
   csrf: string;
   settings: Settings;
   global: boolean;
+  userId?: string;
   title: string;
   description: string;
 }): string {
@@ -367,6 +368,7 @@ function settingsForm(opts: {
       <input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}"/>
       <input type="hidden" name="action" value="saveSettings"/>
       ${opts.global ? `<input type="hidden" name="scope" value="global"/>` : `<input type="hidden" name="scope" value="user"/>`}
+      ${opts.userId ? `<input type="hidden" name="userId" value="${escapeHtml(opts.userId)}"/>` : ""}
       ${opts.global ? check("allowAnonymous", "Allow anonymous providers", s.allowAnonymous) : ""}
       ${opts.global ? check("allowRegistration", "Allow user self-registration", s.allowRegistration) : ""}
       ${opts.global ? check("allowUserSettings", "Allow users to edit their own policy", s.allowUserSettings) : ""}
@@ -522,6 +524,7 @@ export function renderAdminPage(data: AdminPageData): string {
       csrf: data.csrf,
       settings: data.selectedUserSettings,
       global: false,
+      userId: selected.id,
       title: `Policy for ${selected.username}`,
       description: "Per-user limits applied to sites created with this user's tokens.",
     }) : ""}`;

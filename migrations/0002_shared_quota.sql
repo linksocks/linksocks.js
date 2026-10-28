@@ -1,0 +1,5 @@
+CREATE TABLE IF NOT EXISTS quota_usage (
+  principal TEXT PRIMARY KEY,
+  bytes INTEGER NOT NULL DEFAULT 0,
+  requests INTEGER NOT NULL DEFAULT 0
+);

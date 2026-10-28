@@ -150,6 +150,11 @@ const SCHEMA: string[] = [
     value TEXT NOT NULL,
     updated_at INTEGER NOT NULL
   )`,
+  `CREATE TABLE IF NOT EXISTS quota_usage (
+    principal TEXT PRIMARY KEY,
+    bytes INTEGER NOT NULL DEFAULT 0,
+    requests INTEGER NOT NULL DEFAULT 0
+  )`,
 ];
 
 let schemaPromise: Promise<void> | null = null;
@@ -176,6 +181,40 @@ async function initSchema(env: Env): Promise<void> {
 function requireDb(env: Env): D1Database {
   if (!env.DB) throw new Error("D1 binding DB is not configured");
   return env.DB;
+}
+
+export async function consumeQuota(
+  env: Env,
+  principal: string,
+  bytes: number,
+  requests: number,
+  maxBytes: number,
+  maxRequests: number,
+): Promise<boolean> {
+  const result = await requireDb(env)
+    .prepare(
+      `INSERT INTO quota_usage (principal, bytes, requests)
+       SELECT ?, ?, ? WHERE (? = 0 OR ? <= ?) AND (? = 0 OR ? <= ?)
+       ON CONFLICT(principal) DO UPDATE SET
+         bytes = quota_usage.bytes + excluded.bytes,
+         requests = quota_usage.requests + excluded.requests
+       WHERE (? = 0 OR quota_usage.bytes + excluded.bytes <= ?)
+         AND (excluded.requests = 0 OR ? = 0 OR quota_usage.bytes < ?)
+         AND (? = 0 OR quota_usage.requests + excluded.requests <= ?)`,
+    )
+    .bind(principal, bytes, requests, maxBytes, bytes, maxBytes, maxRequests, requests, maxRequests,
+      maxBytes, maxBytes, maxBytes, maxBytes, maxRequests, maxRequests)
+    .run();
+  return result.meta.changes === 1;
+}
+
+export async function quotaCanFit(env: Env, principal: string, bytes: number, maxBytes: number): Promise<boolean> {
+  if (maxBytes === 0) return true;
+  const usage = await requireDb(env).withSession("first-primary")
+    .prepare("SELECT bytes FROM quota_usage WHERE principal = ?")
+    .bind(principal)
+    .first<{ bytes: number }>();
+  return Number(usage?.bytes || 0) + bytes <= maxBytes;
 }
 
 async function ensureAdminUser(env: Env): Promise<void> {

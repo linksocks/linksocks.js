@@ -60,7 +60,14 @@ export interface WebsocketMeta {
   actualToken?: string;
   clientIp?: string;
   peerProtocolVersion?: number;
+  quotaPrincipal?: string;
+  quotaBytes?: number;
+  quotaRequests?: number;
   web?: boolean;
+  webClient?: boolean;
+  webChannelId?: string;
+  webHost?: string;
+  webSocketChannels?: string[];
   webHosts?: string[];
   webBackendCount?: number;
   webOwnerId?: string | null;

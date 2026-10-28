@@ -214,6 +214,9 @@ linksocks web -u wss://linksocks.example.com -t ls_xxx \
 自动生成的域名永远标记为 `temporary`，界面会显示剩余有效期；自定义域名默认长期有效。
 超过配额时边缘会直接返回 `429`，临时域名过期后返回 `410`。
 
+字节与请求数配额是硬上限，由同一身份的所有站点共享（一个账号，或一个匿名 Provider 令牌）：
+SOCKS5 中继流量与网站代理流量消耗同一个计数器，额度用尽后会阻止新页面并断开进行中的中继通道。
+
 ### 负载均衡
 
 - 同一个 Provider 用多个 `-l` 指定多个本地后端，`linksocks web` 内部轮询。
@@ -222,7 +225,7 @@ linksocks web -u wss://linksocks.example.com -t ls_xxx \
 
 ### 新增协议消息
 
-二进制消息类型 0x12–0x18（与 Go 客户端共用）：
+二进制消息类型 0x12–0x19（与 Go 客户端共用）：
 
 | 类型 | 方向 | 说明 |
 |---|---|---|
@@ -233,11 +236,17 @@ linksocks web -u wss://linksocks.example.com -t ls_xxx \
 | `web_data` (0x16) | 双向 | 请求体 / 响应体分片，末片带 `end` 标志 |
 | `web_cancel` (0x17) | 双向 | 取消某个通道 |
 | `web_rotate` (0x18) | Relay → Provider | 通知域名已轮换 |
+| `websocket_frame` (0x19) | 双向 | WebSocket 文本/二进制帧载荷 |
+
+### WebSocket 流量
+
+被代理域名上的 WebSocket 握手会通过同一个 Web Provider 隧道转发：源站自己的升级响应
+（包含协商出的子协议）、文本帧与二进制帧都会双向透传，正常关闭也会同步到两端。WebSocket
+载荷字节同样计入该身份的网络代理限额。
 
 ### 已知限制
 
-- 通过网站代理的 WebSocket Upgrade 暂不支持（返回 `501`），需要 WebSocket 时请使用
-  SOCKS5 / relay 模式。
+- 代理不会协商 WebSocket 的 permessage-deflate 扩展。
 - 请求体上限 16 MB；响应体为流式转发。
 - 每个临时域名有失效时间，过期后必须重新注册才能获得新域名。
 
