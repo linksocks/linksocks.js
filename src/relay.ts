@@ -42,9 +42,12 @@ import {
   effectiveSettings,
   ensureSchema,
   findUserByTokenHash,
+  getReservation,
   getSite,
   isSiteHostForZone,
+  listReservations,
   listSites,
+  listSitesByRelay,
   normalizeHost,
   quotaCanFit,
   randomHostLabel,
@@ -120,9 +123,28 @@ function isInternalHeader(name: string): boolean {
   return name.toLowerCase().startsWith("x-ls-");
 }
 
+function utcDayKey(now = Date.now()): string {
+  return new Date(now).toISOString().slice(0, 10);
+}
+
+function humanizeDuration(ms: number): string {
+  if (ms >= 24 * 60 * 60 * 1000 && ms % (24 * 60 * 60 * 1000) === 0) {
+    return `${ms / (24 * 60 * 60 * 1000)} day${ms === 24 * 60 * 60 * 1000 ? "" : "s"}`;
+  }
+  if (ms >= 60 * 60 * 1000 && ms % (60 * 60 * 1000) === 0) {
+    return `${ms / (60 * 60 * 1000)} hour${ms === 60 * 60 * 1000 ? "" : "s"}`;
+  }
+  if (ms >= 60_000 && ms % 60_000 === 0) {
+    return `${ms / 60_000} minute${ms === 60_000 ? "" : "s"}`;
+  }
+  return `${Math.max(1, Math.round(ms / 1000))} seconds`;
+}
+
 
 export class Relay extends DurableObject {
   private static readonly PROVIDER_DISCONNECT_GRACE_MS = 60_000;
+  private static readonly WEB_RELAY_HOLD_MS = 24 * 60 * 60 * 1000;
+  private static readonly WEB_FORCED_TEMP_HOLD_MS = 60_000;
   private static readonly CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS = 100;
   private static readonly TRAFFIC_FLUSH_IDLE_MS = 60_000;
   private static readonly DEFAULT_CONNECTOR_WAIT_PROVIDER_MS = 5_000;
@@ -161,6 +183,7 @@ export class Relay extends DurableObject {
   private webSocketClients: Map<string, WebSocket> = new Map();
   private webSocketProviders: Map<string, WebSocket> = new Map();
   private webUsage: Record<string, WebUsage> = {};
+  private webUsageDay: string = "";
   private webUsageTimer: ReturnType<typeof setTimeout> | null = null;
   private siteCache: Map<string, { site: SiteRow | null; at: number }> = new Map();
 
@@ -221,6 +244,16 @@ export class Relay extends DurableObject {
       const storedWebUsage = (await this.storage.get("webUsage")) as Record<string, WebUsage> | undefined;
       if (storedWebUsage && typeof storedWebUsage === "object") {
         this.webUsage = storedWebUsage;
+      }
+
+      const storedDay = (await this.storage.get("webUsageDay")) as string | undefined;
+      this.webUsageDay = typeof storedDay === "string" ? storedDay : "";
+      const today = utcDayKey();
+      if (this.webUsageDay !== today) {
+        this.webUsage = {};
+        this.webUsageDay = today;
+        await this.storage.put("webUsage", {});
+        await this.storage.put("webUsageDay", today);
       }
 
       if (this.trafficAccumulator > 0 || this.pendingChannelCreations > 0) {
@@ -406,6 +439,7 @@ export class Relay extends DurableObject {
 
   private async ensureCleanupScheduled() {
     const providerDisconnectTime = (await this.storage.get('providerDisconnectTime')) as number | undefined;
+    const graceMs = await this.getProviderDisconnectGraceMs();
     const now = Date.now();
     if (!providerDisconnectTime) {
       const hasNoWebSockets = this.state.getWebSockets().length === 0;
@@ -415,18 +449,18 @@ export class Relay extends DurableObject {
       const cleanupStartAt = oldestCreatedAt && oldestCreatedAt < now ? oldestCreatedAt : now;
       await this.storage.put('providerDisconnectTime', cleanupStartAt);
       const elapsed = now - cleanupStartAt;
-      if (elapsed >= Relay.PROVIDER_DISCONNECT_GRACE_MS) {
+      if (elapsed >= graceMs) {
         // Grace already expired — perform cleanup directly instead of relying on an alarm.
         await this.performStaleRelayCleanup();
         return;
       }
-      await this.scheduleAlarmAt(now + (Relay.PROVIDER_DISCONNECT_GRACE_MS - elapsed));
+      await this.scheduleAlarmAt(now + (graceMs - elapsed));
       return;
     }
 
     const elapsed = now - providerDisconnectTime;
-    if (elapsed < Relay.PROVIDER_DISCONNECT_GRACE_MS) {
-      await this.scheduleAlarmAt(now + (Relay.PROVIDER_DISCONNECT_GRACE_MS - elapsed));
+    if (elapsed < graceMs) {
+      await this.scheduleAlarmAt(now + (graceMs - elapsed));
       return;
     }
 
@@ -440,18 +474,39 @@ export class Relay extends DurableObject {
    * Safe to call multiple times — idempotent once storage is cleared.
    */
   private async performStaleRelayCleanup(): Promise<void> {
-    const notifiedConnectors = this.notifyConnectorsRelayTermination();
+    const graceMs = await this.getProviderDisconnectGraceMs();
+    const notifiedConnectors = this.notifyConnectorsRelayTermination(graceMs);
     if (notifiedConnectors > 0) {
       await new Promise((resolve) => setTimeout(resolve, Relay.CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS));
     }
 
+    // Release the published hostnames before revoking tokens. Reservations, if
+    // any, live in their own table and keep the name bound to its owner.
+    await this.deleteRelaySites();
     await this.deleteRelayRecords();
 
     // Clear local storage
     await this.storage.deleteAll();
+    this.webUsage = {};
+    this.webUsageDay = "";
+    this.siteCache.clear();
 
     // Close all remaining connections
     this.adminDisconnectAll('All providers disconnected, relay terminated');
+  }
+
+  private async deleteRelaySites(): Promise<void> {
+    if (!this.env.DB) return;
+    const relayId = this.state.id.toString();
+    try {
+      const sites = await listSitesByRelay(this.env, relayId);
+      for (const site of sites) {
+        await deleteSite(this.env, site.host);
+        this.siteCache.delete(site.host);
+      }
+    } catch (error) {
+      console.error("cleanup: failed to delete site rows", error);
+    }
   }
 
   adminDisconnectAll(reason: string = "Admin disconnect") {
@@ -937,6 +992,7 @@ export class Relay extends DurableObject {
               getType: () => MessageType.AuthResponse,
             };
             ws.send(packMessage(response));
+            if (isProvider) await this.markProviderOnline();
             break;
           }
 
@@ -959,6 +1015,7 @@ export class Relay extends DurableObject {
             getType: () => MessageType.AuthResponse,
           };
           ws.send(packMessage(response));
+          if (isProvider) await this.markProviderOnline();
           break;
         }
 
@@ -1411,6 +1468,32 @@ export class Relay extends DurableObject {
       const zone = normalizeHost(this.env.WEB_ZONE || meta.baseHost || "");
       const now = Date.now();
       let requestedHost = normalizeHost(msg.host || "");
+      const originalRequestedHost = requestedHost;
+
+      // A reservation binds a hostname to one account even while no site exists.
+      // It is invisible on the user side and only blocks other accounts.
+      const reservation = requestedHost ? await getReservation(this.env, requestedHost) : null;
+      const reservedClaim = Boolean(
+        requestedHost && reservation && user && reservation.user_id === user.id,
+      );
+      if (requestedHost && reservation) {
+        if (!user) {
+          reply(false, "This hostname is reserved by an account");
+          return;
+        }
+        if (reservation.user_id !== user.id) {
+          reply(false, "This hostname is reserved by another account");
+          return;
+        }
+      }
+
+      // Forced temporary mode discards custom hostnames (and old hosts) on
+      // every registration. The provider receives the new URL in the response
+      // and in a log message so its operator can see the change.
+      if (settings.forceTemporaryHost) {
+        requestedHost = "";
+      }
+
       let existing = requestedHost ? await getSite(this.env, requestedHost) : null;
       let ownsExisting = Boolean(
         existing &&
@@ -1438,7 +1521,7 @@ export class Relay extends DurableObject {
       }
 
       if (requestedHost) {
-        if (!settings.allowCustomHost && !ownsExisting) {
+        if (!settings.allowCustomHost && !ownsExisting && !reservation) {
           reply(false, "Custom hostnames are disabled for this account");
           return;
         }
@@ -1446,7 +1529,7 @@ export class Relay extends DurableObject {
           reply(false, `Hostname must be a subdomain of ${zone || "WEB_ZONE"}`);
           return;
         }
-        if (existing && existing.relay_id !== relayId) {
+        if (existing && existing.relay_id !== relayId && !reservedClaim) {
           reply(false, "This hostname is already bound to another relay");
           return;
         }
@@ -1471,9 +1554,12 @@ export class Relay extends DurableObject {
           reply(false, "WEB_ZONE is not configured, so automatic hostnames are unavailable");
           return;
         }
+        const reservedHosts = new Set(
+          (await listReservations(this.env)).map((row) => row.host),
+        );
         for (let attempt = 0; attempt < 8; attempt++) {
           const candidate = `${randomHostLabel()}.${zone}`;
-          if (!(await getSite(this.env, candidate))) {
+          if (!reservedHosts.has(candidate) && !(await getSite(this.env, candidate))) {
             host = candidate;
             break;
           }
@@ -1487,7 +1573,7 @@ export class Relay extends DurableObject {
       if (!existing) {
         existing = await getSite(this.env, host);
       }
-      if (existing && existing.relay_id !== relayId) {
+      if (existing && existing.relay_id !== relayId && !reservedClaim) {
         reply(false, "This hostname is already bound to another relay");
         return;
       }
@@ -1512,7 +1598,7 @@ export class Relay extends DurableObject {
       }
 
       const temporary = !requestedHost || reclaimingTemporary;
-      let expiresAt = existing?.expires_at ?? null;
+      let expiresAt = reservedClaim ? null : (existing?.expires_at ?? null);
       if (temporary && (!expiresAt || expiresAt <= now || msg.rotate || !existing)) {
         expiresAt = settings.autoRotateSeconds > 0
           ? now + settings.autoRotateSeconds * 1000
@@ -1543,6 +1629,20 @@ export class Relay extends DurableObject {
       };
       await upsertSite(this.env, site);
       this.siteCache.delete(host);
+      await this.rememberWebGrace(settings);
+
+      if (settings.forceTemporaryHost && originalRequestedHost && originalRequestedHost !== host) {
+        const notice: LogMessage = {
+          level: "info",
+          msg: `Forced temporary hostnames are enabled; ${originalRequestedHost} is no longer used. New URL: ${siteUrl(host)}`,
+          getType: () => MessageType.Log,
+        };
+        try {
+          ws.send(packMessage(notice));
+        } catch {
+          // The response below still carries the new host.
+        }
+      }
 
       const previousHosts = Array.isArray(meta.webHosts) ? meta.webHosts : [];
       for (const oldHost of previousHosts) {
@@ -1694,13 +1794,54 @@ export class Relay extends DurableObject {
     });
   }
 
+  private ensureWebUsageDay(): void {
+    const today = utcDayKey();
+    if (this.webUsageDay === today) return;
+    this.webUsageDay = today;
+    this.webUsage = {};
+  }
+
   private getWebUsage(host: string): WebUsage {
+    this.ensureWebUsageDay();
     let usage = this.webUsage[host];
     if (!usage) {
       usage = { requests: 0, bytes: 0, lastSeenAt: 0 };
       this.webUsage[host] = usage;
     }
     return usage;
+  }
+
+  /**
+   * How long a relay group keeps its hostnames and connector tokens after the
+   * last provider leaves.
+   *
+   * Web sites get a 24 hour hold so a provider restart, laptop sleep or brief
+   * outage does not hand the hostname to somebody else. Forced temporary mode
+   * deliberately gives that up: the host rotates and is released quickly.
+   * Relays without any web site keep the historical 60 second grace.
+   */
+  private async getProviderDisconnectGraceMs(): Promise<number> {
+    const stored = (await this.storage.get("webGraceMs")) as number | undefined;
+    if (typeof stored === "number" && stored > 0) return stored;
+    if (!this.env.DB) return Relay.PROVIDER_DISCONNECT_GRACE_MS;
+    try {
+      const sites = await listSitesByRelay(this.env, this.state.id.toString());
+      return sites.length > 0 ? Relay.WEB_RELAY_HOLD_MS : Relay.PROVIDER_DISCONNECT_GRACE_MS;
+    } catch {
+      return Relay.PROVIDER_DISCONNECT_GRACE_MS;
+    }
+  }
+
+  private async rememberWebGrace(settings: Settings): Promise<void> {
+    const holdMs = settings.forceTemporaryHost
+      ? Relay.WEB_FORCED_TEMP_HOLD_MS
+      : Relay.WEB_RELAY_HOLD_MS;
+    await this.storage.put("webGraceMs", holdMs);
+  }
+
+  private async markProviderOnline(): Promise<void> {
+    const scheduled = await this.storage.get("providerDisconnectTime");
+    if (scheduled) await this.storage.delete("providerDisconnectTime");
   }
 
   private incrementWebRequest(host: string): void {
@@ -1728,7 +1869,9 @@ export class Relay extends DurableObject {
   }
 
   private async flushWebUsage(): Promise<void> {
+    this.ensureWebUsageDay();
     if (Object.keys(this.webUsage).length === 0) return;
+    await this.storage.put("webUsageDay", this.webUsageDay);
     await this.storage.put("webUsage", this.webUsage);
   }
 
@@ -2095,6 +2238,7 @@ export class Relay extends DurableObject {
     sites: Record<string, { providers: number; backends: number; requests: number; bytes: number; lastSeenAt: number }>;
   }> {
     this.syncFromState(true);
+    this.ensureWebUsageDay();
     const sites: Record<
       string,
       { providers: number; backends: number; requests: number; bytes: number; lastSeenAt: number }
@@ -2199,12 +2343,13 @@ export class Relay extends DurableObject {
       // Pass the closing socket so it is not counted while still present in state.getWebSockets().
       this.broadcastPartnersCountToConnectors(ws);
       
-      // If all providers have disconnected, schedule connector token invalidation after 60s
+      // If all providers have disconnected, keep the relay (and its published
+      // web hostnames) around for the configured hold period before cleanup.
       // Note: during the close event, the closing socket can still appear in state.getWebSockets().
       // Exclude it to avoid missing the transition to 0 providers and never scheduling the alarm.
       if (this.getActualProviderCountExcluding(ws) === 0) {
         await this.storage.put('providerDisconnectTime', Date.now());
-        await this.scheduleAlarmAt(Date.now() + Relay.PROVIDER_DISCONNECT_GRACE_MS);
+        await this.scheduleAlarmAt(Date.now() + await this.getProviderDisconnectGraceMs());
       }
     } else {
       this.connectors.delete(ws);
@@ -2277,10 +2422,10 @@ export class Relay extends DurableObject {
     await this.token.deleteRelay(relayId);
   }
 
-  private notifyConnectorsRelayTermination(): number {
+  private notifyConnectorsRelayTermination(graceMs: number = Relay.PROVIDER_DISCONNECT_GRACE_MS): number {
     const msg: LogMessage = {
       level: "warn",
-      msg: `All providers in this relay group have been offline for more than ${Math.floor(Relay.PROVIDER_DISCONNECT_GRACE_MS / 1000)} seconds. This relay is terminating and all connector tokens in this group will be revoked. Please wait for a provider to reconnect and use a new connector token.`,
+      msg: `All providers in this relay group have been offline for more than ${humanizeDuration(graceMs)}. This relay is terminating and all connector tokens in this group will be revoked. Please wait for a provider to reconnect and use a new connector token.`,
       getType: () => MessageType.Log,
     };
 
@@ -2321,21 +2466,18 @@ export class Relay extends DurableObject {
     const providerDisconnectTime = (await this.storage.get('providerDisconnectTime')) as number | undefined;
     if (!providerDisconnectTime) return;
 
-    // Only proceed if providers have been disconnected for at least 60 seconds.
+    // Web relays keep their hostnames for 24 hours; plain relays still use the
+    // short 60 second grace.
     const elapsed = Date.now() - providerDisconnectTime;
-    const minWaitMs = Relay.PROVIDER_DISCONNECT_GRACE_MS;
-    if (elapsed < minWaitMs) {
-      // Ensure we run again once the minimum wait has elapsed.
-      await this.scheduleAlarmAt(Date.now() + (minWaitMs - elapsed));
+    const graceMs = await this.getProviderDisconnectGraceMs();
+    if (elapsed < graceMs) {
+      // Ensure we run again once the hold period has elapsed.
+      await this.scheduleAlarmAt(Date.now() + (graceMs - elapsed));
       return;
     }
 
     try {
-      const notifiedConnectors = this.notifyConnectorsRelayTermination();
-      if (notifiedConnectors > 0) {
-        await new Promise((resolve) => setTimeout(resolve, Relay.CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS));
-      }
-
+      // performStaleRelayCleanup notifies connectors itself.
       await this.performStaleRelayCleanup();
     } catch (e) {
       console.error("alarm: cleanup failed, rescheduling", e);

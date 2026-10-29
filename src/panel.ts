@@ -4,6 +4,7 @@ import {
   type AdminPageData,
   type DashboardPageData,
   type Overview,
+  type ReservationView,
   type SiteView,
   type TokenView,
   type UserView,
@@ -21,19 +22,26 @@ import {
   createSession,
   createToken,
   createUser,
+  deleteReservation,
   deleteSession,
   deleteSite,
   deleteUser,
+  effectiveSettings,
   ensureSchema,
   findUserById,
   findUserByUsername,
   findTokenRow,
   getAnonymousSettings,
+  getReservation,
   getSessionContext,
   getUserSettings,
+  isValidHostname,
+  isSiteHostForZone,
+  listReservations,
   listSites,
   listTokens,
   listUsers,
+  normalizeHost,
   parseCookies,
   revokeToken,
   saveAnonymousSettings,
@@ -41,6 +49,7 @@ import {
   sessionCookie,
   touchUserLogin,
   updateUser,
+  upsertReservation,
   verifyPassword,
 } from "./db";
 
@@ -113,6 +122,7 @@ function parseSettingsForm(form: FormData, current: Settings): Settings {
   return {
     allowAnonymous: global ? checked("allowAnonymous") : current.allowAnonymous,
     allowCustomHost: checked("allowCustomHost"),
+    forceTemporaryHost: global ? checked("forceTemporaryHost") : current.forceTemporaryHost,
     allowRegistration: global ? checked("allowRegistration") : current.allowRegistration,
     allowUserSettings: global ? checked("allowUserSettings") : current.allowUserSettings,
     autoRotateSeconds: num("autoRotateSeconds", current.autoRotateSeconds),
@@ -187,6 +197,7 @@ function toSiteViews(
   sites: SiteRow[],
   live: Map<string, LiveSiteInfo>,
   users: Map<string, UserRow>,
+  reservedHosts: Set<string> = new Set(),
 ): SiteView[] {
   return sites.map((site) => {
     const info = live.get(site.host);
@@ -206,6 +217,7 @@ function toSiteViews(
       insecure: site.insecure === 1,
       createdAt: site.created_at,
       relayId: site.relay_id,
+      reserved: reservedHosts.has(site.host),
     };
   });
 }
@@ -219,12 +231,37 @@ function buildOverview(
   return {
     users: users.length,
     sites: sites.length,
+    onlineSites: siteViews.filter((site) => site.providerCount > 0).length,
     providers: siteViews.reduce((sum, site) => sum + site.providerCount, 0),
     requests: siteViews.reduce((sum, site) => sum + site.requests, 0),
     bytes: siteViews.reduce((sum, site) => sum + site.bytes, 0),
-    temporarySites: sites.filter((site) => site.temporary === 1).length,
     tokens: tokens.filter((token) => token.revoked === 0).length,
   };
+}
+
+function toReservationViews(
+  reservations: Awaited<ReturnType<typeof listReservations>>,
+  sites: SiteRow[],
+  users: Map<string, UserRow>,
+): ReservationView[] {
+  const sitesByHost = new Map(sites.map((site) => [site.host, site]));
+  return reservations.map((reservation) => {
+    const site = sitesByHost.get(reservation.host);
+    return {
+      host: reservation.host,
+      userId: reservation.user_id,
+      username: users.get(reservation.user_id)?.username || "deleted user",
+      note: reservation.note || "",
+      createdAt: reservation.created_at,
+      active: Boolean(site),
+      siteOwner: site
+        ? site.owner_id
+          ? users.get(site.owner_id)?.username || "deleted user"
+          : "anonymous"
+        : null,
+      temporary: site?.temporary === 1,
+    };
+  });
 }
 
 export async function handleAdmin(request: Request, env: Env, url: URL): Promise<Response> {
@@ -295,21 +332,23 @@ export async function handleAdmin(request: Request, env: Env, url: URL): Promise
   }
 
   const tabParam = url.searchParams.get("tab") || "overview";
-  const tab = (["overview", "users", "sites", "tokens", "settings"].includes(tabParam)
+  const tab = (["overview", "users", "sites", "tokens", "reservations", "settings"].includes(tabParam)
     ? tabParam
     : "overview") as AdminPageData["tab"];
 
-  const [users, sites, tokens, globalSettings] = await Promise.all([
+  const [users, sites, tokens, reservations, globalSettings] = await Promise.all([
     listUsers(env),
     listSites(env),
     listTokens(env),
+    listReservations(env),
     getAnonymousSettings(env),
   ]);
   const usersById = new Map(users.map((user) => [user.id, user]));
   const live = await loadLiveInfo(env, sites);
-  const siteViews = toSiteViews(sites, live, usersById);
+  const siteViews = toSiteViews(sites, live, usersById, new Set(reservations.map((row) => row.host)));
   const tokenViews = tokens.map((token) => toTokenView(token, usersById));
   const userViews = users.map((user) => toUserView(user, sites, tokens));
+  const reservationViews = toReservationViews(reservations, sites, usersById);
 
   const selectedUserId = url.searchParams.get("user");
   const selectedUser = selectedUserId
@@ -326,8 +365,10 @@ export async function handleAdmin(request: Request, env: Env, url: URL): Promise
     users: userViews,
     sites: siteViews,
     tokens: tokenViews,
+    reservations: reservationViews,
     overview: buildOverview(users, sites, tokens, siteViews),
     globalSettings,
+    zone: normalizeHost(env.WEB_ZONE || env.BASE_HOST || ""),
     selectedUser,
     selectedUserSettings,
     flash: readFlash(request),
@@ -450,6 +491,62 @@ async function handleAdminAction(
       return redirectWithFlash(`${back}?tab=sites`, { kind: "ok", message: `Providers for ${host} disconnected.` });
     }
 
+    if (action === "createReservation") {
+      const host = normalizeHost(String(form.get("host") || ""));
+      const userId = String(form.get("userId") || "");
+      const note = String(form.get("note") || "").trim().slice(0, 200);
+      const user = await findUserById(env, userId);
+      if (!user) {
+        return redirectWithFlash(`${back}?tab=reservations`, { kind: "error", message: "User not found." });
+      }
+      if (!host || !isValidHostname(host)) {
+        return redirectWithFlash(`${back}?tab=reservations`, { kind: "error", message: "Enter a valid hostname." });
+      }
+      const zone = normalizeHost(env.WEB_ZONE || env.BASE_HOST || "");
+      if (!zone || !isSiteHostForZone(host, zone)) {
+        return redirectWithFlash(`${back}?tab=reservations`, {
+          kind: "error",
+          message: `Hostname must be a subdomain of ${zone || "WEB_ZONE"}.`,
+        });
+      }
+      const site = (await listSites(env)).find((row) => row.host === host);
+      if (site && site.owner_id !== userId) {
+        return redirectWithFlash(`${back}?tab=reservations`, {
+          kind: "error",
+          message: `${host} is currently published by ${site.owner_id ? "another account" : "an anonymous provider"}. Delete that site first.`,
+        });
+      }
+      const existing = await getReservation(env, host);
+      if (existing && existing.user_id !== userId) {
+        return redirectWithFlash(`${back}?tab=reservations`, {
+          kind: "error",
+          message: `${host} is already reserved by another account.`,
+        });
+      }
+      await upsertReservation(env, {
+        host,
+        user_id: userId,
+        note: note || null,
+        created_at: existing?.created_at || Date.now(),
+      });
+      return redirectWithFlash(`${back}?tab=reservations`, {
+        kind: "ok",
+        message: `Reserved ${host} for ${user.username}.`,
+      });
+    }
+
+    if (action === "deleteReservation") {
+      const host = normalizeHost(String(form.get("host") || ""));
+      if (!host) {
+        return redirectWithFlash(`${back}?tab=reservations`, { kind: "error", message: "Hostname is required." });
+      }
+      await deleteReservation(env, host);
+      return redirectWithFlash(`${back}?tab=reservations`, {
+        kind: "ok",
+        message: `Reservation for ${host} removed.`,
+      });
+    }
+
     if (action === "saveSettings") {
       const scope = String(form.get("scope") || "global");
       if (scope === "global") {
@@ -557,7 +654,7 @@ export async function handleDashboard(request: Request, env: Env, url: URL): Pro
     listSites(env, context.user.id),
     listTokens(env, context.user.id),
     getAnonymousSettings(env),
-    getUserSettings(env, context.user.id),
+    effectiveSettings(env, context.user),
   ]);
   const usersById = new Map([[context.user.id, context.user]]);
   const live = await loadLiveInfo(env, allSites);

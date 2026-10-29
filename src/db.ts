@@ -11,6 +11,7 @@ import type { Env } from "./types";
 export interface Settings {
   allowAnonymous: boolean;
   allowCustomHost: boolean;
+  forceTemporaryHost: boolean;
   allowRegistration: boolean;
   allowUserSettings: boolean;
   autoRotateSeconds: number;
@@ -24,6 +25,7 @@ export interface Settings {
 export const DEFAULT_ANONYMOUS_SETTINGS: Settings = {
   allowAnonymous: true,
   allowCustomHost: false,
+  forceTemporaryHost: false,
   allowRegistration: false,
   allowUserSettings: true,
   autoRotateSeconds: 6 * 60 * 60,
@@ -37,6 +39,7 @@ export const DEFAULT_ANONYMOUS_SETTINGS: Settings = {
 export const DEFAULT_USER_SETTINGS: Settings = {
   allowAnonymous: true,
   allowCustomHost: true,
+  forceTemporaryHost: false,
   allowRegistration: false,
   allowUserSettings: true,
   autoRotateSeconds: 24 * 60 * 60,
@@ -95,6 +98,13 @@ export interface SessionRow {
   expires_at: number;
 }
 
+export interface ReservationRow {
+  host: string;
+  user_id: string;
+  note: string | null;
+  created_at: number;
+}
+
 const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -137,6 +147,13 @@ const SCHEMA: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_sites_owner ON sites(owner_id)`,
   `CREATE INDEX IF NOT EXISTS idx_sites_relay ON sites(relay_id)`,
+  `CREATE TABLE IF NOT EXISTS reservations (
+    host TEXT PRIMARY KEY,
+    user_id TEXT NOT NULL,
+    note TEXT,
+    created_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_reservations_user ON reservations(user_id)`,
   `CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -518,6 +535,7 @@ export async function deleteUser(env: Env, userId: string): Promise<void> {
   const db = requireDb(env);
   await db.prepare("DELETE FROM tokens WHERE user_id = ?").bind(userId).run();
   await db.prepare("DELETE FROM sessions WHERE user_id = ?").bind(userId).run();
+  await db.prepare("DELETE FROM reservations WHERE user_id = ?").bind(userId).run();
   await db.prepare("DELETE FROM settings WHERE key = ?").bind(`user:${userId}`).run();
   await db.prepare("DELETE FROM users WHERE id = ?").bind(userId).run();
 }
@@ -720,6 +738,53 @@ export async function countSitesByOwner(env: Env, ownerId: string): Promise<numb
 }
 
 /* -------------------------------------------------------------------------- */
+/* Reservations                                                               */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A reservation keeps a hostname bound to one account even while no relay is
+ * online. It never creates a site row, so the host still behaves as if it does
+ * not exist until its owner publishes it. Other accounts cannot claim it.
+ */
+export async function getReservation(env: Env, host: string): Promise<ReservationRow | null> {
+  return (
+    (await requireDb(env)
+      .prepare("SELECT * FROM reservations WHERE host = ? LIMIT 1")
+      .bind(host.trim().toLowerCase())
+      .first<ReservationRow>()) || null
+  );
+}
+
+export async function listReservations(env: Env, userId?: string): Promise<ReservationRow[]> {
+  const db = requireDb(env);
+  const query = userId
+    ? db.prepare("SELECT * FROM reservations WHERE user_id = ? ORDER BY created_at DESC").bind(userId)
+    : db.prepare("SELECT * FROM reservations ORDER BY created_at DESC");
+  const result = await query.all<ReservationRow>();
+  return result.results || [];
+}
+
+export async function upsertReservation(env: Env, reservation: ReservationRow): Promise<void> {
+  await requireDb(env)
+    .prepare(
+      `INSERT INTO reservations (host, user_id, note, created_at)
+       VALUES (?, ?, ?, ?)
+       ON CONFLICT(host) DO UPDATE SET
+         user_id = excluded.user_id,
+         note = excluded.note`,
+    )
+    .bind(reservation.host, reservation.user_id, reservation.note, reservation.created_at)
+    .run();
+}
+
+export async function deleteReservation(env: Env, host: string): Promise<void> {
+  await requireDb(env)
+    .prepare("DELETE FROM reservations WHERE host = ?")
+    .bind(host.trim().toLowerCase())
+    .run();
+}
+
+/* -------------------------------------------------------------------------- */
 /* Settings                                                                   */
 /* -------------------------------------------------------------------------- */
 
@@ -738,6 +803,7 @@ function coerceSettings(raw: Record<string, unknown> | null, defaults: Settings)
   return {
     allowAnonymous: bool("allowAnonymous", defaults.allowAnonymous),
     allowCustomHost: bool("allowCustomHost", defaults.allowCustomHost),
+    forceTemporaryHost: bool("forceTemporaryHost", defaults.forceTemporaryHost),
     allowRegistration: bool("allowRegistration", defaults.allowRegistration),
     allowUserSettings: bool("allowUserSettings", defaults.allowUserSettings),
     autoRotateSeconds: num("autoRotateSeconds", defaults.autoRotateSeconds),
@@ -790,7 +856,15 @@ async function saveSettings(env: Env, key: string, settings: Settings): Promise<
 }
 
 export async function effectiveSettings(env: Env, user: UserRow | null): Promise<Settings> {
-  return user ? getUserSettings(env, user.id) : getAnonymousSettings(env);
+  const global = await getAnonymousSettings(env);
+  if (!user) return global;
+  const userSettings = await getUserSettings(env, user.id);
+  // Force-temporary mode is an operator-level switch: when it is enabled
+  // globally it applies to registered accounts too.
+  return {
+    ...userSettings,
+    forceTemporaryHost: global.forceTemporaryHost || userSettings.forceTemporaryHost,
+  };
 }
 
 /* -------------------------------------------------------------------------- */

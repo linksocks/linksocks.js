@@ -17,6 +17,18 @@ export interface SiteView {
   insecure: boolean;
   createdAt: number;
   relayId: string;
+  reserved: boolean;
+}
+
+export interface ReservationView {
+  host: string;
+  userId: string;
+  username: string;
+  note: string;
+  createdAt: number;
+  active: boolean;
+  siteOwner: string | null;
+  temporary: boolean;
 }
 
 export interface TokenView {
@@ -43,10 +55,10 @@ export interface UserView {
 export interface Overview {
   users: number;
   sites: number;
+  onlineSites: number;
   providers: number;
   requests: number;
   bytes: number;
-  temporarySites: number;
   tokens: number;
 }
 
@@ -59,12 +71,14 @@ export interface Flash {
 export interface AdminPageData {
   user: { username: string };
   csrf: string;
-  tab: "overview" | "users" | "sites" | "tokens" | "settings";
+  tab: "overview" | "users" | "sites" | "tokens" | "reservations" | "settings";
   users: UserView[];
   sites: SiteView[];
   tokens: TokenView[];
+  reservations: ReservationView[];
   overview: Overview;
   globalSettings: Settings;
+  zone: string;
   selectedUser?: UserView;
   selectedUserSettings?: Settings;
   flash?: Flash | null;
@@ -97,15 +111,21 @@ export function formatDate(timestamp: number | null | undefined): string {
   return date.toISOString().replace("T", " ").slice(0, 19) + " UTC";
 }
 
+function formatDateCompact(timestamp: number | null | undefined): string {
+  if (!timestamp) return "—";
+  const date = new Date(timestamp);
+  return date.toISOString().slice(5, 16).replace("T", " ") + " UTC";
+}
+
 export function formatDuration(ms: number): string {
   if (!Number.isFinite(ms) || ms <= 0) return "expired";
   const seconds = Math.floor(ms / 1000);
   const days = Math.floor(seconds / 86400);
   const hours = Math.floor((seconds % 86400) / 3600);
   const minutes = Math.floor((seconds % 3600) / 60);
-  if (days > 0) return `${days}d ${hours}h`;
-  if (hours > 0) return `${hours}h ${minutes}m`;
-  if (minutes > 0) return `${minutes}m ${seconds % 60}s`;
+  if (days > 0) return hours > 0 ? `${days}d ${hours}h` : `${days}d`;
+  if (hours > 0) return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+  if (minutes > 0) return seconds % 60 > 0 ? `${minutes}m ${seconds % 60}s` : `${minutes}m`;
   return `${seconds}s`;
 }
 
@@ -114,7 +134,7 @@ function expiryCell(site: SiteView): string {
   const remaining = site.expiresAt - Date.now();
   const cls = remaining <= 0 ? "badge danger" : remaining < 60 * 60 * 1000 ? "badge warn" : "badge";
   return `<span class="${cls}" data-countdown="${site.expiresAt}">${remaining <= 0 ? "expired" : formatDuration(remaining)}</span>
-    <div class="sub">${escapeHtml(formatDate(site.expiresAt))}</div>`;
+    <div class="sub">${escapeHtml(formatDateCompact(site.expiresAt))}</div>`;
 }
 
 function flashHtml(flash: Flash | null | undefined): string {
@@ -127,90 +147,235 @@ function flashHtml(flash: Flash | null | undefined): string {
 
 const STYLE = `
 :root{
-  --bg:#070b16;--bg2:#0b1226;--card:rgba(255,255,255,.055);--card2:rgba(255,255,255,.08);
-  --stroke:rgba(255,255,255,.12);--text:rgba(255,255,255,.93);--muted:rgba(255,255,255,.62);
-  --muted2:rgba(255,255,255,.42);--brand:#7c3aed;--brand2:#22d3ee;--ok:#34d399;--warn:#fbbf24;
-  --danger:#fb7185;--shadow:0 24px 60px rgba(0,0,0,.45);
-  --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace;
+  --bg:#f3f4f1;
+  --surface:#ffffff;
+  --surface-2:#f7f8f5;
+  --surface-3:#eef0ec;
+  --ink:#15181c;
+  --text:#24282d;
+  --muted:#5f6872;
+  --faint:#6f7880;
+  --line:#dde1da;
+  --line-strong:#c7cdc5;
+  --accent:#2454d6;
+  --accent-hover:#1c44b4;
+  --accent-soft:#edf1ff;
+  --ok:#117347;
+  --ok-soft:#e8f6ef;
+  --warn:#8a5600;
+  --warn-soft:#fff5e2;
+  --danger:#b42318;
+  --danger-soft:#fff0ee;
+  --radius:8px;
+  --radius-sm:6px;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;
+  --sans:Inter,ui-sans-serif,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  color-scheme:light;
 }
 *{box-sizing:border-box}
+*{scrollbar-width:thin;scrollbar-color:#c6cbc4 transparent}
+*::-webkit-scrollbar{width:9px;height:9px}
+*::-webkit-scrollbar-track{background:transparent}
+*::-webkit-scrollbar-thumb{background:#c6cbc4;border-radius:999px;border:2px solid transparent;background-clip:content-box}
+*::-webkit-scrollbar-thumb:hover{background:#aab1aa;background-clip:content-box}
+html{background:var(--bg)}
 html,body{min-height:100%}
 body{
-  margin:0;color:var(--text);font-family:Inter,system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-  background:
-    radial-gradient(900px 500px at 12% 0%,rgba(124,58,237,.28),transparent 62%),
-    radial-gradient(900px 500px at 88% 8%,rgba(34,211,238,.20),transparent 60%),
-    radial-gradient(1200px 800px at 50% 100%,rgba(99,102,241,.16),transparent 62%),
-    linear-gradient(180deg,var(--bg),var(--bg2));
-  background-attachment:fixed;
+  min-height:100vh;margin:0;color:var(--text);
+  font-family:var(--sans);font-size:14.5px;line-height:1.55;
+  background:var(--bg);
+  -webkit-font-smoothing:antialiased;
 }
-a{color:#a5b4fc;text-decoration:none}
-a:hover{text-decoration:underline}
-.wrap{max-width:1180px;margin:0 auto;padding:28px 20px 64px}
-.topbar{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap;margin-bottom:26px}
-.brand{display:flex;align-items:center;gap:12px}
-.logo{width:38px;height:38px;border-radius:12px;background:linear-gradient(135deg,var(--brand),var(--brand2));box-shadow:0 8px 24px rgba(124,58,237,.35)}
-h1{font-size:1.35rem;margin:0;letter-spacing:-.02em}
-h2{font-size:1.05rem;margin:0 0 14px;letter-spacing:-.01em}
-h3{font-size:.95rem;margin:0 0 10px}
-.sub{font-size:.78rem;color:var(--muted2);margin-top:3px}
+a{color:var(--accent);text-decoration:none}
+a:hover{color:var(--accent-hover);text-decoration:underline;text-underline-offset:2px}
+.wrap{max-width:1120px;margin:0 auto;padding:0 28px 72px}
+.topbar{display:flex;align-items:center;justify-content:space-between;gap:24px;flex-wrap:wrap;padding:24px 0 22px;border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:13px;min-width:0}
+.logo{width:34px;height:34px;border-radius:6px;background:var(--ink);color:#fff;display:grid;place-items:center;font-family:var(--mono);font-size:10px;font-weight:700;letter-spacing:.04em;flex:0 0 auto}
+.eyebrow{font-family:var(--mono);font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:var(--faint);font-weight:600;margin-bottom:2px}
+h1{font-size:17px;margin:0;letter-spacing:-.015em;line-height:1.3;font-weight:600;color:var(--ink)}
+h2{font-size:15px;margin:0 0 10px;letter-spacing:-.01em;font-weight:600;color:var(--ink)}
+h3{font-size:13.5px;margin:0 0 8px;font-weight:600;color:var(--ink)}
+.sub{font-size:12.5px;color:var(--muted);margin-top:2px;line-height:1.55}
 .muted{color:var(--muted)}
-.nav{display:flex;gap:6px;flex-wrap:wrap}
-.nav a{padding:8px 12px;border-radius:10px;color:var(--muted);border:1px solid transparent;font-size:.9rem}
-.nav a:hover{background:var(--card);text-decoration:none;color:var(--text)}
-.nav a.active{background:var(--card2);border-color:var(--stroke);color:var(--text)}
-.grid{display:grid;gap:16px}
-.cards{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
-.card{background:var(--card);border:1px solid var(--stroke);border-radius:16px;padding:18px;box-shadow:var(--shadow);backdrop-filter:blur(12px)}
-.card .value{font-size:1.65rem;font-weight:700;letter-spacing:-.03em;margin-top:6px}
-.card .label{font-size:.78rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted2)}
-.section{margin-top:22px}
-.table-wrap{overflow-x:auto;border:1px solid var(--stroke);border-radius:16px;background:rgba(255,255,255,.035)}
-table{width:100%;border-collapse:collapse;font-size:.88rem;min-width:760px}
-th,td{padding:12px 14px;text-align:left;border-bottom:1px solid rgba(255,255,255,.07);vertical-align:top}
-th{font-size:.72rem;text-transform:uppercase;letter-spacing:.08em;color:var(--muted2);font-weight:600;background:rgba(255,255,255,.025)}
-tr:last-child td{border-bottom:none}
-tr:hover td{background:rgba(255,255,255,.025)}
-.mono{font-family:var(--mono);font-size:.82rem}
-.badge{display:inline-flex;align-items:center;gap:5px;padding:3px 8px;border-radius:999px;background:rgba(124,58,237,.18);border:1px solid rgba(124,58,237,.35);font-size:.72rem;font-weight:600}
-.badge.ok{background:rgba(52,211,153,.14);border-color:rgba(52,211,153,.35);color:#a7f3d0}
-.badge.warn{background:rgba(251,191,36,.14);border-color:rgba(251,191,36,.35);color:#fde68a}
-.badge.danger{background:rgba(251,113,133,.14);border-color:rgba(251,113,133,.35);color:#fecdd3}
-.badge.gray{background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.14);color:var(--muted)}
+.nav{display:flex;gap:26px;border-bottom:1px solid var(--line);margin:0 0 32px;overflow-x:auto;scrollbar-width:none}
+.nav::-webkit-scrollbar{display:none}
+.nav a{padding:12px 0 11px;border-bottom:2px solid transparent;margin-bottom:-1px;color:var(--muted);font-size:13.5px;font-weight:500;white-space:nowrap}
+.nav a:hover{color:var(--ink);text-decoration:none}
+.nav a.active{color:var(--ink);border-bottom-color:var(--ink);font-weight:600}
+.wrap > .section{margin-top:0}
+.section{margin-top:24px}
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;flex-wrap:wrap;margin:4px 0 24px}
+.page-head h2{font-size:26px;margin:0;letter-spacing:-.025em;font-weight:600}
+.page-head .sub{margin-top:5px;max-width:760px;color:var(--muted)}
+.grid{display:grid;gap:18px}
+.stats{display:flex;flex-wrap:wrap;gap:1px;background:var(--line);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden;margin-bottom:26px}
+.stat{flex:1 1 150px;background:var(--surface);padding:18px 20px 17px;min-width:0}
+.stat .label{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint);font-weight:600;white-space:nowrap}
+.stat .value{font-size:27px;font-weight:600;letter-spacing:-.035em;margin-top:7px;line-height:1.15;color:var(--ink);font-variant-numeric:tabular-nums}
+.stat .hint{font-size:11.5px;color:var(--faint);margin-top:3px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:22px}
+.card .value{font-size:26px;font-weight:600;letter-spacing:-.03em;margin-top:6px;color:var(--ink)}
+.card .label{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.11em;color:var(--faint)}
+.panel{background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);overflow:hidden}
+.panel-head{display:flex;align-items:center;justify-content:space-between;gap:14px;flex-wrap:wrap;padding:17px 22px;border-bottom:1px solid var(--line);background:var(--surface)}
+.panel-head h2{font-size:14px;margin:0;font-weight:600}
+.panel-body{padding:22px}
+.panel-body.flush{padding:0 0 16px}
+.panel-body.flush .table-wrap{border:0;border-radius:0}
+.panel-body.flush .empty{padding:56px 24px}
+.panel-note{padding:12px 22px;border-bottom:1px solid var(--line);font-size:12.5px;color:var(--muted);background:var(--surface-2)}
+.stack{display:grid;gap:18px}
+.table-wrap{overflow:auto;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface);scrollbar-width:thin;scrollbar-color:#c6cbc4 transparent}
+.table-wrap::-webkit-scrollbar{height:9px;width:9px}
+.table-wrap::-webkit-scrollbar-track{background:transparent}
+.table-wrap::-webkit-scrollbar-thumb{background:#c6cbc4;border-radius:999px;border:2px solid transparent;background-clip:padding-box}
+.table-wrap::-webkit-scrollbar-thumb:hover{background:#aab1aa;background-clip:padding-box}
+table{width:100%;border-collapse:collapse;font-size:13.5px;min-width:780px}
+thead th{background:var(--surface-2);font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.1em;color:var(--faint);font-weight:600;text-align:left;padding:10px 18px;border-bottom:1px solid var(--line);white-space:nowrap}
+td{padding:14px 18px;text-align:left;border-bottom:1px solid #edf0ea;vertical-align:top;white-space:nowrap;color:var(--text)}
+td .sub{white-space:normal}
+th:first-child,td:first-child{padding-left:22px}
+th:last-child,td:last-child{padding-right:22px}
+tbody tr:last-child td{border-bottom:none}
+tbody tr:hover td{background:#fafbf8}
+td .sub{font-size:11.5px;margin-top:3px;color:var(--faint)}
+table th .muted{text-transform:none;letter-spacing:0;font-weight:500;font-size:10px;color:var(--faint)}
+.table-wrap.compact table{min-width:0}
+.user-table table{min-width:620px}
+.table-wrap.compact thead th{padding:9px 16px}
+.table-wrap.compact td{padding:11px 16px;font-size:12.8px}
+.table-wrap.compact th:first-child,.table-wrap.compact td:first-child{padding-left:22px}
+.table-wrap.compact th:last-child,.table-wrap.compact td:last-child{padding-right:22px}
+.mono{font-family:var(--mono);font-size:12.5px;font-variant-numeric:tabular-nums}
+.badge{display:inline-flex;align-items:center;gap:5px;padding:2px 7px;border-radius:4px;background:var(--accent-soft);border:1px solid #d9e2ff;color:#23449c;font-family:var(--mono);font-size:10.5px;font-weight:600;line-height:1.5;white-space:nowrap;vertical-align:middle}
+.badge.ok{background:var(--ok-soft);border-color:#cbe9da;color:var(--ok)}
+.badge.warn{background:var(--warn-soft);border-color:#f1dfb6;color:var(--warn)}
+.badge.danger{background:var(--danger-soft);border-color:#f0cbc6;color:var(--danger)}
+.badge.gray{background:var(--surface-3);border-color:var(--line);color:var(--muted)}
+.badge.accent{background:var(--accent-soft);border-color:#d9e2ff;color:var(--accent)}
+.badge + .badge{margin-left:4px}
+.dot{width:5px;height:5px;border-radius:999px;background:currentColor;display:inline-block;flex:0 0 auto}
 .actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
-.btn{appearance:none;border:1px solid var(--stroke);background:var(--card2);color:var(--text);padding:9px 14px;border-radius:10px;font-size:.85rem;font-weight:600;cursor:pointer;font-family:inherit}
-.btn:hover{background:rgba(255,255,255,.12)}
-.btn.primary{background:linear-gradient(135deg,var(--brand),#4f46e5);border-color:transparent;box-shadow:0 8px 24px rgba(124,58,237,.3)}
-.btn.primary:hover{filter:brightness(1.08)}
-.btn.danger{color:#fecdd3;border-color:rgba(251,113,133,.35);background:rgba(251,113,133,.12)}
-.btn.small{padding:6px 10px;font-size:.78rem;border-radius:8px}
-input,select,textarea{width:100%;padding:10px 12px;border-radius:10px;border:1px solid var(--stroke);background:rgba(0,0,0,.28);color:var(--text);font-family:inherit;font-size:.9rem;outline:none}
-input:focus,select:focus,textarea:focus{border-color:rgba(34,211,238,.6);box-shadow:0 0 0 3px rgba(34,211,238,.12)}
-label{display:block;font-size:.8rem;color:var(--muted);margin-bottom:6px;font-weight:600}
-.field{margin-bottom:14px}
-.field .hint{font-size:.74rem;color:var(--muted2);margin-top:5px}
-.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:0 16px}
-.check{display:flex;align-items:center;gap:9px;margin:10px 0;font-size:.86rem;color:var(--muted)}
-.check input{width:auto;accent-color:#7c3aed}
-.inline{display:inline-flex;gap:8px;align-items:center}
-.flash{padding:12px 14px;border-radius:12px;margin-bottom:18px;font-size:.86rem;border:1px solid}
-.flash.ok{background:rgba(52,211,153,.1);border-color:rgba(52,211,153,.3);color:#a7f3d0}
-.flash.error{background:rgba(251,113,133,.1);border-color:rgba(251,113,133,.3);color:#fecdd3}
-.token-reveal{margin-top:10px}
-.token-reveal pre{background:rgba(0,0,0,.4);border:1px solid var(--stroke);padding:10px 12px;border-radius:10px;overflow-x:auto;font-family:var(--mono);font-size:.82rem}
-.two-col{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(280px,1fr);gap:16px}
-@media(max-width:860px){.two-col{grid-template-columns:1fr}}
-.login{min-height:100vh;min-height:100dvh;display:grid;place-items:center;padding:24px}
+.btn{appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);padding:7px 12px;min-height:34px;border-radius:var(--radius-sm);font-size:13px;font-weight:550;cursor:pointer;font-family:inherit;transition:background .15s ease,border-color .15s ease,color .15s ease}
+.btn:hover{background:var(--surface-2);border-color:#adb5ad;text-decoration:none}
+.btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
+.btn.primary:hover{background:var(--accent-hover);border-color:var(--accent-hover)}
+.btn.danger{color:var(--danger);border-color:#ecc9c4;background:var(--surface)}
+.btn.danger:hover{background:var(--danger-soft);border-color:#dfa9a2}
+.btn.ghost{background:transparent;border-color:transparent;color:var(--accent);padding-left:6px;padding-right:6px}
+.btn.ghost:hover{background:var(--surface-2);border-color:transparent;color:var(--accent-hover)}
+.btn.small{min-height:28px;padding:4px 9px;font-size:12px;border-radius:5px}
+input,select,textarea{width:100%;padding:9px 11px;border-radius:var(--radius-sm);border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);font-family:inherit;font-size:14px;line-height:1.4;outline:none;min-height:38px;transition:border-color .15s ease,box-shadow .15s ease}
+input::placeholder,textarea::placeholder{color:#a2a9b1}
+input:focus,select:focus,textarea:focus{border-color:var(--accent);box-shadow:0 0 0 3px rgba(36,84,214,.12)}
+label{display:block;font-size:12.5px;color:var(--ink);margin-bottom:6px;font-weight:550}
+.field{margin-bottom:16px}
+.field .hint{font-size:11.5px;color:var(--faint);margin-top:5px;line-height:1.5}
+.form-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:0 18px}
+.form-section{margin-top:22px;padding-top:18px;border-top:1px solid var(--line)}
+.form-danger{margin-top:18px;padding-top:18px;border-top:1px solid var(--line)}
+.check{display:flex;align-items:flex-start;gap:9px;margin:10px 0;font-size:13px;color:var(--text);cursor:pointer;font-weight:400}
+.check input{width:15px;height:15px;min-height:0;margin:2px 0 0;flex:0 0 auto;accent-color:var(--accent)}
+.check .hint{display:block;font-size:11.5px;color:var(--faint);margin-top:2px;line-height:1.45;font-weight:400}
+.check-body{display:block;min-width:0}
+.check-label{display:block;line-height:1.4}
+.form-title{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:.12em;color:var(--faint);font-weight:600;margin:4px 0 12px}
+.form-title:not(:first-of-type){margin-top:28px;padding-top:22px;border-top:1px solid var(--line)}
+.toggle-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:10px;margin-bottom:4px}
+.toggle-grid .check{margin:0;padding:13px 15px;border:1px solid var(--line);border-radius:var(--radius-sm);background:var(--surface-2);line-height:1.4;display:grid;grid-template-columns:15px minmax(0,1fr);gap:10px;align-items:start}
+.toggle-grid .check:hover{border-color:var(--line-strong);background:var(--surface)}
+.inline{display:inline-flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0}
+.flash{padding:12px 14px;border-radius:var(--radius-sm);margin-bottom:22px;font-size:13px;border:1px solid}
+.flash.ok{background:var(--ok-soft);border-color:#cbe9da;color:var(--ok)}
+.flash.error{background:var(--danger-soft);border-color:#f0cbc6;color:var(--danger)}
+.token-reveal{margin-top:12px}
+.token-reveal pre{background:var(--surface-2);border:1px solid var(--line);padding:12px;border-radius:var(--radius-sm);overflow-x:auto;font-family:var(--mono);font-size:12.5px;margin:8px 0}
+.two-col{display:grid;grid-template-columns:minmax(0,1.5fr) minmax(300px,1fr);gap:18px;align-items:start}
+.two-col.user-manage{grid-template-columns:minmax(0,1fr) minmax(360px,1.35fr)}
+.user-manage .form-grid{grid-template-columns:repeat(auto-fit,minmax(170px,1fr))}
+.empty{display:flex;flex-direction:column;align-items:center;justify-content:center;gap:7px;padding:52px 24px;text-align:center;color:var(--muted)}
+.empty .empty-icon{display:none}
+.mobile-only,.only-phone{display:none}
+.empty strong{color:var(--ink);font-weight:600;font-size:13.5px}
+.empty .sub{max-width:460px;margin-top:0;font-size:12.5px}
+.empty-command{display:inline-block;max-width:100%;overflow-x:auto;white-space:nowrap;margin:7px 0 2px;padding:7px 10px;border:1px solid var(--line);border-radius:5px;background:var(--surface-2);font-family:var(--mono);font-size:11.5px;color:var(--text)}
+.empty code,.code{font-family:var(--mono);font-size:12px;background:var(--surface-2);border:1px solid var(--line);padding:3px 7px;border-radius:4px;color:var(--text)}
+.empty code{display:inline-block;max-width:100%;white-space:normal;overflow-wrap:anywhere;line-height:1.6}
+.note{display:flex;gap:10px;align-items:flex-start;padding:13px 15px;border-radius:var(--radius-sm);border:1px solid var(--line);background:var(--surface-2);color:var(--muted);font-size:12.5px;line-height:1.55}
+.note strong{color:var(--ink);font-weight:600}
+.nowrap{white-space:nowrap!important}
+.policy{display:grid;gap:0}
+.policy-row{display:flex;justify-content:space-between;gap:16px;align-items:baseline;padding:12px 0;border-bottom:1px solid #edf0ea;font-size:13px}
+.policy-row:last-child{border-bottom:none}
+.policy-row span{color:var(--muted)}
+.policy-row b{font-weight:600;color:var(--ink);text-align:right;font-variant-numeric:tabular-nums}
+.login{min-height:100vh;min-height:100dvh;display:grid;place-items:center;padding:32px 20px}
 .login-box{width:100%;max-width:380px}
-.login-brand{display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:16px;font-weight:800;letter-spacing:-.02em}
-.login-brand .logo{width:34px;height:34px;border-radius:11px}
-.login .card{width:100%;max-width:380px;padding:26px}
-.login h1{text-align:center;margin-bottom:4px}
-.login .sub{text-align:center;margin-bottom:22px}
-.error-page{min-height:100vh;min-height:100dvh;display:grid;place-items:center;padding:24px;text-align:center}
-.error-page .code{font-size:4rem;font-weight:800;letter-spacing:-.06em;background:linear-gradient(135deg,var(--brand),var(--brand2));-webkit-background-clip:text;background-clip:text;color:transparent}
-footer{margin-top:36px;color:var(--muted2);font-size:.78rem;text-align:center}
-.copy-note{font-size:.76rem;color:var(--muted2)}
+.login-brand{display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:22px;font-weight:600;letter-spacing:-.01em;color:var(--ink);font-size:15px}
+.login-brand .logo{width:30px;height:30px;border-radius:5px;font-size:9px}
+.login .card{width:100%;max-width:380px;padding:32px;border:1px solid var(--line);border-radius:var(--radius);background:var(--surface)}
+.login h1{text-align:center;margin-bottom:5px;font-size:22px;letter-spacing:-.025em}
+.login .sub{text-align:center;margin-bottom:24px}
+.login .btn.primary{width:100%;margin-top:4px}
+.login .field:last-of-type{margin-bottom:18px}
+.error-page{min-height:100vh;min-height:100dvh;display:grid;place-items:center;padding:32px 20px;text-align:center}
+.error-page .code{font-size:64px;font-weight:600;letter-spacing:-.06em;color:var(--ink);border:0;background:transparent;padding:0;line-height:1}
+.error-page h1{margin-top:8px;font-size:20px}
+footer{margin-top:56px;padding-top:20px;border-top:1px solid var(--line);color:var(--faint);font-size:12px;display:flex;justify-content:space-between;gap:14px;flex-wrap:wrap}
+footer a{color:var(--muted)}
+footer a:hover{color:var(--ink)}
+.copy-note{font-size:11.5px;color:var(--faint)}
+@media(max-width:960px){
+  .two-col,.two-col.user-manage{grid-template-columns:1fr}
+}
+@media(max-width:760px){
+  .wrap{padding:0 18px 56px}
+  .topbar{padding:18px 0 16px;gap:14px}
+  h1{font-size:16px}
+  .nav{gap:20px;margin-bottom:26px}
+  .page-head{align-items:flex-start;margin-bottom:20px}
+  .page-head h2{font-size:22px}
+  .stats{margin-bottom:22px}
+  .stat{padding:15px 16px}
+  .stat .value{font-size:23px}
+  .card{padding:18px}
+  .panel-head{padding:15px 16px}
+  .panel-body{padding:16px}
+  .panel-body.flush .empty{padding:44px 18px}
+  table{min-width:680px}
+  thead th{padding-left:14px;padding-right:14px}
+  td{padding-left:14px;padding-right:14px}
+  th:first-child,td:first-child{padding-left:16px}
+  th:last-child,td:last-child{padding-right:16px}
+  .login{padding:24px 16px}
+  .login .card{padding:26px 22px}
+  footer{margin-top:44px}
+}
+@media(max-width:700px){
+  .user-table .col-sites,.user-table .col-tokens,.user-table .col-created{display:none}
+  .user-table table{min-width:0}
+  .token-table .col-created,.token-table .col-last-used{display:none}
+  .token-table table{min-width:0}
+  .res-table .owner-col,.res-table .col-state{display:none}
+  .res-table table{min-width:0}
+  .only-phone{display:block}
+}
+@media(max-width:760px){
+  .site-table .col-owner,.site-table .col-type,.site-table .col-expires,.site-table .col-requests,.site-table .col-transfer{display:none}
+  .site-table table{min-width:0}
+  .mobile-only{display:block}
+}
+@media(max-width:560px){
+  .owner-col{display:none}
+  .topbar .actions{width:100%;justify-content:space-between}
+  .nav{flex-wrap:wrap;gap:2px 20px;overflow:visible}
+  .nav a{padding:9px 0 8px}
+  .stat{flex-basis:130px;padding:14px 15px}
+  .stat .value{font-size:22px}
+  .recent-table .col-requests,.recent-table .col-transfer{display:none}
+  .recent-table table{min-width:0}
+}
 `;
 
 function layout(opts: {
@@ -244,20 +409,21 @@ function layout(opts: {
 ${opts.bare ? opts.content : `<div class="wrap">
   <div class="topbar">
     <div class="brand">
-      <div class="logo"></div>
+      <div class="logo" aria-hidden="true">LS</div>
       <div>
+        <div class="eyebrow">LinkSocks</div>
         <h1>${escapeHtml(opts.title)}</h1>
-        <div class="sub">${escapeHtml(opts.subtitle || "LinkSocks web proxy control plane")}</div>
+        <div class="sub">${escapeHtml(opts.subtitle || "Web proxy control plane")}</div>
       </div>
     </div>
     <div class="actions">
-      ${opts.userLabel ? `<span class="badge gray">${escapeHtml(opts.userLabel)}</span>` : ""}
+      ${opts.userLabel ? `<span class="badge gray"><span class="dot"></span>${escapeHtml(opts.userLabel)}</span>` : ""}
       ${logout}
     </div>
   </div>
-  <div class="nav">${nav}</div>
+  ${nav ? `<div class="nav">${nav}</div>` : ""}
   <div class="section">${opts.content}</div>
-  <footer>LinkSocks.js · Web reverse proxy · D1 control plane</footer>
+  <footer><span>LinkSocks.js · Web reverse proxy · D1 control plane</span><span><a href="/">Home</a> · <a href="/dashboard">Dashboard</a></span></footer>
 </div>`}
 <script>
 (function(){
@@ -331,7 +497,7 @@ export function renderLoginPage(opts: {
     bare: true,
     content: `<div class="login">
       <div class="login-box">
-        <div class="login-brand"><div class="logo"></div><span>LinkSocks.js</span></div>
+        <div class="login-brand"><div class="logo" aria-hidden="true">LS</div><span>LinkSocks.js</span></div>
         <div class="card">
         <h1>${escapeHtml(opts.title)}</h1>
         <div class="sub">${
@@ -366,37 +532,53 @@ function settingsForm(opts: {
 }): string {
   const s = opts.settings;
   const check = (name: string, label: string, checked: boolean, hint = "") =>
-    `<label class="check"><input type="checkbox" name="${name}" value="1" ${checked ? "checked" : ""}/> ${escapeHtml(label)}${hint ? `<span class="hint">${escapeHtml(hint)}</span>` : ""}</label>`;
+    `<label class="check"><input type="checkbox" name="${name}" value="1" ${checked ? "checked" : ""}/><span class="check-body"><span class="check-label">${escapeHtml(label)}</span>${hint ? `<span class="hint">${escapeHtml(hint)}</span>` : ""}</span></label>`;
   const num = (name: string, label: string, value: number, hint: string) =>
     `<div class="field"><label for="${name}">${escapeHtml(label)}</label><input id="${name}" name="${name}" type="number" min="0" step="1" value="${value}"/><div class="hint">${escapeHtml(hint)}</div></div>`;
-  return `<div class="card">
-    <h2>${escapeHtml(opts.title)}</h2>
-    <div class="sub" style="margin-bottom:16px">${escapeHtml(opts.description)}</div>
-    <form method="POST" action="${escapeHtml(opts.action)}">
-      <input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}"/>
-      <input type="hidden" name="action" value="saveSettings"/>
-      ${opts.global ? `<input type="hidden" name="scope" value="global"/>` : `<input type="hidden" name="scope" value="user"/>`}
-      ${opts.userId ? `<input type="hidden" name="userId" value="${escapeHtml(opts.userId)}"/>` : ""}
-      ${opts.global ? check("allowAnonymous", "Allow anonymous providers", s.allowAnonymous) : ""}
-      ${opts.global ? check("allowRegistration", "Allow user self-registration", s.allowRegistration) : ""}
-      ${opts.global ? check("allowUserSettings", "Allow users to edit their own policy", s.allowUserSettings) : ""}
-      ${check("allowCustomHost", "Allow custom hostnames", s.allowCustomHost, "Requires a hostname under WEB_ZONE.")}
-      <div class="form-grid">
-        ${num("autoRotateSeconds", "Temporary URL lifetime (seconds)", s.autoRotateSeconds, "0 disables automatic expiry. Auto-generated hosts are temporary.")}
-        ${num("quotaBytes", "Transfer quota (bytes)", s.quotaBytes, "0 = unlimited. Request and response bytes are counted.")}
-        ${num("quotaRequests", "Request quota", s.quotaRequests, "0 = unlimited.")}
-        ${num("quotaDurationSeconds", "Site duration (seconds)", s.quotaDurationSeconds, "0 = no duration limit.")}
-        ${num("maxSites", "Max sites", s.maxSites, "Per owner / per anonymous token.")}
-        ${num("maxBackends", "Max backends", s.maxBackends, "Per provider registration.")}
-      </div>
-      <button class="btn primary" type="submit">Save settings</button>
-    </form>
+  const toggles = [
+    opts.global ? check("allowAnonymous", "Allow anonymous providers", s.allowAnonymous, "Providers without a token can publish sites.") : "",
+    opts.global ? check("allowRegistration", "Allow self-registration", s.allowRegistration, "Anyone can create an account from /register.") : "",
+    opts.global ? check("allowUserSettings", "Allow users to edit their own policy", s.allowUserSettings, "Users may override these limits in their dashboard.") : "",
+    check("allowCustomHost", "Allow custom hostnames", s.allowCustomHost, "Requires a hostname under WEB_ZONE."),
+    opts.global ? check("forceTemporaryHost", "Force temporary hostnames", s.forceTemporaryHost, "Ignores requested hostnames and applies to registered accounts too. Every provider gets a fresh URL on connect.") : "",
+  ].filter(Boolean).join("");
+  return `<div class="panel">
+    <div class="panel-head"><div><h2>${escapeHtml(opts.title)}</h2><div class="sub">${escapeHtml(opts.description)}</div></div></div>
+    <div class="panel-body">
+      <form method="POST" action="${escapeHtml(opts.action)}">
+        <input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}"/>
+        <input type="hidden" name="action" value="saveSettings"/>
+        ${opts.global ? `<input type="hidden" name="scope" value="global"/>` : `<input type="hidden" name="scope" value="user"/>`}
+        ${opts.userId ? `<input type="hidden" name="userId" value="${escapeHtml(opts.userId)}"/>` : ""}
+        <h3 class="form-title">Access</h3>
+        <div class="toggle-grid">${toggles}</div>
+        <h3 class="form-title">Limits</h3>
+        <div class="form-grid">
+          ${num("maxSites", "Max sites", s.maxSites, "Per owner / per anonymous token.")}
+          ${num("maxBackends", "Max backends", s.maxBackends, "Per provider registration.")}
+          ${num("autoRotateSeconds", "Temporary URL lifetime", s.autoRotateSeconds, "Seconds. 0 disables automatic expiry.")}
+        </div>
+        <h3 class="form-title">Quotas</h3>
+        <div class="form-grid">
+          ${num("quotaBytes", "Transfer quota", s.quotaBytes, "Bytes. 0 = unlimited. Request and response bytes are counted.")}
+          ${num("quotaRequests", "Request quota", s.quotaRequests, "0 = unlimited.")}
+          ${num("quotaDurationSeconds", "Site duration", s.quotaDurationSeconds, "Seconds. 0 = no duration limit.")}
+        </div>
+        ${!opts.global && s.forceTemporaryHost ? `<div class="note" style="margin-bottom:16px"><div><strong>Forced temporary hostnames are enabled</strong> by the administrator. Custom hostnames are ignored while this policy is active.</div></div>` : ""}
+        <button class="btn primary" type="submit">Save settings</button>
+      </form>
+    </div>
   </div>`;
 }
 
 function sitesTable(sites: SiteView[], opts: { csrf: string; action: string; admin: boolean }): string {
   if (sites.length === 0) {
-    return `<div class="card"><div class="muted">No proxied sites yet. Run <span class="mono">linksocks web -u &lt;server&gt; -l http://127.0.0.1:8080</span> to create one.</div></div>`;
+    return `<div class="empty">
+      <div class="empty-icon">◌</div>
+      <strong>No sites yet</strong>
+      <div class="sub">Publish one with the CLI. It will appear here after the provider connects.</div>
+      <div class="empty-command">linksocks web -u &lt;server&gt; -l http://127.0.0.1:8080</div>
+    </div>`;
   }
   const rows = sites
     .map((site) => {
@@ -404,46 +586,89 @@ function sitesTable(sites: SiteView[], opts: { csrf: string; action: string; adm
         ? `<span class="badge warn">temporary</span>`
         : `<span class="badge ok">permanent</span>`;
       const status = site.providerCount > 0
-        ? `<span class="badge ok">${site.providerCount} online</span>`
-        : `<span class="badge danger">offline</span>`;
-      return `<tr>
-        <td><a class="mono" href="${escapeHtml(site.url)}" target="_blank" rel="noreferrer">${escapeHtml(site.host)}</a>
-          <div class="sub">${site.anonymous ? "anonymous" : "user"} · ${site.insecure ? "TLS verify off" : "TLS verify on"}</div></td>
-        <td>${opts.admin ? escapeHtml(site.owner) : ""}${opts.admin ? `<div class="sub">${escapeHtml(site.relayId.slice(0, 12))}…</div>` : ""}</td>
-        <td>${type}<div class="sub">${site.rotateSeconds > 0 ? `rotate ${formatDuration(site.rotateSeconds * 1000)}` : "no rotation"}</div></td>
-        <td>${expiryCell(site)}</td>
-        <td><span class="badge gray">${site.backendCount} origin${site.backendCount === 1 ? "" : "s"}</span><div class="sub">${status}</div></td>
-        <td class="mono">${site.requests.toLocaleString()}</td>
-        <td class="mono">${escapeHtml(formatBytes(site.bytes))}</td>
-        <td>
-          <form method="POST" action="${escapeHtml(opts.action)}" class="actions" data-confirm="Delete this site mapping? The provider will be disconnected.">
+        ? `<span class="badge ok"><span class="dot"></span>${site.providerCount} online</span>`
+        : `<span class="badge danger"><span class="dot"></span>offline</span>`;
+      const reserveButton = opts.admin && site.ownerId && !site.reserved
+        ? `<form method="POST" action="${escapeHtml(opts.action)}" class="actions" data-confirm="Reserve ${escapeHtml(site.host)} for ${escapeHtml(site.owner)}?">
             <input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}"/>
-            <input type="hidden" name="action" value="deleteSite"/>
+            <input type="hidden" name="action" value="createReservation"/>
             <input type="hidden" name="host" value="${escapeHtml(site.host)}"/>
-            <button class="btn small danger" type="submit">Delete</button>
-          </form>
+            <input type="hidden" name="userId" value="${escapeHtml(site.ownerId)}"/>
+            <button class="btn small" type="submit">Reserve</button>
+          </form>`
+        : "";
+      return `<tr>
+        <td>
+          <a class="mono" href="${escapeHtml(site.url)}" target="_blank" rel="noreferrer">${escapeHtml(site.host)}</a>
+          ${opts.admin && site.reserved ? `<span class="badge accent" title="Reserved hostnames stay bound to their owner while offline">reserved</span>` : ""}
+          <div class="sub">${site.anonymous ? "anonymous" : "account"} · ${site.insecure ? "TLS verify off" : "TLS verify on"}</div>
+          <div class="sub mobile-only">${site.temporary ? "temporary" : "permanent"}${site.expiresAt ? ` · ${formatDuration(site.expiresAt - Date.now())} left` : ""}</div>
+        </td>
+        ${opts.admin ? `<td class="col-owner">${escapeHtml(site.owner)}<div class="sub mono">${escapeHtml(site.relayId.slice(0, 12))}…</div></td>` : ""}
+        <td class="col-type">${type}<div class="sub">${site.rotateSeconds > 0 ? `${formatDuration(site.rotateSeconds * 1000)} rotation` : "no rotation"}</div></td>
+        <td class="col-expires">${expiryCell(site)}</td>
+        <td>${status}<div class="sub">${site.backendCount} origin${site.backendCount === 1 ? "" : "s"}</div></td>
+        <td class="mono col-requests">${site.requests.toLocaleString()}</td>
+        <td class="mono col-transfer">${escapeHtml(formatBytes(site.bytes))}</td>
+        <td>
+          <div class="actions">
+            ${reserveButton}
+            <form method="POST" action="${escapeHtml(opts.action)}" class="actions" data-confirm="Delete this site mapping? The provider will be disconnected.">
+              <input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}"/>
+              <input type="hidden" name="action" value="deleteSite"/>
+              <input type="hidden" name="host" value="${escapeHtml(site.host)}"/>
+              <button class="btn small danger" type="submit">Delete</button>
+            </form>
+          </div>
         </td>
       </tr>`;
     })
     .join("");
-  return `<div class="table-wrap"><table>
-    <thead><tr><th>Host</th>${opts.admin ? "<th>Owner</th>" : ""}<th>Type</th><th>Expires</th><th>Origins</th><th>Requests</th><th>Bytes</th><th></th></tr></thead>
+  return `<div class="table-wrap site-table"><table>
+    <thead><tr><th>Host</th>${opts.admin ? `<th class="col-owner">Owner</th>` : ""}<th class="col-type">Type</th><th class="col-expires">Expires</th><th>Status</th><th class="col-requests">Requests <span class="muted">today</span></th><th class="col-transfer">Transfer <span class="muted">today</span></th><th></th></tr></thead>
     <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+function recentSitesTable(sites: SiteView[], admin: boolean): string {
+  if (sites.length === 0) {
+    return `<div class="empty"><div class="empty-icon">◌</div><strong>No sites yet</strong><div class="sub">Published hostnames appear here.</div></div>`;
+  }
+  return `<div class="table-wrap compact recent-table"><table>
+    <thead><tr><th>Host</th>${admin ? `<th class="owner-col">Owner</th>` : ""}<th>Status</th><th class="col-requests">Requests <span class="muted">today</span></th><th class="col-transfer">Transfer <span class="muted">today</span></th></tr></thead>
+    <tbody>${sites
+      .map((site) => {
+        const status = site.providerCount > 0
+          ? `<span class="badge ok"><span class="dot"></span>online</span>`
+          : `<span class="badge danger"><span class="dot"></span>offline</span>`;
+        return `<tr>
+          <td><span class="mono">${escapeHtml(site.host)}</span>${admin && site.reserved ? ` <span class="badge accent">reserved</span>` : ""}<div class="sub">${site.temporary ? "temporary" : "permanent"}</div></td>
+          ${admin ? `<td class="owner-col">${escapeHtml(site.owner)}</td>` : ""}
+          <td>${status}<div class="sub">${site.backendCount} origin${site.backendCount === 1 ? "" : "s"}</div></td>
+          <td class="mono col-requests">${site.requests.toLocaleString()}</td>
+          <td class="mono col-transfer">${escapeHtml(formatBytes(site.bytes))}</td>
+        </tr>`;
+      })
+      .join("")}</tbody>
   </table></div>`;
 }
 
 function tokensTable(tokens: TokenView[], opts: { csrf: string; action: string; admin: boolean }): string {
   if (tokens.length === 0) {
-    return `<div class="card"><div class="muted">No tokens yet. Create one to bind providers to your account.</div></div>`;
+    return `<div class="empty">
+      <div class="empty-icon">⌁</div>
+      <strong>No tokens yet</strong>
+      <div class="sub">${opts.admin ? "Tokens created by users appear here. Create one from a user's page." : "Create a token to bind providers to your account and keep their sites after reconnects."}</div>
+    </div>`;
   }
   const rows = tokens
     .map(
       (token) => `<tr>
       <td class="mono">${escapeHtml(token.prefix)}…${token.revoked ? ` <span class="badge danger">revoked</span>` : ""}</td>
-      ${opts.admin ? `<td>${escapeHtml(token.username || "")}</td>` : ""}
+      ${opts.admin ? `<td class="owner-col">${escapeHtml(token.username || "")}</td>` : ""}
       <td>${escapeHtml(token.label || "—")}</td>
-      <td>${escapeHtml(formatDate(token.createdAt))}</td>
-      <td>${token.lastUsedAt ? escapeHtml(formatDate(token.lastUsedAt)) : `<span class="muted">never</span>`}</td>
+      <td class="col-created">${escapeHtml(formatDate(token.createdAt))}</td>
+      <td class="col-last-used">${token.lastUsedAt ? escapeHtml(formatDate(token.lastUsedAt)) : `<span class="muted">never</span>`}</td>
       <td>${token.revoked ? "" : `<form method="POST" action="${escapeHtml(opts.action)}" data-confirm="Revoke this token?">
         <input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}"/>
         <input type="hidden" name="action" value="revokeToken"/>
@@ -453,10 +678,57 @@ function tokensTable(tokens: TokenView[], opts: { csrf: string; action: string; 
     </tr>`,
     )
     .join("");
-  return `<div class="table-wrap"><table>
-    <thead><tr><th>Token</th>${opts.admin ? "<th>Owner</th>" : ""}<th>Label</th><th>Created</th><th>Last used</th><th></th></tr></thead>
+  return `<div class="table-wrap token-table"><table>
+    <thead><tr><th>Token</th>${opts.admin ? `<th class="owner-col">Owner</th>` : ""}<th>Label</th><th class="col-created">Created</th><th class="col-last-used">Last used</th><th></th></tr></thead>
     <tbody>${rows}</tbody>
   </table></div>`;
+}
+
+function reservationsTable(reservations: ReservationView[], opts: { csrf: string; action: string }): string {
+  if (reservations.length === 0) {
+    return `<div class="empty">
+      <div class="empty-icon">◈</div>
+      <strong>No reservations</strong>
+      <div class="sub">Reserve a hostname to keep it bound to one account while its provider is offline. The reservation is invisible to users.</div>
+    </div>`;
+  }
+  const rows = reservations
+    .map((reservation) => {
+      const state = reservation.active
+        ? `<span class="badge ok"><span class="dot"></span>published</span>
+           <div class="sub">${reservation.temporary ? "temporary" : "permanent"}${reservation.siteOwner ? ` · by ${escapeHtml(reservation.siteOwner)}` : ""}</div>`
+        : `<span class="badge gray"><span class="dot"></span>held</span><div class="sub">not published</div>`;
+      const meta = [
+        reservation.note ? escapeHtml(reservation.note) : "",
+        `<span class="nowrap">reserved ${escapeHtml(formatDateCompact(reservation.createdAt))}</span>`,
+      ].filter(Boolean).join(" · ");
+      return `<tr>
+        <td><div class="mono">${escapeHtml(reservation.host)}</div><div class="sub">${meta}</div><div class="sub only-phone">owned by ${escapeHtml(reservation.username)}</div><div class="only-phone" style="margin-top:6px">${state}</div></td>
+        <td class="owner-col">${escapeHtml(reservation.username)}<div class="sub mono">${escapeHtml(reservation.userId.slice(0, 8))}…</div></td>
+        <td class="col-state">${state}</td>
+        <td class="actions">
+          <form method="POST" action="${escapeHtml(opts.action)}" data-confirm="Remove the reservation for ${escapeHtml(reservation.host)}?">
+            <input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}"/>
+            <input type="hidden" name="action" value="deleteReservation"/>
+            <input type="hidden" name="host" value="${escapeHtml(reservation.host)}"/>
+            <button class="btn small danger" type="submit">Release</button>
+          </form>
+        </td>
+      </tr>`;
+    })
+    .join("");
+  return `<div class="table-wrap compact res-table"><table>
+    <thead><tr><th>Hostname</th><th class="owner-col">Owner</th><th class="col-state">State</th><th></th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
+function pageHead(title: string, description: string): string {
+  return `<div class="page-head"><div><h2>${escapeHtml(title)}</h2><div class="sub">${escapeHtml(description)}</div></div></div>`;
+}
+
+function statCard(label: string, value: string | number, hint = ""): string {
+  return `<div class="stat"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div>${hint ? `<div class="hint">${escapeHtml(hint)}</div>` : ""}</div>`;
 }
 
 export function renderAdminPage(data: AdminPageData): string {
@@ -465,96 +737,141 @@ export function renderAdminPage(data: AdminPageData): string {
     { href: "/admin?tab=users", label: "Users", active: data.tab === "users" },
     { href: "/admin?tab=sites", label: "Sites", active: data.tab === "sites" },
     { href: "/admin?tab=tokens", label: "Tokens", active: data.tab === "tokens" },
+    { href: "/admin?tab=reservations", label: "Reservations", active: data.tab === "reservations" },
     { href: "/admin?tab=settings", label: "Settings", active: data.tab === "settings" },
     { href: "/dashboard", label: "My dashboard", active: false },
   ];
 
   let content = flashHtml(data.flash);
   if (data.tab === "overview") {
-    content += `<div class="grid cards">
-      ${card("Users", data.overview.users)}
-      ${card("Sites", data.overview.sites)}
-      ${card("Live providers", data.overview.providers)}
-      ${card("Temporary sites", data.overview.temporarySites)}
-      ${card("Requests", data.overview.requests.toLocaleString())}
-      ${card("Transfer", formatBytes(data.overview.bytes))}
+    content += pageHead("Overview", "A live snapshot of accounts, published sites and traffic. Request and transfer figures cover the current UTC day.");
+    content += `<div class="stats">
+      ${statCard("Users", data.overview.users, "registered accounts")}
+      ${statCard("Sites", data.overview.sites, `${data.overview.onlineSites} online now`)}
+      ${statCard("Live providers", data.overview.providers, "connected providers")}
+      ${statCard("Requests", data.overview.requests.toLocaleString(), "today UTC")}
+      ${statCard("Transfer", formatBytes(data.overview.bytes), "today UTC")}
+      ${statCard("Tokens", data.overview.tokens, "active provider tokens")}
     </div>
     <div class="section two-col">
-      <div class="card"><h2>Recent sites</h2>${sitesTable(data.sites.slice(0, 8), { csrf: data.csrf, action: "/admin/action", admin: true })}</div>
-      <div class="card"><h2>Anonymous policy</h2>
-        <div class="sub">These limits apply to providers without a registered token.</div>
-        <ul class="muted" style="line-height:1.9;padding-left:18px;margin:14px 0 0">
-          <li>Anonymous access: <b>${data.globalSettings.allowAnonymous ? "enabled" : "disabled"}</b></li>
-          <li>Custom hostnames: <b>${data.globalSettings.allowCustomHost ? "allowed" : "blocked"}</b></li>
-          <li>Temporary URL lifetime: <b>${formatDuration(data.globalSettings.autoRotateSeconds * 1000)}</b></li>
-          <li>Transfer quota: <b>${data.globalSettings.quotaBytes ? formatBytes(data.globalSettings.quotaBytes) : "unlimited"}</b></li>
-          <li>Request quota: <b>${data.globalSettings.quotaRequests || "unlimited"}</b></li>
-        </ul>
-        <div style="margin-top:14px"><a class="btn small" href="/admin?tab=settings">Edit policy</a></div>
+      <div class="panel">
+        <div class="panel-head"><h2>Recent sites</h2><a class="btn small ghost" href="/admin?tab=sites">View all</a></div>
+        <div class="panel-body flush">${recentSitesTable(data.sites.slice(0, 8), true)}</div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Anonymous policy</h2><a class="btn small ghost" href="/admin?tab=settings">Edit</a></div>
+        <div class="panel-body">
+          <div class="policy">
+            <div class="policy-row"><span>Anonymous access</span><b>${data.globalSettings.allowAnonymous ? "enabled" : "disabled"}</b></div>
+            <div class="policy-row"><span>Custom hostnames</span><b>${data.globalSettings.allowCustomHost ? "allowed" : "blocked"}</b></div>
+            <div class="policy-row"><span>Forced temporary hosts</span><b>${data.globalSettings.forceTemporaryHost ? "enabled" : "off"}</b></div>
+            <div class="policy-row"><span>Temporary URL lifetime</span><b>${formatDuration(data.globalSettings.autoRotateSeconds * 1000)}</b></div>
+            <div class="policy-row"><span>Transfer quota</span><b>${data.globalSettings.quotaBytes ? formatBytes(data.globalSettings.quotaBytes) : "unlimited"}</b></div>
+            <div class="policy-row"><span>Request quota</span><b>${data.globalSettings.quotaRequests || "unlimited"}</b></div>
+          </div>
+        </div>
       </div>
     </div>`;
   } else if (data.tab === "users") {
     const selected = data.selectedUser;
-    content += `<div class="two-col">
-      <div class="card"><h2>Users</h2>
-        <div class="table-wrap"><table>
-          <thead><tr><th>User</th><th>Role</th><th>Sites</th><th>Tokens</th><th>Created</th><th></th></tr></thead>
-          <tbody>${data.users
-            .map(
-              (user) => `<tr>
-              <td><b>${escapeHtml(user.username)}</b>${user.disabled ? ` <span class="badge danger">disabled</span>` : ""}<div class="sub">${escapeHtml(user.id.slice(0, 8))}…</div></td>
-              <td>${user.isAdmin ? `<span class="badge">admin</span>` : `<span class="badge gray">user</span>`}</td>
-              <td class="mono">${user.siteCount}</td>
-              <td class="mono">${user.tokenCount}</td>
-              <td>${escapeHtml(formatDate(user.createdAt))}</td>
-              <td><a class="btn small" href="/admin?tab=users&user=${encodeURIComponent(user.id)}">Manage</a></td>
-            </tr>`,
-            )
-            .join("")}</tbody>
-        </table></div>
-        <h3 style="margin-top:22px">Create user</h3>
-        <form method="POST" action="/admin/action">
-          <input type="hidden" name="csrf" value="${escapeHtml(data.csrf)}"/>
-          <input type="hidden" name="action" value="createUser"/>
-          <div class="form-grid">
-            <div class="field"><label for="new-username">Username</label><input id="new-username" name="username" required/></div>
-            <div class="field"><label for="new-password">Password</label><input id="new-password" name="password" type="password" minlength="8" required/></div>
-          </div>
-          <label class="check"><input type="checkbox" name="isAdmin" value="1"/> Grant administrator role</label>
-          <button class="btn primary" type="submit">Create user</button>
-        </form>
-      </div>
-      <div class="card"><h2>${selected ? `Manage ${escapeHtml(selected.username)}` : "Select a user"}</h2>
-        ${selected ? userManageForm(selected, data.csrf) : `<div class="muted">Choose “Manage” next to a user to edit their policy and tokens.</div>`}
-      </div>
-    </div>
-    ${selected && data.selectedUserSettings ? settingsForm({
-      action: "/admin/action",
-      csrf: data.csrf,
-      settings: data.selectedUserSettings,
-      global: false,
-      userId: selected.id,
-      title: `Policy for ${selected.username}`,
-      description: "Per-user limits applied to sites created with this user's tokens.",
-    }) : ""}`;
+    content += pageHead("Users", "Accounts, roles and per-user provider policy.");
+    content += `<div class="panel">
+      <div class="panel-head"><h2>${data.users.length} account${data.users.length === 1 ? "" : "s"}</h2><span class="sub">Select a user to manage their policy and tokens.</span></div>
+      <div class="panel-body flush"><div class="table-wrap user-table"><table>
+        <thead><tr><th>User</th><th>Role</th><th class="col-sites">Sites</th><th class="col-tokens">Tokens</th><th class="col-created">Created</th><th></th></tr></thead>
+        <tbody>${data.users
+          .map(
+            (user) => `<tr class="${selected?.id === user.id ? "is-selected" : ""}">
+            <td><b>${escapeHtml(user.username)}</b>${user.disabled ? ` <span class="badge danger">disabled</span>` : ""}<div class="sub mono">${escapeHtml(user.id.slice(0, 8))}…</div></td>
+            <td>${user.isAdmin ? `<span class="badge">admin</span>` : `<span class="badge gray">user</span>`}</td>
+            <td class="mono col-sites">${user.siteCount}</td>
+            <td class="mono col-tokens">${user.tokenCount}</td>
+            <td class="col-created">${escapeHtml(formatDate(user.createdAt))}</td>
+            <td><a class="btn small" href="/admin?tab=users&user=${encodeURIComponent(user.id)}">Manage</a></td>
+          </tr>`,
+          )
+          .join("")}</tbody>
+      </table></div></div>
+    </div>`;
+    if (selected) {
+      content += `<div class="section two-col user-manage">
+        <div class="panel">
+          <div class="panel-head"><h2>Manage ${escapeHtml(selected.username)}</h2><span class="sub">Account access and tokens</span></div>
+          <div class="panel-body">${userManageForm(selected, data.csrf)}</div>
+        </div>
+        ${data.selectedUserSettings ? settingsForm({
+          action: "/admin/action",
+          csrf: data.csrf,
+          settings: {
+            ...data.selectedUserSettings,
+            forceTemporaryHost: data.selectedUserSettings.forceTemporaryHost || data.globalSettings.forceTemporaryHost,
+          },
+          global: false,
+          userId: selected.id,
+          title: `Policy for ${selected.username}`,
+          description: "Per-user limits applied to sites created with this user's tokens.",
+        }) : ""}
+      </div>`;
+    } else {
+      content += `<div class="panel">
+        <div class="panel-head"><h2>Create user</h2><span class="sub">Accounts can publish sites with their own tokens.</span></div>
+        <div class="panel-body">
+          <form method="POST" action="/admin/action">
+            <input type="hidden" name="csrf" value="${escapeHtml(data.csrf)}"/>
+            <input type="hidden" name="action" value="createUser"/>
+            <div class="form-grid">
+              <div class="field"><label for="new-username">Username</label><input id="new-username" name="username" required/></div>
+              <div class="field"><label for="new-password">Password</label><input id="new-password" name="password" type="password" minlength="8" required/><div class="hint">At least 8 characters.</div></div>
+            </div>
+            <label class="check"><input type="checkbox" name="isAdmin" value="1"/> Grant administrator role</label>
+            <button class="btn primary" type="submit">Create user</button>
+          </form>
+        </div>
+      </div>`;
+    }
   } else if (data.tab === "sites") {
-    content += `<div class="card"><h2>Sites</h2><div class="sub" style="margin-bottom:14px">All active hostname mappings. “Origins” is the number of local backends declared by connected providers.</div>${sitesTable(data.sites, { csrf: data.csrf, action: "/admin/action", admin: true })}</div>`;
+    content += pageHead("Sites", "Every published hostname, its owner, origins and today's traffic. Reserved hosts stay bound to their owner while offline.");
+    content += `<div class="panel"><div class="panel-head"><h2>${data.sites.length} site${data.sites.length === 1 ? "" : "s"}</h2></div><div class="panel-body flush">${sitesTable(data.sites, { csrf: data.csrf, action: "/admin/action", admin: true })}</div></div>`;
   } else if (data.tab === "tokens") {
-    content += `<div class="card"><h2>Tokens</h2><div class="sub" style="margin-bottom:14px">Provider tokens are bound to the user who created them. Raw tokens are shown only once at creation.</div>${tokensTable(data.tokens, { csrf: data.csrf, action: "/admin/action", admin: true })}</div>`;
+    content += pageHead("Tokens", "Provider tokens are bound to the account that created them. Raw tokens are shown only once.");
+    content += `<div class="panel"><div class="panel-head"><h2>${data.tokens.length} token${data.tokens.length === 1 ? "" : "s"}</h2></div><div class="panel-body flush">${tokensTable(data.tokens, { csrf: data.csrf, action: "/admin/action", admin: true })}</div></div>`;
+  } else if (data.tab === "reservations") {
+    content += pageHead("Reservations", "Admin-only hostname holds. A reservation keeps a name bound to one account while its provider is offline, and is invisible on the user side.");
+    content += `<div class="two-col">
+      <div class="panel">
+        <div class="panel-head"><h2>${data.reservations.length} reservation${data.reservations.length === 1 ? "" : "s"}</h2></div>
+        <div class="panel-body flush">${reservationsTable(data.reservations, { csrf: data.csrf, action: "/admin/action" })}</div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h2>Reserve a hostname</h2></div>
+        <div class="panel-body">
+          <form method="POST" action="/admin/action">
+            <input type="hidden" name="csrf" value="${escapeHtml(data.csrf)}"/>
+            <input type="hidden" name="action" value="createReservation"/>
+            <div class="field"><label for="reserve-host">Hostname</label><input id="reserve-host" name="host" placeholder="blog${data.zone ? `.${escapeHtml(data.zone)}` : ".example.com"}" required/><div class="hint">${data.zone ? `Must be a subdomain of ${escapeHtml(data.zone)}.` : "WEB_ZONE is not configured; custom hosts cannot be validated."}</div></div>
+            <div class="field"><label for="reserve-user">Owner</label><select id="reserve-user" name="userId" required>${data.users.map((user) => `<option value="${escapeHtml(user.id)}">${escapeHtml(user.username)}${user.isAdmin ? " (admin)" : ""}</option>`).join("")}</select></div>
+            <div class="field"><label for="reserve-note">Note</label><input id="reserve-note" name="note" placeholder="optional, admin only"/></div>
+            <button class="btn primary" type="submit">Create reservation</button>
+          </form>
+          <div class="note" style="margin-top:14px"><div>Reservations do not proxy anything. The hostname keeps returning <strong>Unknown site</strong> until its owner publishes it again. Other accounts cannot claim it.</div></div>
+        </div>
+      </div>
+    </div>`;
   } else {
+    content += pageHead("Settings", "Global defaults for anonymous providers. Registered accounts keep their own limits; force-temporary mode is global.");
     content += settingsForm({
       action: "/admin/action",
       csrf: data.csrf,
       settings: data.globalSettings,
       global: true,
       title: "Global anonymous policy",
-      description: "Defaults for providers that connect without a registered token. Registered users have their own policy.",
+      description: "Defaults for providers that connect without a registered token.",
     });
   }
 
   return layout({
     title: "Admin console",
-    subtitle: "Users, tokens, sites and anonymous quotas",
+    subtitle: "Users, tokens, sites, reservations and quotas",
     nav,
     userLabel: `${data.user.username} · admin`,
     logoutAction: "/admin?logout",
@@ -570,28 +887,24 @@ function userManageForm(user: UserView, csrf: string): string {
       <div class="field"><label for="reset-password">New password</label><input id="reset-password" name="password" type="password" minlength="8" placeholder="Leave blank to keep current"/></div>
       <label class="check"><input type="checkbox" name="isAdmin" value="1" ${user.isAdmin ? "checked" : ""}/> Administrator</label>
       <label class="check"><input type="checkbox" name="disabled" value="1" ${user.disabled ? "checked" : ""}/> Disabled</label>
-      <div class="actions">
-        <button class="btn primary" type="submit">Save user</button>
-        <button class="btn" type="submit" form="create-token-form">Create token</button>
-      </div>
+      <button class="btn primary" type="submit">Save user</button>
     </form>
-    <form method="POST" action="/admin/action" id="create-token-form" style="margin-top:12px">
-      <input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/>
-      <input type="hidden" name="action" value="createToken"/>
-      <input type="hidden" name="userId" value="${escapeHtml(user.id)}"/>
-      <div class="field"><label for="token-label">Token label</label><input id="token-label" name="label" placeholder="laptop / ci"/></div>
-      <button class="btn" type="submit">Create token for ${escapeHtml(user.username)}</button>
-    </form>
-    <form method="POST" action="/admin/action" style="margin-top:18px" data-confirm="Delete this user, their tokens and sessions?">
+    <div class="form-section">
+      <h3>Create token</h3>
+      <form method="POST" action="/admin/action">
+        <input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/>
+        <input type="hidden" name="action" value="createToken"/>
+        <input type="hidden" name="userId" value="${escapeHtml(user.id)}"/>
+        <div class="field"><label for="token-label">Label</label><input id="token-label" name="label" placeholder="laptop / ci"/></div>
+        <button class="btn" type="submit">Create token for ${escapeHtml(user.username)}</button>
+      </form>
+    </div>
+    <form class="form-danger" method="POST" action="/admin/action" data-confirm="Delete this user, their tokens and sessions?">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/>
       <input type="hidden" name="action" value="deleteUser"/>
       <input type="hidden" name="userId" value="${escapeHtml(user.id)}"/>
       <button class="btn danger" type="submit">Delete user</button>
     </form>`;
-}
-
-function card(label: string, value: string | number): string {
-  return `<div class="card"><div class="label">${escapeHtml(label)}</div><div class="value">${escapeHtml(value)}</div></div>`;
 }
 
 export function renderDashboardPage(data: DashboardPageData): string {
@@ -606,31 +919,37 @@ export function renderDashboardPage(data: DashboardPageData): string {
   }
   let content = flashHtml(data.flash);
   if (data.tab === "overview") {
-    content += `<div class="grid cards">
-      ${card("My sites", data.overview.sites)}
-      ${card("Live providers", data.overview.providers)}
-      ${card("Temporary sites", data.overview.temporarySites)}
-      ${card("Requests", data.overview.requests.toLocaleString())}
-      ${card("Transfer", formatBytes(data.overview.bytes))}
-      ${card("Tokens", data.overview.tokens)}
+    content += pageHead("Overview", "Your sites, origins and today's traffic.");
+    content += `<div class="stats">
+      ${statCard("My sites", data.overview.sites, `${data.overview.onlineSites} online now`)}
+      ${statCard("Live providers", data.overview.providers, "connected providers")}
+      ${statCard("Requests", data.overview.requests.toLocaleString(), "today UTC")}
+      ${statCard("Transfer", formatBytes(data.overview.bytes), "today UTC")}
+      ${statCard("Tokens", data.overview.tokens, "provider tokens")}
     </div>
-    <div class="section card"><h2>My sites</h2>${sitesTable(data.sites.slice(0, 8), { csrf: data.csrf, action: "/dashboard/action", admin: false })}</div>`;
+    <div class="section panel">
+      <div class="panel-head"><h2>My sites</h2><a class="btn small ghost" href="/dashboard?tab=sites">View all</a></div>
+      <div class="panel-body flush">${sitesTable(data.sites.slice(0, 8), { csrf: data.csrf, action: "/dashboard/action", admin: false })}</div>
+    </div>`;
   } else if (data.tab === "sites") {
-    content += `<div class="card"><h2>My sites</h2><div class="sub" style="margin-bottom:14px">Each site can have multiple origins behind one hostname. Temporary hosts expire automatically.</div>${sitesTable(data.sites, { csrf: data.csrf, action: "/dashboard/action", admin: false })}</div>`;
+    content += pageHead("My sites", "Each site can have multiple origins behind one hostname. Temporary hosts expire automatically.");
+    content += `<div class="panel"><div class="panel-head"><h2>${data.sites.length} site${data.sites.length === 1 ? "" : "s"}</h2></div><div class="panel-body flush">${sitesTable(data.sites, { csrf: data.csrf, action: "/dashboard/action", admin: false })}</div></div>`;
   } else if (data.tab === "tokens") {
+    content += pageHead("Tokens", "Tokens bind providers to your account. Keep them private.");
     content += `<div class="two-col">
-      <div class="card"><h2>My tokens</h2>${tokensTable(data.tokens, { csrf: data.csrf, action: "/dashboard/action", admin: false })}</div>
-      <div class="card"><h2>Create token</h2>
-        <div class="sub" style="margin-bottom:14px">Use a token with <span class="mono">linksocks web -t &lt;token&gt;</span> to bind the site to your account.</div>
+      <div class="panel"><div class="panel-head"><h2>${data.tokens.length} token${data.tokens.length === 1 ? "" : "s"}</h2></div><div class="panel-body flush">${tokensTable(data.tokens, { csrf: data.csrf, action: "/dashboard/action", admin: false })}</div></div>
+      <div class="panel"><div class="panel-head"><h2>Create token</h2></div><div class="panel-body">
+        <div class="sub" style="margin-bottom:14px">Use it with <span class="mono">linksocks web -t &lt;token&gt;</span>.</div>
         <form method="POST" action="/dashboard/action">
           <input type="hidden" name="csrf" value="${escapeHtml(data.csrf)}"/>
           <input type="hidden" name="action" value="createToken"/>
-          <div class="field"><label for="token-label">Label</label><input id="token-label" name="label" placeholder="laptop / ci"/></div>
+          <div class="field"><label for="token-label">Label</label><input id="token-label" name="label" placeholder="laptop / ci"/><div class="hint">Only for your own reference.</div></div>
           <button class="btn primary" type="submit">Create token</button>
         </form>
-      </div>
+      </div></div>
     </div>`;
   } else {
+    content += pageHead("Settings", "Limits for sites created with your tokens.");
     content += data.allowUserSettings
       ? settingsForm({
           action: "/dashboard/action",
@@ -640,7 +959,7 @@ export function renderDashboardPage(data: DashboardPageData): string {
           title: "My provider policy",
           description: "These limits apply to sites created with your tokens. Set a value to 0 for unlimited.",
         })
-      : `<div class="card"><h2>Settings</h2><div class="muted">Your administrator has disabled per-user policy editing.</div></div>`;
+      : `<div class="panel"><div class="panel-body"><div class="empty"><div class="empty-icon">⚙</div><strong>Settings are managed by your administrator</strong><div class="sub">Per-user policy editing is disabled on this server.</div></div></div></div>`;
   }
   return layout({
     title: "My dashboard",

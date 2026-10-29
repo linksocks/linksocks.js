@@ -195,8 +195,8 @@ linksocks web -u wss://linksocks.example.com -t ls_xxx \
 ### User System (D1)
 
 - `/admin` — administrator console. The admin account is auto-created from
-  `ADMIN_USERNAME` / `ADMIN_PASSWORD` on first boot. Manage users, tokens, sites
-  and the global anonymous policy.
+  `ADMIN_USERNAME` / `ADMIN_PASSWORD` on first boot. Manage users, tokens, sites,
+  hostname reservations and the global anonymous policy.
 - `/dashboard` — user console limited to the signed-in user's sites, tokens,
   traffic and origins.
 - `/register` — self-registration, gated by the global `allowRegistration`
@@ -207,6 +207,22 @@ linksocks web -u wss://linksocks.example.com -t ls_xxx \
 - Administrators can edit anonymous access, custom hostname allowance,
   registration, and whether users may edit their own policy; per-user overrides
   live on the user detail page.
+
+### Hostname Holds and Reservations
+
+When the last provider of a web relay disconnects, its published hostnames stay
+bound to that relay for **24 hours**. A provider restart or a short outage
+therefore keeps the same URL, and other accounts cannot take it over during
+the hold. With `forceTemporaryHost` enabled the hold is intentionally short
+(60 seconds) and the provider receives a log message with the new URL when the
+host rotates. Plain SOCKS relays keep the historical 60 second grace.
+
+Administrators can additionally **reserve** a hostname for an account in
+`/admin?tab=reservations`. A reservation does not create a site and is invisible
+to users: the hostname simply remains unavailable to everyone else after the
+relay is released, until its owner publishes it again. Reservations survive
+relay cleanup and are deleted only when the reservation or the account is
+removed.
 
 ### Quotas and Temporary Hosts
 
