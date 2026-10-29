@@ -247,8 +247,10 @@ export default {
     }
 
     * { box-sizing: border-box; }
-    html, body { height: 100%; }
+    html { min-height: 100%; }
     body {
+      min-height: 100vh;
+      min-height: 100dvh;
       margin: 0;
       font-family: Inter, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
       color: var(--text);
@@ -362,6 +364,34 @@ export default {
       border-radius: 50%;
       background: #22c55e;
       box-shadow: 0 0 0 4px rgba(34,197,94,0.16);
+    }
+
+    .heroActions {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-shrink: 0;
+    }
+    .signInBtn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 16px;
+      border-radius: 999px;
+      border: 1px solid transparent;
+      background: linear-gradient(135deg, var(--brand), var(--brand2));
+      color: #fff;
+      font-size: 12.5px;
+      font-weight: 700;
+      white-space: nowrap;
+      box-shadow: 0 10px 24px rgba(124,58,237,0.28);
+      transition: filter 0.2s, transform 0.2s;
+    }
+    .signInBtn:hover {
+      color: #fff;
+      text-decoration: none;
+      filter: brightness(1.08);
+      transform: translateY(-1px);
     }
 
     .heroBody {
@@ -602,7 +632,9 @@ export default {
     @media (max-width: 860px) {
       .stats { grid-template-columns: 1fr; }
       .grid { grid-template-columns: 1fr; }
-      .heroTop { flex-direction: column; align-items: flex-start; }
+      .heroTop { flex-direction: column; align-items: stretch; }
+      .brand { padding-right: 0; }
+      .heroActions { justify-content: space-between; }
     }
 
     .usageSection {
@@ -681,7 +713,10 @@ export default {
             <p class="subtitle">Public relay endpoint · Cloudflare Workers</p>
           </div>
         </div>
-        <div class="pill"><span class="dot" aria-hidden="true"></span> Online</div>
+        <div class="heroActions">
+          <a class="signInBtn" href="/dashboard">Sign in</a>
+          <div class="pill"><span class="dot" aria-hidden="true"></span> Online</div>
+        </div>
       </div>
 
       <div class="heroBody">
@@ -789,7 +824,7 @@ export default {
 
       <div class="footer">
         <span>Client: <a href="https://github.com/linksocks/linksocks" target="_blank" rel="noreferrer">github.com/linksocks/linksocks</a></span>
-        <span>LinkSocks.js</span>
+        <span><a href="/admin">Admin console</a> · LinkSocks.js</span>
       </div>
     </div>
   </div>

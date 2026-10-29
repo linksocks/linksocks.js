@@ -200,11 +200,14 @@ label{display:block;font-size:.8rem;color:var(--muted);margin-bottom:6px;font-we
 .token-reveal pre{background:rgba(0,0,0,.4);border:1px solid var(--stroke);padding:10px 12px;border-radius:10px;overflow-x:auto;font-family:var(--mono);font-size:.82rem}
 .two-col{display:grid;grid-template-columns:minmax(0,1.4fr) minmax(280px,1fr);gap:16px}
 @media(max-width:860px){.two-col{grid-template-columns:1fr}}
-.login{min-height:100vh;display:grid;place-items:center;padding:24px}
+.login{min-height:100vh;min-height:100dvh;display:grid;place-items:center;padding:24px}
+.login-box{width:100%;max-width:380px}
+.login-brand{display:flex;align-items:center;justify-content:center;gap:10px;margin-bottom:16px;font-weight:800;letter-spacing:-.02em}
+.login-brand .logo{width:34px;height:34px;border-radius:11px}
 .login .card{width:100%;max-width:380px;padding:26px}
 .login h1{text-align:center;margin-bottom:4px}
 .login .sub{text-align:center;margin-bottom:22px}
-.error-page{min-height:100vh;display:grid;place-items:center;padding:24px;text-align:center}
+.error-page{min-height:100vh;min-height:100dvh;display:grid;place-items:center;padding:24px;text-align:center}
 .error-page .code{font-size:4rem;font-weight:800;letter-spacing:-.06em;background:linear-gradient(135deg,var(--brand),var(--brand2));-webkit-background-clip:text;background-clip:text;color:transparent}
 footer{margin-top:36px;color:var(--muted2);font-size:.78rem;text-align:center}
 .copy-note{font-size:.76rem;color:var(--muted2)}
@@ -218,6 +221,7 @@ function layout(opts: {
   logoutAction?: string;
   content: string;
   scripts?: string;
+  bare?: boolean;
 }): string {
   const nav = (opts.nav || [])
     .map(
@@ -237,7 +241,7 @@ function layout(opts: {
 <style>${STYLE}</style>
 </head>
 <body>
-<div class="wrap">
+${opts.bare ? opts.content : `<div class="wrap">
   <div class="topbar">
     <div class="brand">
       <div class="logo"></div>
@@ -254,7 +258,7 @@ function layout(opts: {
   <div class="nav">${nav}</div>
   <div class="section">${opts.content}</div>
   <footer>LinkSocks.js · Web reverse proxy · D1 control plane</footer>
-</div>
+</div>`}
 <script>
 (function(){
   function fmt(ms){
@@ -305,7 +309,7 @@ export function renderLoginPage(opts: {
 }): string {
   const isRegister = opts.mode === "register";
   const submitLabel = isRegister ? "Create account" : "Sign in";
-  const footerParts: string[] = [];
+  const footerParts: string[] = [`<a href="/">Back to home</a>`];
   if (isRegister && opts.signInHref) {
     footerParts.push(`<a href="${escapeHtml(opts.signInHref)}">Already have an account? Sign in</a>`);
   }
@@ -324,8 +328,11 @@ export function renderLoginPage(opts: {
       : opts.admin
         ? "Administrator sign in"
         : "User sign in",
+    bare: true,
     content: `<div class="login">
-      <div class="card">
+      <div class="login-box">
+        <div class="login-brand"><div class="logo"></div><span>LinkSocks.js</span></div>
+        <div class="card">
         <h1>${escapeHtml(opts.title)}</h1>
         <div class="sub">${
           isRegister
@@ -342,6 +349,7 @@ export function renderLoginPage(opts: {
           <button class="btn primary" type="submit" style="width:100%">${submitLabel}</button>
         </form>
         ${footerParts.length > 0 ? `<div class="sub" style="margin-top:16px">${footerParts.join(" · ")}</div>` : ""}
+        </div>
       </div>
     </div>`,
   });
@@ -458,6 +466,7 @@ export function renderAdminPage(data: AdminPageData): string {
     { href: "/admin?tab=sites", label: "Sites", active: data.tab === "sites" },
     { href: "/admin?tab=tokens", label: "Tokens", active: data.tab === "tokens" },
     { href: "/admin?tab=settings", label: "Settings", active: data.tab === "settings" },
+    { href: "/dashboard", label: "My dashboard", active: false },
   ];
 
   let content = flashHtml(data.flash);
@@ -592,6 +601,9 @@ export function renderDashboardPage(data: DashboardPageData): string {
     { href: "/dashboard?tab=tokens", label: "Tokens", active: data.tab === "tokens" },
     { href: "/dashboard?tab=settings", label: "Settings", active: data.tab === "settings" },
   ];
+  if (data.user.isAdmin) {
+    nav.push({ href: "/admin", label: "Admin console", active: false });
+  }
   let content = flashHtml(data.flash);
   if (data.tab === "overview") {
     content += `<div class="grid cards">
@@ -643,6 +655,7 @@ export function renderDashboardPage(data: DashboardPageData): string {
 export function renderErrorPage(title: string, message: string, code = "Error"): string {
   return layout({
     title,
+    bare: true,
     content: `<div class="error-page"><div>
       <div class="code">${escapeHtml(code)}</div>
       <h1>${escapeHtml(title)}</h1>
