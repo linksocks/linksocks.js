@@ -926,6 +926,35 @@ export function siteUrl(host: string, scheme = "https"): string {
   return `${scheme}://${host}`;
 }
 
+export interface QuantityUnit {
+  label: string;
+  value: number;
+}
+
+export const BYTE_UNITS: readonly QuantityUnit[] = [
+  { label: "B", value: 1 },
+  { label: "KiB", value: 1024 },
+  { label: "MiB", value: 1024 ** 2 },
+  { label: "GiB", value: 1024 ** 3 },
+  { label: "TiB", value: 1024 ** 4 },
+];
+
+export const DURATION_UNITS: readonly QuantityUnit[] = [
+  { label: "seconds", value: 1 },
+  { label: "minutes", value: 60 },
+  { label: "hours", value: 60 * 60 },
+  { label: "days", value: 24 * 60 * 60 },
+];
+
+export function splitQuantity(value: number, units: readonly QuantityUnit[]): { value: number; unit: number } {
+  const total = Number.isFinite(value) && value > 0 ? Math.floor(value) : 0;
+  if (total === 0) return { value: 0, unit: units[0].value };
+  for (let index = units.length - 1; index >= 0; index--) {
+    if (total % units[index].value === 0) return { value: total / units[index].value, unit: units[index].value };
+  }
+  return { value: total, unit: units[0].value };
+}
+
 export function formatBytes(bytes: number): string {
   if (!Number.isFinite(bytes) || bytes <= 0) return "0 B";
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];

@@ -94,7 +94,23 @@ test("administrator can enable and disable policy checkboxes", { timeout: 20000 
   assert.equal(savedUser.status, 303);
   const updatedUser = await worker.dispatchFetch(`http://localhost/admin?tab=users&user=${userId}`, { headers });
   const updatedUserHtml = await updatedUser.text();
-  assert.ok(/name="quotaBytes"[^>]*value="2048"/.test(updatedUserHtml), "user quota must be saved");
+  assert.ok(/name="quotaBytes"[^>]*value="2"/.test(updatedUserHtml), "2048 bytes should display as 2 KiB");
+  assert.ok(/<option value="1024" selected>/.test(updatedUserHtml), "2048 bytes should select the KiB unit");
+
+  await save({
+    autoRotateSeconds: "2",
+    autoRotateSecondsUnit: "86400",
+    quotaBytes: "2",
+    quotaBytesUnit: "1048576",
+    quotaDurationSeconds: "3",
+    quotaDurationSecondsUnit: "3600",
+  });
+  const quantities = await (await worker.dispatchFetch("http://localhost/admin?tab=settings", { headers })).text();
+  assert.ok(/name="quotaBytes"[^>]*value="2"/.test(quantities), "2 MiB should display as 2 in the number input");
+  assert.ok(/<option value="1048576" selected>/.test(quantities), "2 MiB should select the MiB unit");
+  assert.ok(/name="autoRotateSeconds"[^>]*value="2"/.test(quantities), "2 days should display as 2");
+  assert.ok(/<option value="86400" selected>/.test(quantities), "2 days should select the days unit");
+  assert.ok(/name="quotaDurationSeconds"[^>]*value="3"/.test(quantities), "3 hours should display as 3");
 
   await save({ publicUrl: "relay.example.com" });
   const publicHome = await (await worker.dispatchFetch("http://localhost/")).text();

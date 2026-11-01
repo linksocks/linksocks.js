@@ -14,10 +14,13 @@ import {
   renderLoginPage,
 } from "./ui";
 import {
+  type QuantityUnit,
   type Settings,
   type SiteRow,
   type TokenRow,
   type UserRow,
+  BYTE_UNITS,
+  DURATION_UNITS,
   clearSessionCookie,
   createSession,
   createToken,
@@ -119,16 +122,23 @@ function parseSettingsForm(form: FormData, current: Settings): Settings {
     if (!Number.isFinite(value) || value < 0) return fallback;
     return Math.floor(value);
   };
+  const quantity = (name: string, unitName: string, fallback: number, units: readonly QuantityUnit[]) => {
+    if (!form.has(name)) return fallback;
+    const value = Number(form.get(name));
+    const unit = Number(form.get(unitName) || 1);
+    if (!Number.isFinite(value) || value < 0 || !units.some((item) => item.value === unit)) return fallback;
+    return Math.floor(value * unit);
+  };
   return {
     publicUrl: global ? normalizePublicUrl(form.get("publicUrl")) : current.publicUrl,
     allowAnonymous: global ? checked("allowAnonymous") : current.allowAnonymous,
     allowCustomHost: checked("allowCustomHost"),
     forceTemporaryHost: global ? checked("forceTemporaryHost") : current.forceTemporaryHost,
     allowRegistration: global ? checked("allowRegistration") : current.allowRegistration,
-    autoRotateSeconds: num("autoRotateSeconds", current.autoRotateSeconds),
-    quotaBytes: num("quotaBytes", current.quotaBytes),
+    autoRotateSeconds: quantity("autoRotateSeconds", "autoRotateSecondsUnit", current.autoRotateSeconds, DURATION_UNITS),
+    quotaBytes: quantity("quotaBytes", "quotaBytesUnit", current.quotaBytes, BYTE_UNITS),
     quotaRequests: num("quotaRequests", current.quotaRequests),
-    quotaDurationSeconds: num("quotaDurationSeconds", current.quotaDurationSeconds),
+    quotaDurationSeconds: quantity("quotaDurationSeconds", "quotaDurationSecondsUnit", current.quotaDurationSeconds, DURATION_UNITS),
     maxSites: num("maxSites", current.maxSites),
     maxBackends: Math.max(1, num("maxBackends", current.maxBackends)),
   };

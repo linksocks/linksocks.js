@@ -1,5 +1,5 @@
 import type { Settings } from "./db";
-import { formatBytes } from "./db";
+import { BYTE_UNITS, DURATION_UNITS, formatBytes, splitQuantity } from "./db";
 
 export interface SiteView {
   host: string;
@@ -296,6 +296,9 @@ dialog.modal.wide{width:min(720px,calc(100vw - 36px))}
 .combo-option .role{font-family:var(--mono);font-size:10px;color:var(--faint);text-transform:uppercase;letter-spacing:.08em}
 .combo-empty{padding:10px;color:var(--faint);font-size:12.5px}
 .form-grid .span-2{grid-column:1/-1}
+.quantity{display:flex;gap:8px}
+.quantity input{flex:1;min-width:0}
+.quantity select{width:104px;flex:none}
 .btn{appearance:none;display:inline-flex;align-items:center;justify-content:center;gap:6px;border:1px solid var(--line-strong);background:var(--surface);color:var(--ink);padding:7px 12px;min-height:34px;border-radius:var(--radius-sm);font-size:13px;font-weight:550;cursor:pointer;font-family:inherit;transition:background .15s ease,border-color .15s ease,color .15s ease}
 .btn:hover{background:var(--surface-2);border-color:#adb5ad;text-decoration:none}
 .btn.primary{background:var(--accent);border-color:var(--accent);color:#fff}
@@ -699,6 +702,19 @@ function settingsForm(opts: {
     `<label class="check"><input type="checkbox" name="${name}" value="1" ${checked ? "checked" : ""}/><span class="check-body"><span class="check-label">${escapeHtml(label)}</span>${hint ? `<span class="hint">${escapeHtml(hint)}</span>` : ""}</span></label>`;
   const num = (name: string, label: string, value: number, hint: string) =>
     `<div class="field"><label for="${name}">${escapeHtml(label)}</label><input id="${name}" name="${name}" type="number" min="0" step="1" value="${value}"/><div class="hint">${escapeHtml(hint)}</div></div>`;
+  const quantity = (name: string, label: string, value: number, units: typeof BYTE_UNITS, hint: string) => {
+    const parts = splitQuantity(value, units);
+    const options = units
+      .map((unit) => `<option value="${unit.value}"${unit.value === parts.unit ? " selected" : ""}>${unit.label}</option>`)
+      .join("");
+    return `<div class="field"><label for="${name}">${escapeHtml(label)}</label>
+      <div class="quantity">
+        <input id="${name}" name="${name}" type="number" min="0" step="1" value="${parts.value}"/>
+        <select id="${name}Unit" name="${name}Unit" aria-label="${escapeHtml(label)} unit">${options}</select>
+      </div>
+      <div class="hint">${escapeHtml(hint)}</div>
+    </div>`;
+  };
   const toggles = [
     opts.global ? check("allowAnonymous", "Allow anonymous providers", s.allowAnonymous, "Providers without a token can publish sites.") : "",
     opts.global ? check("allowRegistration", "Allow self-registration", s.allowRegistration, "Anyone can create an account from /register.") : "",
@@ -726,13 +742,13 @@ function settingsForm(opts: {
         <div class="form-grid">
           ${num("maxSites", "Max sites", s.maxSites, "Per owner / per anonymous token.")}
           ${num("maxBackends", "Max backends", s.maxBackends, "Per provider registration.")}
-          ${num("autoRotateSeconds", "Temporary URL lifetime (seconds)", s.autoRotateSeconds, "Seconds. 0 disables automatic expiry.")}
+          ${quantity("autoRotateSeconds", "Temporary URL lifetime", s.autoRotateSeconds, DURATION_UNITS, "0 disables automatic expiry.")}
         </div>
         <h3 class="form-title">Quotas</h3>
         <div class="form-grid">
-          ${num("quotaBytes", "Total transfer quota (bytes)", s.quotaBytes, `Lifetime cap per account or anonymous token; request and response bytes count. ${s.quotaBytes ? `Currently ${formatBytes(s.quotaBytes)}.` : "0 = unlimited."}`)}
+          ${quantity("quotaBytes", "Total transfer quota", s.quotaBytes, BYTE_UNITS, `Lifetime cap per account or anonymous token; request and response bytes count. ${s.quotaBytes ? `Currently ${formatBytes(s.quotaBytes)}.` : "0 = unlimited."}`)}
           ${num("quotaRequests", "Total request quota", s.quotaRequests, "Lifetime cap. 0 = unlimited.")}
-          ${num("quotaDurationSeconds", "Site duration (seconds)", s.quotaDurationSeconds, "Seconds. 0 = no duration limit.")}
+          ${quantity("quotaDurationSeconds", "Site duration", s.quotaDurationSeconds, DURATION_UNITS, "0 = no duration limit.")}
         </div>
         ${!opts.global && s.forceTemporaryHost ? `<div class="note" style="margin-bottom:16px"><div><strong>Forced temporary hostnames are enabled</strong> by the administrator. Custom hostnames are ignored while this policy is active.</div></div>` : ""}
         <div class="${opts.modal ? "modal-actions" : "form-actions"}"><button class="btn primary" type="submit">${opts.modal ? "Save policy" : "Save settings"}</button></div>
