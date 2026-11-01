@@ -335,19 +335,15 @@ export default {
       flex-shrink: 0;
     }
 
-    .pill {
+    .status {
       display: inline-flex;
       align-items: center;
       gap: 7px;
-      padding: 5px 9px;
-      border-radius: 5px;
-      border: 1px solid var(--line);
-      background: var(--surface);
       color: var(--muted);
       font-family: var(--mono);
       font-size: 10px;
       font-weight: 600;
-      letter-spacing: 0.08em;
+      letter-spacing: 0.09em;
       text-transform: uppercase;
       white-space: nowrap;
     }
@@ -362,22 +358,34 @@ export default {
     .signInBtn {
       display: inline-flex;
       align-items: center;
-      gap: 8px;
-      padding: 8px 14px;
+      justify-content: center;
+      gap: 6px;
+      height: 32px;
+      padding: 0 12px;
       border-radius: 6px;
-      border: 1px solid var(--accent);
-      background: var(--accent);
-      color: #ffffff;
+      border: 1px solid var(--line-strong);
+      background: var(--surface);
+      color: var(--text);
       font-size: 12.5px;
       font-weight: 600;
+      line-height: 1;
       white-space: nowrap;
       transition: background 0.15s ease, border-color 0.15s ease;
     }
+    .signInBtn .arrow {
+      color: var(--faint);
+      font-size: 12px;
+      transition: transform 0.15s ease;
+    }
     .signInBtn:hover {
-      color: #ffffff;
+      color: var(--ink);
       text-decoration: none;
-      background: var(--accent-hover);
-      border-color: var(--accent-hover);
+      background: var(--surface-2);
+      border-color: #b7beb6;
+    }
+    .signInBtn:hover .arrow {
+      transform: translateX(2px);
+      color: var(--muted);
     }
 
     .heroBody { padding: 0; }
@@ -635,7 +643,7 @@ export default {
       .grid { grid-template-columns: 1fr; }
       .intro { padding: 42px 0 28px; }
     }
-    @media (max-width: 460px) {
+    @media (max-width: 340px) {
       .heroActions { width: 100%; justify-content: space-between; }
     }
     @media (max-width: 620px) {
@@ -732,8 +740,8 @@ export default {
           </div>
         </div>
         <div class="heroActions">
-          <div class="pill"><span class="dot" aria-hidden="true"></span> Online</div>
-          <a class="signInBtn" href="/dashboard">Console sign in</a>
+          <div class="status"><span class="dot" aria-hidden="true"></span> Online</div>
+          <a class="signInBtn" href="/dashboard" aria-label="Sign in to the console">Sign in <span class="arrow" aria-hidden="true">&rarr;</span></a>
         </div>
       </div>
 
