@@ -9,11 +9,11 @@ import type { Env } from "./types";
  */
 
 export interface Settings {
+  publicUrl: string;
   allowAnonymous: boolean;
   allowCustomHost: boolean;
   forceTemporaryHost: boolean;
   allowRegistration: boolean;
-  allowUserSettings: boolean;
   autoRotateSeconds: number;
   quotaBytes: number;
   quotaRequests: number;
@@ -23,11 +23,11 @@ export interface Settings {
 }
 
 export const DEFAULT_ANONYMOUS_SETTINGS: Settings = {
+  publicUrl: "",
   allowAnonymous: true,
   allowCustomHost: false,
   forceTemporaryHost: false,
   allowRegistration: false,
-  allowUserSettings: true,
   autoRotateSeconds: 6 * 60 * 60,
   quotaBytes: 256 * 1024 * 1024,
   quotaRequests: 5000,
@@ -37,11 +37,11 @@ export const DEFAULT_ANONYMOUS_SETTINGS: Settings = {
 };
 
 export const DEFAULT_USER_SETTINGS: Settings = {
+  publicUrl: "",
   allowAnonymous: true,
   allowCustomHost: true,
   forceTemporaryHost: false,
   allowRegistration: false,
-  allowUserSettings: true,
   autoRotateSeconds: 24 * 60 * 60,
   quotaBytes: 0,
   quotaRequests: 0,
@@ -794,6 +794,19 @@ function coerceNumber(value: unknown, fallback: number): number {
   return Math.floor(num);
 }
 
+export function normalizePublicUrl(value: unknown): string {
+  let raw = String(value ?? "").trim();
+  if (!raw) return "";
+  if (!/^[a-z][a-z0-9+.-]*:\/\//i.test(raw)) raw = `https://${raw}`;
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return "";
+    return url.origin;
+  } catch {
+    return "";
+  }
+}
+
 function coerceSettings(raw: Record<string, unknown> | null, defaults: Settings): Settings {
   const source = raw && typeof raw === "object" ? raw : {};
   const bool = (key: keyof Settings, fallback: boolean) =>
@@ -801,11 +814,11 @@ function coerceSettings(raw: Record<string, unknown> | null, defaults: Settings)
   const num = (key: keyof Settings, fallback: number) =>
     coerceNumber(source[key], fallback);
   return {
+    publicUrl: typeof source.publicUrl === "string" ? normalizePublicUrl(source.publicUrl) : defaults.publicUrl,
     allowAnonymous: bool("allowAnonymous", defaults.allowAnonymous),
     allowCustomHost: bool("allowCustomHost", defaults.allowCustomHost),
     forceTemporaryHost: bool("forceTemporaryHost", defaults.forceTemporaryHost),
     allowRegistration: bool("allowRegistration", defaults.allowRegistration),
-    allowUserSettings: bool("allowUserSettings", defaults.allowUserSettings),
     autoRotateSeconds: num("autoRotateSeconds", defaults.autoRotateSeconds),
     quotaBytes: num("quotaBytes", defaults.quotaBytes),
     quotaRequests: num("quotaRequests", defaults.quotaRequests),

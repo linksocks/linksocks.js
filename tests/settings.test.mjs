@@ -57,13 +57,13 @@ test("administrator can enable and disable policy checkboxes", { timeout: 20000 
     assert.equal(response.status, 303);
   }
 
-  await save({ allowAnonymous: "1", allowRegistration: "1", allowUserSettings: "1", allowCustomHost: "1" });
+  await save({ allowAnonymous: "1", allowRegistration: "1", allowCustomHost: "1" });
   assert.equal((await worker.dispatchFetch("http://localhost/register")).status, 200);
 
   await save({});
   const disabled = await worker.dispatchFetch("http://localhost/admin?tab=settings", { headers });
   const updated = await disabled.text();
-  for (const name of ["allowAnonymous", "allowRegistration", "allowUserSettings", "allowCustomHost"]) {
+  for (const name of ["allowAnonymous", "allowRegistration", "allowCustomHost"]) {
     assert.equal(new RegExp(`name="${name}" value="1"\\s+checked`).test(updated), false, `${name} should be disabled`);
   }
   assert.equal((await worker.dispatchFetch("http://localhost/register")).status, 403);
@@ -95,4 +95,25 @@ test("administrator can enable and disable policy checkboxes", { timeout: 20000 
   const updatedUser = await worker.dispatchFetch(`http://localhost/admin?tab=users&user=${userId}`, { headers });
   const updatedUserHtml = await updatedUser.text();
   assert.ok(/name="quotaBytes"[^>]*value="2048"/.test(updatedUserHtml), "user quota must be saved");
+
+  await save({ publicUrl: "relay.example.com" });
+  const publicHome = await (await worker.dispatchFetch("http://localhost/")).text();
+  assert.ok(
+    publicHome.includes("linksocks provider -u https://relay.example.com"),
+    "the configured primary URL must replace the request origin in quick start commands",
+  );
+  await save({});
+
+  const dashboard = await worker.dispatchFetch("http://localhost/dashboard?tab=settings", { headers });
+  const dashboardHtml = await dashboard.text();
+  assert.equal(dashboardHtml.includes('id="settingsForm"'), false, "regular users must not edit quotas or limits");
+  assert.ok(dashboardHtml.includes("<h2>Overview</h2>"));
+
+  const users = await (await worker.dispatchFetch("http://localhost/admin?tab=users", { headers })).text();
+  assert.ok(users.includes("modal=password"), "password changes must open in a dialog");
+  assert.ok(users.includes("modal=policy"), "policy changes must open in a dialog");
+  assert.equal(users.includes("user-create-token"), false, "user management no longer creates tokens inline");
+
+  const reservations = await (await worker.dispatchFetch("http://localhost/admin?tab=reservations", { headers })).text();
+  assert.ok(reservations.includes('role="combobox"'), "reservation owner must be a searchable combobox");
 });

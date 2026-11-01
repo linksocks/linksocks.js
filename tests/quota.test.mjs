@@ -150,7 +150,7 @@ test("a single Web response cannot exceed the byte quota", { timeout: 20000 }, a
     redirect: "manual",
     headers: { Cookie: session },
     body: new URLSearchParams({
-      csrf, action: "saveSettings", scope: "global", allowAnonymous: "1", allowUserSettings: "1",
+      csrf, action: "saveSettings", scope: "global", allowAnonymous: "1",
       quotaBytes: "1024", quotaRequests: "0",
     }),
   });
@@ -213,7 +213,7 @@ test("anonymous SOCKS and Web traffic share the same byte quota", { timeout: 200
   const saved = await worker.dispatchFetch("http://localhost/admin/action", {
     method: "POST", redirect: "manual", headers: { Cookie: session },
     body: new URLSearchParams({
-      csrf, action: "saveSettings", scope: "global", allowAnonymous: "1", allowUserSettings: "1",
+      csrf, action: "saveSettings", scope: "global", allowAnonymous: "1",
       quotaBytes: "1024", quotaRequests: "0",
     }),
   });

@@ -26,7 +26,6 @@ import {
   deleteSession,
   deleteSite,
   deleteUser,
-  effectiveSettings,
   ensureSchema,
   findUserById,
   findUserByUsername,
@@ -42,6 +41,7 @@ import {
   listTokens,
   listUsers,
   normalizeHost,
+  normalizePublicUrl,
   parseCookies,
   revokeToken,
   saveAnonymousSettings,
@@ -120,11 +120,11 @@ function parseSettingsForm(form: FormData, current: Settings): Settings {
     return Math.floor(value);
   };
   return {
+    publicUrl: global ? normalizePublicUrl(form.get("publicUrl")) : current.publicUrl,
     allowAnonymous: global ? checked("allowAnonymous") : current.allowAnonymous,
     allowCustomHost: checked("allowCustomHost"),
     forceTemporaryHost: global ? checked("forceTemporaryHost") : current.forceTemporaryHost,
     allowRegistration: global ? checked("allowRegistration") : current.allowRegistration,
-    allowUserSettings: global ? checked("allowUserSettings") : current.allowUserSettings,
     autoRotateSeconds: num("autoRotateSeconds", current.autoRotateSeconds),
     quotaBytes: num("quotaBytes", current.quotaBytes),
     quotaRequests: num("quotaRequests", current.quotaRequests),
@@ -357,6 +357,10 @@ export async function handleAdmin(request: Request, env: Env, url: URL): Promise
   const selectedUserSettings = selectedUser
     ? await getUserSettings(env, selectedUser.id)
     : undefined;
+  const modalParam = url.searchParams.get("modal") || "";
+  const userModal = selectedUser && ["password", "access", "policy", "delete"].includes(modalParam)
+    ? (modalParam as AdminPageData["userModal"])
+    : undefined;
 
   const data: AdminPageData = {
     user: { username: context.user.username },
@@ -368,9 +372,11 @@ export async function handleAdmin(request: Request, env: Env, url: URL): Promise
     reservations: reservationViews,
     overview: buildOverview(users, sites, tokens, siteViews),
     globalSettings,
+    serverUrl: globalSettings.publicUrl || url.origin,
     zone: normalizeHost(env.WEB_ZONE || env.BASE_HOST || ""),
     selectedUser,
     selectedUserSettings,
+    userModal,
     flash: readFlash(request),
   };
 
@@ -426,7 +432,7 @@ async function handleAdminAction(
         isAdmin: nextAdmin,
         disabled: nextDisabled,
       });
-      return redirectWithFlash(`${back}?tab=users&user=${encodeURIComponent(userId)}`, {
+      return redirectWithFlash(`${back}?tab=users`, {
         kind: "ok",
         message: `User ${target.username} updated.`,
       });
@@ -493,11 +499,15 @@ async function handleAdminAction(
 
     if (action === "createReservation") {
       const host = normalizeHost(String(form.get("host") || ""));
-      const userId = String(form.get("userId") || "");
+      let userId = String(form.get("userId") || "");
+      const requestedName = String(form.get("userName") || "").trim().toLowerCase();
+      if (!userId && requestedName) {
+        userId = (await listUsers(env)).find((row) => row.username === requestedName)?.id || "";
+      }
       const note = String(form.get("note") || "").trim().slice(0, 200);
       const user = await findUserById(env, userId);
       if (!user) {
-        return redirectWithFlash(`${back}?tab=reservations`, { kind: "error", message: "User not found." });
+        return redirectWithFlash(`${back}?tab=reservations`, { kind: "error", message: "Select an owner from the account list." });
       }
       if (!host || !isValidHostname(host)) {
         return redirectWithFlash(`${back}?tab=reservations`, { kind: "error", message: "Enter a valid hostname." });
@@ -550,6 +560,13 @@ async function handleAdminAction(
     if (action === "saveSettings") {
       const scope = String(form.get("scope") || "global");
       if (scope === "global") {
+        const enteredUrl = String(form.get("publicUrl") || "").trim();
+        if (enteredUrl && !normalizePublicUrl(enteredUrl)) {
+          return redirectWithFlash(`${back}?tab=settings`, {
+            kind: "error",
+            message: "Primary connection URL must be an http(s) origin, for example https://relay.example.com.",
+          });
+        }
         const current = await getAnonymousSettings(env);
         await saveAnonymousSettings(env, parseSettingsForm(form, current));
         return redirectWithFlash(`${back}?tab=settings`, { kind: "ok", message: "Global policy saved." });
@@ -559,7 +576,7 @@ async function handleAdminAction(
       if (!user) return redirectWithFlash(`${back}?tab=users`, { kind: "error", message: "User not found." });
       const current = await getUserSettings(env, userId);
       await saveUserSettings(env, userId, parseSettingsForm(form, current));
-      return redirectWithFlash(`${back}?tab=users&user=${encodeURIComponent(userId)}`, {
+      return redirectWithFlash(`${back}?tab=users`, {
         kind: "ok",
         message: `Policy for ${user.username} saved.`,
       });
@@ -646,15 +663,14 @@ export async function handleDashboard(request: Request, env: Env, url: URL): Pro
   }
 
   const tabParam = url.searchParams.get("tab") || "overview";
-  const tab = (["overview", "sites", "tokens", "settings"].includes(tabParam)
+  const tab = (["overview", "sites", "tokens"].includes(tabParam)
     ? tabParam
     : "overview") as DashboardPageData["tab"];
 
-  const [allSites, allTokens, global, userSettings] = await Promise.all([
+  const [allSites, allTokens, global] = await Promise.all([
     listSites(env, context.user.id),
     listTokens(env, context.user.id),
     getAnonymousSettings(env),
-    effectiveSettings(env, context.user),
   ]);
   const usersById = new Map([[context.user.id, context.user]]);
   const live = await loadLiveInfo(env, allSites);
@@ -668,8 +684,7 @@ export async function handleDashboard(request: Request, env: Env, url: URL): Pro
     sites: siteViews,
     tokens: tokenViews,
     overview: buildOverview([context.user], allSites, allTokens, siteViews),
-    settings: userSettings,
-    allowUserSettings: global.allowUserSettings,
+    serverUrl: global.publicUrl || url.origin,
     flash: readFlash(request),
   };
 
@@ -724,19 +739,6 @@ async function handleDashboardAction(
       await deleteSite(env, host);
       await disconnectHost(env, site.relay_id, host);
       return redirectWithFlash(`${back}?tab=sites`, { kind: "ok", message: `Site ${host} deleted.` });
-    }
-
-    if (action === "saveSettings") {
-      const global = await getAnonymousSettings(env);
-      if (!global.allowUserSettings) {
-        return redirectWithFlash(`${back}?tab=settings`, {
-          kind: "error",
-          message: "Per-user policy editing is disabled by the administrator.",
-        });
-      }
-      const current = await getUserSettings(env, context.user.id);
-      await saveUserSettings(env, context.user.id, parseSettingsForm(form, current));
-      return redirectWithFlash(`${back}?tab=settings`, { kind: "ok", message: "Your policy has been saved." });
     }
 
     return redirectWithFlash(back, { kind: "error", message: `Unknown action: ${action}` });

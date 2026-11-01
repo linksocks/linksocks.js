@@ -3,7 +3,7 @@ import zxcvbn from "zxcvbn";
 
 import { handleErrors } from "./common";
 import { AuthResponseMessage, packMessage, MessageType } from "./message";
-import { formatBytes, getSite, normalizeHost } from "./db";
+import { formatBytes, getAnonymousSettings, getSite, normalizeHost } from "./db";
 import { ensureSchema } from "./db";
 import { handleAdmin, handleDashboard, handleRegister } from "./panel";
 import { renderErrorPage, renderExpiredPage } from "./ui";
@@ -217,6 +217,15 @@ export default {
         } catch {
           usage = null;
         }
+        let publicUrl = "";
+        if (env.DB) {
+          try {
+            publicUrl = (await getAnonymousSettings(env)).publicUrl;
+          } catch {
+            publicUrl = "";
+          }
+        }
+        const relayUrl = publicUrl || url.origin;
 
         const html = `
 <!DOCTYPE html>
@@ -817,14 +826,14 @@ export default {
             </ol>
 
             <p class="cmdLabel">Provider</p>
-            <div class="cmd" data-copy="linksocks provider -u ${url.origin} -c your_connector_token">
-              <pre>linksocks provider -u ${url.origin} -c your_connector_token</pre>
+            <div class="cmd" data-copy="linksocks provider -u ${relayUrl} -c your_connector_token">
+              <pre>linksocks provider -u ${relayUrl} -c your_connector_token</pre>
               <button class="copyBtn" type="button" aria-label="Copy provider command" data-copy-btn>Copy</button>
             </div>
 
             <p class="cmdLabel" style="margin-top: 24px">Connector</p>
-            <div class="cmd" data-copy="linksocks connector -u ${url.origin} -t your_connector_token">
-              <pre>linksocks connector -u ${url.origin} -t your_connector_token</pre>
+            <div class="cmd" data-copy="linksocks connector -u ${relayUrl} -t your_connector_token">
+              <pre>linksocks connector -u ${relayUrl} -t your_connector_token</pre>
               <button class="copyBtn" type="button" aria-label="Copy connector command" data-copy-btn>Copy</button>
             </div>
           </div>
@@ -839,9 +848,9 @@ export default {
                 <div class="metaKey">Visitor Region</div>
                 <div class="metaVal">${String(request.cf?.country || "-")}</div>
               </div>
-              <div class="metaRow" data-copy="${url.origin}">
+              <div class="metaRow" data-copy="${relayUrl}">
                 <div class="metaKey">URL</div>
-                <div class="metaVal" title="${url.origin}">${url.origin}</div>
+                <div class="metaVal" title="${relayUrl}">${relayUrl}</div>
                 <button class="copyBtn" type="button" aria-label="Copy endpoint URL" data-copy-btn>Copy</button>
               </div>
             </div>
