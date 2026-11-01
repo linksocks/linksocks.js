@@ -470,7 +470,7 @@ ${opts.bare ? opts.content : `<div class="wrap">
       <div>
         <div class="eyebrow">LinkSocks</div>
         <h1>${escapeHtml(opts.title)}</h1>
-        <div class="sub">${escapeHtml(opts.subtitle || "Web proxy control plane")}</div>
+        <div class="sub">${escapeHtml(opts.subtitle || "Relay and site control plane")}</div>
       </div>
     </div>
     <div class="actions">
@@ -480,7 +480,7 @@ ${opts.bare ? opts.content : `<div class="wrap">
   </div>
   ${nav ? `<div class="nav">${nav}</div>` : ""}
   <div class="section">${opts.content}</div>
-  <footer><span>LinkSocks.js · Web reverse proxy · D1 control plane</span><span><a href="/">Home</a> · <a href="/dashboard">Dashboard</a></span></footer>
+  <footer><span>LinkSocks.js · Relay and site control plane · D1</span><span><a href="/">Home</a> · <a href="/dashboard">Dashboard</a></span></footer>
 </div>`}
 <script>
 (function(){
@@ -667,10 +667,10 @@ export function renderLoginPage(opts: {
         <h1>${escapeHtml(opts.title)}</h1>
         <div class="sub">${
           isRegister
-            ? "Register to create tokens, publish sites and track your own traffic."
+            ? "Register to create relay tokens, publish sites and track your own traffic."
             : opts.admin
-              ? "Manage users, sites and anonymous quotas."
-              : "View your sites, tokens and traffic."
+              ? "Manage relay tokens, site providers, users and quotas."
+              : "View your relay tokens, site providers and traffic."
         }</div>
         ${opts.error ? `<div class="flash error">${escapeHtml(opts.error)}</div>` : ""}
         <form method="POST" action="${escapeHtml(opts.action)}">
@@ -716,17 +716,17 @@ function settingsForm(opts: {
     </div>`;
   };
   const toggles = [
-    opts.global ? check("allowAnonymous", "Allow anonymous providers", s.allowAnonymous, "Providers without a token can publish sites.") : "",
+    opts.global ? check("allowAnonymous", "Allow anonymous site providers", s.allowAnonymous, "Site providers without a token can publish a hostname.") : "",
     opts.global ? check("allowRegistration", "Allow self-registration", s.allowRegistration, "Anyone can create an account from /register.") : "",
-    check("allowCustomHost", "Allow custom hostnames", s.allowCustomHost, "Requires a hostname under WEB_ZONE."),
-    opts.global ? check("forceTemporaryHost", "Force temporary hostnames", s.forceTemporaryHost, "Ignores requested hostnames and applies to registered accounts too. Every provider gets a fresh URL on connect.") : "",
+    check("allowCustomHost", "Allow custom site hostnames", s.allowCustomHost, "Site providers may request a hostname under WEB_ZONE."),
+    opts.global ? check("forceTemporaryHost", "Force temporary site hostnames", s.forceTemporaryHost, "Ignores requested hostnames for site providers, including registered accounts. Every site connection gets a fresh URL.") : "",
   ].filter(Boolean).join("");
   const connection = opts.global
     ? `<h3 class="form-title">Connection</h3>
         <div class="form-grid">
           <div class="field span-2"><label for="publicUrl">Primary connection URL</label>
             <input id="publicUrl" name="publicUrl" type="text" inputmode="url" value="${escapeHtml(s.publicUrl)}" placeholder="relay.example.com or https://relay.example.com"/>
-            <div class="hint">Used in the homepage quick start, CLI examples and the endpoint panel. Leave blank to use the host this request arrived on.</div>
+            <div class="hint">Used for relay and site commands, the homepage and the endpoint panel. Leave blank to use the host this request arrived on.</div>
           </div>
         </div>`
     : "";
@@ -740,15 +740,15 @@ function settingsForm(opts: {
         <div class="toggle-grid">${toggles}</div>
         <h3 class="form-title">Limits</h3>
         <div class="form-grid">
-          ${num("maxSites", "Max sites", s.maxSites, "Per owner / per anonymous token.")}
-          ${num("maxBackends", "Max backends", s.maxBackends, "Per provider registration.")}
-          ${quantity("autoRotateSeconds", "Temporary URL lifetime", s.autoRotateSeconds, DURATION_UNITS, "0 disables automatic expiry.")}
+          ${num("maxSites", "Max sites", s.maxSites, "Per account / per anonymous site token.")}
+          ${num("maxBackends", "Max backends", s.maxBackends, "Origin servers per site provider registration.")}
+          ${quantity("autoRotateSeconds", "Temporary site URL lifetime", s.autoRotateSeconds, DURATION_UNITS, "How long a temporary site hostname stays valid. 0 disables automatic expiry.")}
         </div>
         <h3 class="form-title">Quotas</h3>
         <div class="form-grid">
-          ${quantity("quotaBytes", "Total transfer quota", s.quotaBytes, BYTE_UNITS, `Lifetime cap per account or anonymous token; request and response bytes count. ${s.quotaBytes ? `Currently ${formatBytes(s.quotaBytes)}.` : "0 = unlimited."}`)}
-          ${num("quotaRequests", "Total request quota", s.quotaRequests, "Lifetime cap. 0 = unlimited.")}
-          ${quantity("quotaDurationSeconds", "Site duration", s.quotaDurationSeconds, DURATION_UNITS, "0 = no duration limit.")}
+          ${quantity("quotaBytes", "Total transfer quota", s.quotaBytes, BYTE_UNITS, `Shared lifetime cap for relay and site traffic per account or anonymous token; request and response bytes count. ${s.quotaBytes ? `Currently ${formatBytes(s.quotaBytes)}.` : "0 = unlimited."}`)}
+          ${num("quotaRequests", "Total request quota", s.quotaRequests, "Shared lifetime cap for relay and site requests. 0 = unlimited.")}
+          ${quantity("quotaDurationSeconds", "Site duration", s.quotaDurationSeconds, DURATION_UNITS, "Maximum lifetime of a published site. 0 = no duration limit.")}
         </div>
         ${!opts.global && s.forceTemporaryHost ? `<div class="note" style="margin-bottom:16px"><div><strong>Forced temporary hostnames are enabled</strong> by the administrator. Custom hostnames are ignored while this policy is active.</div></div>` : ""}
         <div class="${opts.modal ? "modal-actions" : "form-actions"}"><button class="btn primary" type="submit">${opts.modal ? "Save policy" : "Save settings"}</button></div>
@@ -766,7 +766,7 @@ function sitesTable(sites: SiteView[], opts: { csrf: string; action: string; adm
     return `<div class="empty">
       <div class="empty-icon">◌</div>
       <strong>No sites yet</strong>
-      <div class="sub">Publish one with the CLI. It will appear here after the provider connects.</div>
+      <div class="sub">Publish one with the CLI. It will appear here after the site provider connects.</div>
       <div class="empty-command">linksocks web -u ${escapeHtml(server)} -l http://127.0.0.1:8080</div>
     </div>`;
   }
@@ -803,7 +803,7 @@ function sitesTable(sites: SiteView[], opts: { csrf: string; action: string; adm
         <td>
           <div class="actions">
             ${reserveButton}
-            <form method="POST" action="${escapeHtml(opts.action)}" class="actions" data-confirm="Delete this site mapping? The provider will be disconnected.">
+            <form method="POST" action="${escapeHtml(opts.action)}" class="actions" data-confirm="Delete this site mapping? All site providers for this hostname will be disconnected.">
               <input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}"/>
               <input type="hidden" name="action" value="deleteSite"/>
               <input type="hidden" name="host" value="${escapeHtml(site.host)}"/>
@@ -848,7 +848,7 @@ function tokensTable(tokens: TokenView[], opts: { csrf: string; action: string; 
     return `<div class="empty">
       <div class="empty-icon">⌁</div>
       <strong>No tokens yet</strong>
-      <div class="sub">${opts.admin ? "Tokens created by users appear here. Create one from a user's page." : "Create a token to bind providers to your account and keep their sites after reconnects."}</div>
+      <div class="sub">${opts.admin ? "Tokens created by users appear here. Create one from a user's page." : "Create a token to bind relay and site providers to your account."}</div>
     </div>`;
   }
   const rows = tokens
@@ -879,7 +879,7 @@ function reservationsTable(reservations: ReservationView[], opts: { csrf: string
     return `<div class="empty">
       <div class="empty-icon">◈</div>
       <strong>No reservations</strong>
-      <div class="sub">Reserve a hostname to keep it bound to one account while its provider is offline. The reservation is invisible to users.</div>
+      <div class="sub">Reserve a hostname to keep it bound to one account while its site provider is offline. The reservation is invisible to users.</div>
     </div>`;
   }
   const rows = reservations
@@ -966,14 +966,14 @@ export function renderAdminPage(data: AdminPageData): string {
 
   let content = data.flash?.token ? "" : flashHtml(data.flash);
   if (data.tab === "overview") {
-    content += pageHead("Overview", "A live snapshot of accounts, published sites and traffic. Request and transfer figures cover the current UTC day.");
+    content += pageHead("Overview", "A live snapshot of accounts, relay tokens, site providers and traffic. Request and transfer figures cover the current UTC day.");
     content += `<div class="stats">
       ${statCard("Users", data.overview.users, "registered accounts")}
       ${statCard("Sites", data.overview.sites, `${data.overview.onlineSites} online now`)}
-      ${statCard("Live providers", data.overview.providers, "connected providers")}
+      ${statCard("Live site providers", data.overview.providers, "connected site providers")}
       ${statCard("Requests", data.overview.requests.toLocaleString(), "today UTC")}
       ${statCard("Transfer", formatBytes(data.overview.bytes), "today UTC")}
-      ${statCard("Tokens", data.overview.tokens, "active provider tokens")}
+      ${statCard("Tokens", data.overview.tokens, "active tokens")}
     </div>
     <div class="section two-col">
       <div class="panel">
@@ -984,10 +984,10 @@ export function renderAdminPage(data: AdminPageData): string {
         <div class="panel-head"><h2>Anonymous policy</h2><a class="btn small ghost" href="/admin?tab=settings">Edit</a></div>
         <div class="panel-body">
           <div class="policy">
-            <div class="policy-row"><span>Anonymous access</span><b>${data.globalSettings.allowAnonymous ? "enabled" : "disabled"}</b></div>
-            <div class="policy-row"><span>Custom hostnames</span><b>${data.globalSettings.allowCustomHost ? "allowed" : "blocked"}</b></div>
-            <div class="policy-row"><span>Forced temporary hosts</span><b>${data.globalSettings.forceTemporaryHost ? "enabled" : "off"}</b></div>
-            <div class="policy-row"><span>Temporary URL lifetime</span><b>${formatDuration(data.globalSettings.autoRotateSeconds * 1000)}</b></div>
+            <div class="policy-row"><span>Anonymous site access</span><b>${data.globalSettings.allowAnonymous ? "enabled" : "disabled"}</b></div>
+            <div class="policy-row"><span>Custom site hostnames</span><b>${data.globalSettings.allowCustomHost ? "allowed" : "blocked"}</b></div>
+            <div class="policy-row"><span>Forced temporary site hosts</span><b>${data.globalSettings.forceTemporaryHost ? "enabled" : "off"}</b></div>
+            <div class="policy-row"><span>Temporary site URL lifetime</span><b>${formatDuration(data.globalSettings.autoRotateSeconds * 1000)}</b></div>
             <div class="policy-row"><span>Total transfer quota</span><b>${data.globalSettings.quotaBytes ? `${formatBytes(data.globalSettings.quotaBytes)} total` : "unlimited"}</b></div>
             <div class="policy-row"><span>Total request quota</span><b>${data.globalSettings.quotaRequests ? `${data.globalSettings.quotaRequests.toLocaleString()} total` : "unlimited"}</b></div>
           </div>
@@ -1069,7 +1069,7 @@ export function renderAdminPage(data: AdminPageData): string {
           <input type="hidden" name="action" value="updateUser"/>
           <input type="hidden" name="userId" value="${escapeHtml(selected.id)}"/>
           <label class="check"><input type="checkbox" name="isAdmin" value="1" ${selected.isAdmin ? "checked" : ""}/><span class="check-body"><span class="check-label">Administrator</span><span class="hint">Can manage users, sites, reservations and global policy.</span></span></label>
-          <label class="check"><input type="checkbox" name="disabled" value="1" ${selected.disabled ? "checked" : ""}/><span class="check-body"><span class="check-label">Disabled</span><span class="hint">Blocks sign-in and rejects this account's provider tokens.</span></span></label>
+          <label class="check"><input type="checkbox" name="disabled" value="1" ${selected.disabled ? "checked" : ""}/><span class="check-body"><span class="check-label">Disabled</span><span class="hint">Blocks sign-in and rejects this account's relay and site provider tokens.</span></span></label>
           <div class="modal-actions">
             <button type="button" class="btn danger danger-left" data-open="user-delete">Delete account</button>
             <button type="button" class="btn" data-close>Cancel</button>
@@ -1118,10 +1118,10 @@ export function renderAdminPage(data: AdminPageData): string {
     content += pageHead("Sites", "Every published hostname, its owner, origins and today's traffic. Reserved hosts stay bound to their owner while offline.");
     content += `<div class="panel"><div class="panel-head"><h2>${data.sites.length} site${data.sites.length === 1 ? "" : "s"}</h2></div><div class="panel-body flush">${sitesTable(data.sites, { csrf: data.csrf, action: "/admin/action", admin: true, serverUrl: data.serverUrl })}</div></div>`;
   } else if (data.tab === "tokens") {
-    content += pageHead("Tokens", "Provider tokens are bound to the account that created them. Raw tokens are shown only once.");
+    content += pageHead("Tokens", "Tokens bind relay and site providers to the account that created them. Raw tokens are shown only once.");
     content += `<div class="panel"><div class="panel-head"><h2>${data.tokens.length} token${data.tokens.length === 1 ? "" : "s"}</h2></div><div class="panel-body flush">${tokensTable(data.tokens, { csrf: data.csrf, action: "/admin/action", admin: true })}</div></div>`;
   } else if (data.tab === "reservations") {
-    content += pageHead("Reservations", "Admin-only hostname holds. A reservation keeps a name bound to one account while its provider is offline, and is invisible on the user side.");
+    content += pageHead("Reservations", "Admin-only hostname holds. A reservation keeps a name bound to one account while its site provider is offline, and is invisible on the user side.");
     content += `<div class="two-col">
       <div class="panel">
         <div class="panel-head"><h2>${data.reservations.length} reservation${data.reservations.length === 1 ? "" : "s"}</h2></div>
@@ -1143,14 +1143,14 @@ export function renderAdminPage(data: AdminPageData): string {
       </div>
     </div>`;
   } else {
-    content += pageHead("Settings", "Global defaults for anonymous providers. Registered accounts keep their own limits; force-temporary mode is global.");
+    content += pageHead("Settings", "Global defaults for anonymous relay traffic and site providers. Registered accounts keep their own limits; force-temporary mode applies to every site provider.");
     content += settingsForm({
       action: "/admin/action",
       csrf: data.csrf,
       settings: data.globalSettings,
       global: true,
       title: "Global anonymous policy",
-      description: "Defaults for providers that connect without a registered token.",
+      description: "Defaults for anonymous relay traffic and site providers that connect without a registered token.",
     });
   }
 
@@ -1170,7 +1170,7 @@ function createTokenDialog(csrf: string, serverUrl: string): string {
   return modalDialog({
     id: "create-token",
     title: "Create token",
-    subtitle: `Used by the provider CLI with ${serverUrl}.`,
+    subtitle: `Used by relay and site providers with ${serverUrl}.`,
     body: `<form method="POST" action="/dashboard/action">
       <input type="hidden" name="csrf" value="${escapeHtml(csrf)}"/>
       <input type="hidden" name="action" value="createToken"/>
@@ -1202,13 +1202,13 @@ export function renderDashboardPage(data: DashboardPageData): string {
   }
   let content = data.flash?.token ? "" : flashHtml(data.flash);
   if (data.tab === "overview") {
-    content += pageHead("Overview", "Your sites, origins and today's traffic.");
+    content += pageHead("Overview", "Your relay tokens, site providers and today's traffic.");
     content += `<div class="stats">
       ${statCard("My sites", data.overview.sites, `${data.overview.onlineSites} online now`)}
-      ${statCard("Live providers", data.overview.providers, "connected providers")}
+      ${statCard("Live site providers", data.overview.providers, "connected site providers")}
       ${statCard("Requests", data.overview.requests.toLocaleString(), "today UTC")}
       ${statCard("Transfer", formatBytes(data.overview.bytes), "today UTC")}
-      ${statCard("Tokens", data.overview.tokens, "provider tokens")}
+      ${statCard("Tokens", data.overview.tokens, "active tokens")}
     </div>
     <div class="section panel">
       <div class="panel-head"><h2>My sites</h2><a class="btn small ghost" href="/dashboard?tab=sites">View all</a></div>
@@ -1218,10 +1218,11 @@ export function renderDashboardPage(data: DashboardPageData): string {
     content += pageHead("My sites", "Each site can have multiple origins behind one hostname. Temporary hosts expire automatically.");
     content += `<div class="panel"><div class="panel-head"><h2>${data.sites.length} site${data.sites.length === 1 ? "" : "s"}</h2></div><div class="panel-body flush">${sitesTable(data.sites, { csrf: data.csrf, action: "/dashboard/action", admin: false, serverUrl: data.serverUrl })}</div></div>`;
   } else if (data.tab === "tokens") {
-    content += pageHead("Tokens", "Tokens bind providers to your account. Keep them private.");
+    content += pageHead("Tokens", "Tokens bind relay and site providers to your account. Keep them private.");
     content += `<div class="panel">
       <div class="panel-head">
-        <div><h2>${data.tokens.length} token${data.tokens.length === 1 ? "" : "s"}</h2><div class="sub">Use one with <span class="mono">linksocks web -u ${escapeHtml(data.serverUrl)} -t &lt;token&gt;</span>.</div></div>
+        <div><h2>${data.tokens.length} token${data.tokens.length === 1 ? "" : "s"}</h2><div class="sub">Relay: <span class="mono">linksocks provider -u ${escapeHtml(data.serverUrl)} -t &lt;token&gt;</span></div>
+        <div class="sub">Site: <span class="mono">linksocks web -u ${escapeHtml(data.serverUrl)} -l http://127.0.0.1:8080 -t &lt;token&gt;</span></div></div>
         <div class="panel-tools"><button class="btn primary" type="button" data-open="create-token">Create token</button></div>
       </div>
       <div class="panel-body flush">${tokensTable(data.tokens, { csrf: data.csrf, action: "/dashboard/action", admin: false })}</div>
@@ -1231,7 +1232,7 @@ export function renderDashboardPage(data: DashboardPageData): string {
   }
   return layout({
     title: "My dashboard",
-    subtitle: "Your web proxy sites, origins and traffic",
+    subtitle: "Your relay access, site providers and traffic",
     nav,
     userLabel: data.user.username,
     logoutAction: "/dashboard?logout",
@@ -1255,7 +1256,7 @@ export function renderErrorPage(title: string, message: string, code = "Error"):
 export function renderExpiredPage(host: string, expiresAt: number | null): string {
   return renderErrorPage(
     "This temporary URL has expired",
-    `${host} expired${expiresAt ? ` at ${formatDate(expiresAt)}` : ""}. Restart or re-register the provider to receive a new hostname.`,
+    `${host} expired${expiresAt ? ` at ${formatDate(expiresAt)}` : ""}. Restart or re-register the site provider to receive a new hostname.`,
     "410",
   );
 }

@@ -204,9 +204,9 @@ linksocks web -u wss://linksocks.example.com -t ls_xxx \
 - Tokens created in `/dashboard` bind any provider that connects with
   `-t <token>` to that account. The UI shows ownership, temporary badges,
   expiry countdowns, origin counts and live provider counts.
-- Administrators can edit anonymous access, custom hostname allowance,
-  registration, and whether users may edit their own policy; per-user overrides
-  live on the user detail page.
+- Administrators can edit anonymous site publishing, custom hostname
+  allowance, registration, and whether users may edit their own policy;
+  per-user overrides live on the user detail page.
 
 ### Hostname Holds and Reservations
 

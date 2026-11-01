@@ -195,7 +195,7 @@ linksocks web -u wss://linksocks.example.com -t ls_xxx \
 - `/register`：用户自助注册，受全局设置 `allowRegistration` 控制。
 - 用户在 `/dashboard` 生成 Token 后，用 `-t <token>` 运行的 Provider 会自动绑定到该账号；
   面板中会显示站点归属、临时域名徽章、到期倒计时、源站数量与在线 Provider 数量。
-- 管理员可以在“Settings”中配置匿名访问开关、是否允许自定义域名、是否允许用户注册、
+- 管理员可以在“Settings”中配置匿名站点发布开关、是否允许自定义域名、是否允许用户注册、
   主连接域名以及全局配额；用户策略、改密和账户访问权限都在 `/admin?tab=users`
   的独立弹窗中管理，普通用户面板只保留站点、令牌和流量。
 

@@ -67,7 +67,6 @@ interface NetworkQuota {
   principal: string;
   bytes: number;
   requests: number;
-  allowed: boolean;
 }
 
 interface WebPending {
@@ -1073,10 +1072,10 @@ export class Relay extends DurableObject {
             }
 
             const quota = await this.getNetworkQuota(provider);
-            if (quota && (!quota.allowed || !await consumeQuota(this.env, quota.principal, 0, 1, quota.bytes, quota.requests))) {
+            if (quota && !await consumeQuota(this.env, quota.principal, 0, 1, quota.bytes, quota.requests)) {
               const response: ConnectResponseMessage = {
                 success: false,
-                error: quota.allowed ? "Quota exceeded" : "Anonymous providers are disabled",
+                error: "Quota exceeded",
                 channelId: connectMsg.channelId,
                 getType: () => MessageType.ConnectResponse,
               };
@@ -1338,7 +1337,6 @@ export class Relay extends DurableObject {
       principal: user ? `user:${user.id}` : `anonymous:${tokenKey}`,
       bytes: settings.quotaBytes,
       requests: settings.quotaRequests,
-      allowed: Boolean(user) || settings.allowAnonymous,
     };
   }
 
@@ -1362,10 +1360,6 @@ export class Relay extends DurableObject {
     if (this.env.DB && !meta.quotaPrincipal) {
       const quota = await this.getNetworkQuota(provider);
       if (quota) {
-        if (!quota.allowed) {
-          this.disconnectChannel(data.channelId);
-          return;
-        }
         meta = this.safeDeserializeAttachment(provider);
         meta.quotaPrincipal = quota.principal;
         meta.quotaBytes = quota.bytes;

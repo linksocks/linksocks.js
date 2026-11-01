@@ -263,6 +263,37 @@ test("anonymous SOCKS and Web traffic share the same byte quota", { timeout: 200
   connector.socket.send(networkDataFrame(networkChannel, new Uint8Array(1)));
   assert.equal((await connector.next(0x06))[1], 0x06);
   assert.equal((await siteRequest(await worker.ready, registration.host)).status, 429);
+
+  // Anonymous site publishing is a site-provider policy; the relay core must
+  // keep accepting anonymous SOCKS providers when it is disabled.
+  const disabled = await worker.dispatchFetch("http://localhost/admin/action", {
+    method: "POST", redirect: "manual", headers: { Cookie: session },
+    body: new URLSearchParams({ csrf, action: "saveSettings", scope: "global" }),
+  });
+  assert.equal(disabled.status, 303);
+
+  const relayProviderToken = randomBytes(24).toString("hex");
+  const relayConnectorToken = randomBytes(24).toString("hex");
+  const relayProvider = await open(relayProviderToken, true);
+  relayProvider.socket.send(connectorFrame(randomBytes(16), relayConnectorToken));
+  assert.equal((await relayProvider.next(0x08))[18], 1);
+  const relayConnector = await open(relayConnectorToken, false);
+  const relayChannel = randomBytes(16);
+  relayConnector.socket.send(connectFrame(relayChannel));
+  await relayProvider.next(0x03);
+  relayProvider.socket.send(connectResponseFrame(relayChannel));
+  assert.equal((await relayConnector.next(0x05))[2], 1);
+  relayConnector.socket.send(networkDataFrame(relayChannel, new Uint8Array(4)));
+  assert.equal((await relayProvider.next(0x04)).length, 28);
+
+  const anonymousSite = await open(randomBytes(24).toString("hex"), true, true);
+  anonymousSite.socket.send(jsonFrame(0x12, { backends: [{ url: "http://localhost:8080" }] }));
+  const rejected = JSON.parse(new TextDecoder().decode((await anonymousSite.next(0x13)).slice(6)));
+  assert.equal(rejected.success, false, "anonymous site publishing must honor the site policy");
+
+  relayProvider.socket.close();
+  relayConnector.socket.close();
+  anonymousSite.socket.close();
   connector.socket.close();
   web.socket.close();
   network.socket.close();

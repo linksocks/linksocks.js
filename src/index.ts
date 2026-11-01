@@ -758,7 +758,7 @@ export default {
         <div class="intro">
           <div class="kicker">Cloudflare Workers · WebSocket relay</div>
           <h1 class="title">Public Relay Server</h1>
-          <p class="subtitle">One endpoint between LinkSocks providers and connectors. Live traffic, quota usage and connection details are below.</p>
+          <p class="subtitle">One endpoint for both LinkSocks cores: relay traffic and published sites share the same server. Live relay traffic and quota usage are below.</p>
         </div>
         ${statsError ? `<div class="errBanner">Stats temporarily unavailable: ${statsError}</div>` : ""}
         <div class="stats">
@@ -822,7 +822,8 @@ export default {
             <p class="panelTitle">Quick start</p>
             <ol class="qsSteps">
               <li>Download the <b>linksocks</b> client: <a href="https://github.com/linksocks/linksocks/releases" target="_blank" rel="noreferrer">GitHub Releases</a></li>
-              <li>Run <b>Provider</b> on the machine that can reach your service (can be in a private network); run <b>Connector</b> on the client machine.</li>
+              <li><b>Relay:</b> run <b>Provider</b> near the service and <b>Connector</b> on the client machine.</li>
+              <li><b>Site:</b> run <b>Site provider</b> with the local HTTP URL to publish a hostname.</li>
             </ol>
 
             <p class="cmdLabel">Provider</p>
@@ -835,6 +836,12 @@ export default {
             <div class="cmd" data-copy="linksocks connector -u ${relayUrl} -t your_connector_token">
               <pre>linksocks connector -u ${relayUrl} -t your_connector_token</pre>
               <button class="copyBtn" type="button" aria-label="Copy connector command" data-copy-btn>Copy</button>
+            </div>
+
+            <p class="cmdLabel" style="margin-top: 24px">Site provider</p>
+            <div class="cmd" data-copy="linksocks web -u ${relayUrl} -l http://127.0.0.1:8080 -t your_provider_token">
+              <pre>linksocks web -u ${relayUrl} -l http://127.0.0.1:8080 -t your_provider_token</pre>
+              <button class="copyBtn" type="button" aria-label="Copy site provider command" data-copy-btn>Copy</button>
             </div>
           </div>
           <div class="panel">

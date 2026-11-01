@@ -46,6 +46,8 @@ test("administrator can enable and disable policy checkboxes", { timeout: 20000 
   const html = await settings.text();
   const csrf = html.match(/name="csrf" value="([^"]+)"/)?.[1];
   assert.ok(csrf);
+  assert.ok(html.includes("Allow anonymous site providers"), "anonymous access is a site-provider policy, not a relay one");
+  assert.ok(html.includes("Force temporary site hostnames"), "temporary-host policy must name site providers");
 
   async function save(fields) {
     const response = await worker.dispatchFetch("http://localhost/admin/action", {
