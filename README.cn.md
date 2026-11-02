@@ -150,8 +150,10 @@ IP、不需要开放入站端口，也不需要在 Worker 中配置任何源站�
    | `BASE_HOST` | Control Plane 所在主机名，例如 `linksocks.example.com`；为空时回退到 `WEB_ZONE` |
    | `ADMIN_USERNAME` | 初始管理员用户名，默认 `admin` |
 
-3. DNS：把 `example.com` 与 `*.example.com` 都指向这个 Worker（自定义域或路由），
-   这样自动生成的临时域名才能被访问。
+3. DNS 与路由：把 `example.com` 与 `*.example.com` 都指向这个 Worker，并为
+   `WEB_ZONE` 添加 Worker 路由 `*.example.com/*`。只有通配 DNS 记录是不够的：
+   没有路由时 Cloudflare 会返回 `DNS points to prohibited IP`（403）。路由必须
+   和 `WEB_ZONE` 在同一个 zone 下。
 
 4. 部署：
 

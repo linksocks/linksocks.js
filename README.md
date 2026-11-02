@@ -155,8 +155,11 @@ port, and no origin address stored in the Worker.
    | `BASE_HOST` | Hostname of the control plane, e.g. `linksocks.example.com` (falls back to `WEB_ZONE`) |
    | `ADMIN_USERNAME` | Initial administrator username, defaults to `admin` |
 
-3. DNS: point both `example.com` and `*.example.com` at this Worker (custom
-   domain or routes) so generated temporary hosts resolve.
+3. DNS: point both `example.com` and `*.example.com` at this Worker, and add
+   the Worker route `*.example.com/*` for `WEB_ZONE`. The wildcard DNS record
+   alone is not enough: without the route Cloudflare answers the generated
+   host with `DNS points to prohibited IP` (403). The route must belong to the
+   same zone that hosts `WEB_ZONE`.
 
 4. Deploy:
 
