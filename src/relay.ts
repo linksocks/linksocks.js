@@ -1696,13 +1696,20 @@ export class Relay extends DurableObject {
       }
 
       const temporary = !requestedHost || reclaimingTemporary;
+      // The permanent-host grant is the merged custom-hostname permission: the
+      // account published its own hostname, so the site never rotates and the
+      // account-wide duration cap does not apply to it either. Reconnecting to
+      // an existing temporary host stays temporary, grant or not.
+      const permanentHost = Boolean(requestedHost) && settings.allowCustomHost && !temporary;
       let expiresAt = reservedClaim ? null : (existing?.expires_at ?? null);
       if (temporary && (!expiresAt || expiresAt <= now || !existing)) {
         expiresAt = settings.autoRotateSeconds > 0
           ? now + settings.autoRotateSeconds * 1000
           : null;
       }
-      if (settings.quotaDurationSeconds > 0) {
+      if (permanentHost) {
+        expiresAt = null;
+      } else if (settings.quotaDurationSeconds > 0) {
         const durationExpiry = now + settings.quotaDurationSeconds * 1000;
         expiresAt = expiresAt ? Math.min(expiresAt, durationExpiry) : durationExpiry;
       }

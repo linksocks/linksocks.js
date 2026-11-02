@@ -210,6 +210,11 @@ linksocks web -u wss://linksocks.example.com -t ls_xxx \
 - Administrators can edit anonymous site publishing, custom hostname
   allowance, registration, and whether users may edit their own policy;
   per-user overrides live on the user detail page.
+- `allowCustomHost` on a user is the **permanent hostname grant**: the account
+  may publish a hostname of its own under `WEB_ZONE`, and that site never
+  rotates and never expires. It is denied by default, so operators grant it
+  account by account. A global `forceTemporaryHost` still applies to every
+  account that does not hold the grant.
 
 ### Hostname Holds and Reservations
 
@@ -240,9 +245,13 @@ Each site freezes a policy at creation time:
 | `maxSites` | Sites per account / per anonymous token |
 | `maxBackends` | Origins allowed per registration |
 
-Auto-generated hosts are always `temporary` with a countdown in the UI; custom
-hosts are permanent by default. Quota overruns return `429` at the edge and
-expired temporary hosts return `410`.
+Auto-generated hosts are always `temporary` with a countdown in the UI. A custom
+host needs the account's permanent-host grant; a granted host is `temporary =
+false`, never rotates, and ignores `quotaDurationSeconds`, so the site stays up
+until its provider leaves. Without the grant the relay refuses a requested host,
+and under `forceTemporaryHost` an ungranted provider is simply rewritten to a
+generated host. Quota overruns return `429` at the edge and expired temporary
+hosts return `410`.
 
 The byte and request quotas are hard limits shared by every site of the same
 principal (one account, or one anonymous provider token). SOCKS5 relay traffic

@@ -36,10 +36,14 @@ export const DEFAULT_ANONYMOUS_SETTINGS: Settings = {
   maxBackends: 8,
 };
 
+// For a registered account `allowCustomHost` is the permanent-host grant: the
+// account may publish a hostname of its own under WEB_ZONE, and that site never
+// rotates and never expires. It is denied by default so an operator grants it
+// to individual accounts instead of handing it to every registered user.
 export const DEFAULT_USER_SETTINGS: Settings = {
   publicUrl: "",
   allowAnonymous: true,
-  allowCustomHost: true,
+  allowCustomHost: false,
   forceTemporaryHost: false,
   allowRegistration: false,
   autoRotateSeconds: 24 * 60 * 60,
@@ -958,11 +962,14 @@ export async function effectiveSettings(env: Env, user: UserRow | null): Promise
   const global = await getAnonymousSettings(env);
   if (!user) return global;
   const userSettings = await getUserSettings(env, user.id);
-  // Force-temporary mode is an operator-level switch: when it is enabled
-  // globally it applies to registered accounts too.
+  // Force-temporary mode is an operator-level switch that reaches registered
+  // accounts too, except the ones holding the permanent-host grant: those were
+  // granted an explicit exception, so a global force must not silently take
+  // their custom hostname away.
   return {
     ...userSettings,
-    forceTemporaryHost: global.forceTemporaryHost || userSettings.forceTemporaryHost,
+    forceTemporaryHost:
+      userSettings.forceTemporaryHost || (global.forceTemporaryHost && !userSettings.allowCustomHost),
   };
 }
 

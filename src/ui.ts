@@ -696,6 +696,7 @@ function settingsForm(opts: {
   description: string;
   bare?: boolean;
   modal?: boolean;
+  globalForceTemporary?: boolean;
 }): string {
   const s = opts.settings;
   const check = (name: string, label: string, checked: boolean, hint = "") =>
@@ -718,8 +719,10 @@ function settingsForm(opts: {
   const toggles = [
     opts.global ? check("allowAnonymous", "Allow anonymous site providers", s.allowAnonymous, "Site providers without a token can publish a hostname.") : "",
     opts.global ? check("allowRegistration", "Allow self-registration", s.allowRegistration, "Anyone can create an account from /register.") : "",
-    check("allowCustomHost", "Allow custom site hostnames", s.allowCustomHost, "Site providers may request a hostname under WEB_ZONE."),
-    opts.global ? check("forceTemporaryHost", "Force temporary site hostnames", s.forceTemporaryHost, "Ignores requested hostnames for site providers, including registered accounts. Every site connection gets a fresh URL.") : "",
+    opts.global
+      ? check("allowCustomHost", "Allow custom site hostnames", s.allowCustomHost, "Anonymous site providers may request a hostname under WEB_ZONE.")
+      : check("allowCustomHost", "Allow permanent custom hostnames", s.allowCustomHost, "The account may publish its own hostname under WEB_ZONE. Granted hostnames never rotate, never expire, and are exempt from forced temporary hostnames."),
+    opts.global ? check("forceTemporaryHost", "Force temporary site hostnames", s.forceTemporaryHost, "Ignores requested hostnames for site providers, including registered accounts, except accounts granted permanent custom hostnames. Every other site connection gets a fresh URL.") : "",
   ].filter(Boolean).join("");
   const connection = opts.global
     ? `<h3 class="form-title">Connection</h3>
@@ -750,7 +753,13 @@ function settingsForm(opts: {
           ${num("quotaRequests", "Total request quota", s.quotaRequests, "Shared lifetime cap for relay and site requests. 0 = unlimited.")}
           ${quantity("quotaDurationSeconds", "Site duration", s.quotaDurationSeconds, DURATION_UNITS, "Maximum lifetime of a published site. 0 = no duration limit.")}
         </div>
-        ${!opts.global && s.forceTemporaryHost ? `<div class="note" style="margin-bottom:16px"><div><strong>Forced temporary hostnames are enabled</strong> by the administrator. Custom hostnames are ignored while this policy is active.</div></div>` : ""}
+        ${!opts.global && opts.globalForceTemporary
+          ? `<div class="note" style="margin-bottom:16px"><div>${
+              s.allowCustomHost
+                ? "<strong>Forced temporary hostnames are enabled</strong> globally, but this account holds the permanent custom hostname grant and is exempt."
+                : "<strong>Forced temporary hostnames are enabled</strong> by the administrator. Requested hostnames are ignored and every site connection gets a fresh URL."
+            }</div></div>`
+          : ""}
         <div class="${opts.modal ? "modal-actions" : "form-actions"}"><button class="btn primary" type="submit">${opts.modal ? "Save policy" : "Save settings"}</button></div>
       </form>`;
   if (opts.bare) return form;
@@ -1087,11 +1096,9 @@ export function renderAdminPage(data: AdminPageData): string {
           body: settingsForm({
             action: "/admin/action",
             csrf: data.csrf,
-            settings: {
-              ...data.selectedUserSettings,
-              forceTemporaryHost: data.selectedUserSettings.forceTemporaryHost || data.globalSettings.forceTemporaryHost,
-            },
+            settings: data.selectedUserSettings,
             global: false,
+            globalForceTemporary: data.globalSettings.forceTemporaryHost,
             userId: selected.id,
             title: `Policy for ${selected.username}`,
             description: "Per-user limits applied to sites created with this user's tokens.",
@@ -1143,7 +1150,7 @@ export function renderAdminPage(data: AdminPageData): string {
       </div>
     </div>`;
   } else {
-    content += pageHead("Settings", "Global defaults for anonymous relay traffic and site providers. Registered accounts keep their own limits; force-temporary mode applies to every site provider.");
+    content += pageHead("Settings", "Global defaults for anonymous relay traffic and site providers. Registered accounts keep their own limits; force-temporary mode applies to every site provider except accounts granted permanent custom hostnames.");
     content += settingsForm({
       action: "/admin/action",
       csrf: data.csrf,
