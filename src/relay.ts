@@ -39,11 +39,13 @@ import {
   type SiteRow,
   type UserRow,
   consumeQuota,
+  deleteRetiredHostsByRelay,
   deleteSite,
   effectiveSettings,
   ensureSchema,
   findUserByTokenHash,
   getReservation,
+  getRetiredHost,
   getSite,
   isSiteHostForZone,
   listReservations,
@@ -52,6 +54,7 @@ import {
   normalizeHost,
   quotaCanFit,
   randomHostLabel,
+  rotateSiteRecord,
   sha256Hex,
   siteUrl,
   upsertSite,
@@ -75,11 +78,6 @@ interface WebRotationResult {
   url: string;
   expiresAt: number;
   rotateSeconds: number;
-}
-
-interface WebRotationRecord {
-  host: string;
-  at: number;
 }
 
 interface WebPending {
@@ -160,10 +158,9 @@ export class Relay extends DurableObject {
   private static readonly CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS = 100;
   private static readonly TRAFFIC_FLUSH_IDLE_MS = 60_000;
   private static readonly DEFAULT_CONNECTOR_WAIT_PROVIDER_MS = 5_000;
-  // Rotate before the Go client's own 60 second threshold so the server can
-  // hand every provider the same replacement host.
+  // Rotate before the hostname expires so every provider has time to adopt the
+  // replacement. The relay owns this timer; clients only receive WebRotate.
   private static readonly WEB_ROTATE_LEAD_MS = 120_000;
-  private static readonly WEB_ROTATION_MEMORY_MS = 10 * 60_000;
 
   private providerChannels: Map<string, WebSocket>;
   private connectorChannels: Map<string, WebSocket>;
@@ -202,7 +199,9 @@ export class Relay extends DurableObject {
   private webUsageDay: string = "";
   private webUsageTimer: ReturnType<typeof setTimeout> | null = null;
   private siteCache: Map<string, { site: SiteRow | null; at: number }> = new Map();
-  private webRotationChain: Promise<void> = Promise.resolve();
+  // Registration and rotation both read-then-write D1 site rows. A single
+  // per-DO chain keeps those critical sections from interleaving.
+  private siteMutationChain: Promise<void> = Promise.resolve();
 
   private async getOwnerTokenKey(): Promise<string> {
     const v = (await this.storage.get("ownerTokenKey")) as string | undefined;
@@ -497,9 +496,19 @@ export class Relay extends DurableObject {
       await new Promise((resolve) => setTimeout(resolve, Relay.CONNECTOR_SHUTDOWN_NOTICE_DELAY_MS));
     }
 
-    // Release the published hostnames before revoking tokens. Reservations, if
-    // any, live in their own table and keep the name bound to its owner.
-    await this.deleteRelaySites();
+    // Release the published hostnames and their rotation history before
+    // revoking tokens. Reservations, if any, live in their own table and keep
+    // the name bound to its owner.
+    await this.withSiteMutation(async () => {
+      await this.deleteRelaySites();
+      if (this.env.DB) {
+        try {
+          await deleteRetiredHostsByRelay(this.env, this.state.id.toString());
+        } catch (error) {
+          console.error("cleanup: failed to delete retired host rows", error);
+        }
+      }
+    });
     await this.deleteRelayRecords();
 
     // Clear local storage
@@ -1426,6 +1435,7 @@ export class Relay extends DurableObject {
       return;
     }
 
+    const release = await this.lockSiteMutation();
     try {
       await ensureSchema(this.env);
       const relayId = this.state.id.toString();
@@ -1509,6 +1519,19 @@ export class Relay extends DurableObject {
         requestedHost = "";
       }
 
+      // Every hostname a rotation leaves behind is a tombstone. Only the relay
+      // that owns the chain may follow it to the current head; nobody can
+      // register the deprecated hostname itself again.
+      const retired = requestedHost ? await getRetiredHost(this.env, requestedHost) : null;
+      if (retired) {
+        if (retired.relay_id !== relayId) {
+          reply(false, "This hostname has been retired by another relay");
+          return;
+        }
+        const mappedSite = await getSite(this.env, retired.successor_host);
+        requestedHost = mappedSite && mappedSite.relay_id === relayId ? mappedSite.host : "";
+      }
+
       if (msg.rotate) {
         const rotationSourceHost = requestedHost || currentHost;
         const sourceSite = rotationSourceHost ? await getSite(this.env, rotationSourceHost) : null;
@@ -1520,78 +1543,54 @@ export class Relay extends DurableObject {
           sourceSite.relay_id === relayId &&
           (!sourceSite.owner_id || sourceSite.owner_id === (user?.id || null))
         ) {
+          // Older clients may still send a rotation request. Treat it as a
+          // nudge: rotate only when the relay's own schedule says it is due,
+          // otherwise hand back the current host.
           const lead = this.webRotationLeadMs(sourceSite.rotate_seconds);
-          if (sourceSite.expires_at && sourceSite.expires_at > now + lead && currentHost === sourceSite.host) {
-            // A rotation already happened, but this provider's own timer fired
-            // before it processed the broadcast. Reply with the shared host.
-            meta.webHosts = [sourceSite.host];
-            meta.webBackendCount = backends.length;
-            ws.serializeAttachment(meta);
-            this.syncFromState(true);
-            await this.rememberWebGrace(settings);
-            reply(true, undefined, {
-              host: sourceSite.host,
-              url: siteUrl(sourceSite.host),
-              temporary: true,
-              expiresAt: sourceSite.expires_at ?? undefined,
-              rotateSeconds: sourceSite.rotate_seconds,
-              backendCount: backends.length,
-              owner: user?.username,
-            });
-            return;
+          if (!sourceSite.expires_at || sourceSite.expires_at - now <= lead) {
+            const rotated = await this.rotateTemporarySiteLocked(sourceSite, ws);
+            if (rotated) {
+              await this.rememberWebGrace(settings);
+              reply(true, undefined, {
+                host: rotated.host,
+                url: rotated.url,
+                temporary: true,
+                expiresAt: rotated.expiresAt,
+                rotateSeconds: rotated.rotateSeconds,
+                backendCount: backends.length,
+                owner: user?.username,
+              });
+              return;
+            }
           }
 
-          const rotated = await this.rotateTemporarySite(sourceSite, ws);
-          if (rotated) {
-            await this.rememberWebGrace(settings);
-            reply(true, undefined, {
-              host: rotated.host,
-              url: rotated.url,
-              temporary: true,
-              expiresAt: rotated.expiresAt,
-              rotateSeconds: rotated.rotateSeconds,
-              backendCount: backends.length,
-              owner: user?.username,
-            });
-            return;
-          }
-        } else if (!sourceSite && rotationSourceHost) {
-          // The provider reconnected after the old host was rotated away.
-          // Follow the recorded rotation instead of allocating another host.
-          const mappedHost = await this.findRecentRotation(rotationSourceHost);
-          const mappedSite = mappedHost ? await getSite(this.env, mappedHost) : null;
-          if (
-            mappedSite &&
-            mappedSite.relay_id === relayId &&
-            (!mappedSite.owner_id || mappedSite.owner_id === (user?.id || null))
-          ) {
-            meta.webHosts = [mappedSite.host];
-            meta.webBackendCount = backends.length;
-            ws.serializeAttachment(meta);
-            this.syncFromState(true);
-            await this.rememberWebGrace(settings);
-            reply(true, undefined, {
-              host: mappedSite.host,
-              url: siteUrl(mappedSite.host),
-              temporary: mappedSite.temporary === 1,
-              expiresAt: mappedSite.expires_at ?? undefined,
-              rotateSeconds: mappedSite.rotate_seconds,
-              backendCount: backends.length,
-              owner: user?.username,
-            });
-            return;
-          }
+          meta.webHosts = [sourceSite.host];
+          meta.webBackendCount = backends.length;
+          ws.serializeAttachment(meta);
+          this.syncFromState(true);
+          await this.rememberWebGrace(settings);
+          reply(true, undefined, {
+            host: sourceSite.host,
+            url: siteUrl(sourceSite.host),
+            temporary: true,
+            expiresAt: sourceSite.expires_at ?? undefined,
+            rotateSeconds: sourceSite.rotate_seconds,
+            backendCount: backends.length,
+            owner: user?.username,
+          });
+          return;
         }
       }
 
       let existing = requestedHost ? await getSite(this.env, requestedHost) : null;
       if (requestedHost && !existing) {
         // A provider that missed the rotation broadcast reconnects with the
-        // host it still knows about; follow the shared record instead of
+        // host it still knows about; follow the tombstone instead of
         // allocating a second replacement domain.
-        const mappedHost = await this.findRecentRotation(requestedHost);
-        const mappedSite = mappedHost ? await getSite(this.env, mappedHost) : null;
+        const previous = await getRetiredHost(this.env, requestedHost);
+        const mappedSite = previous ? await getSite(this.env, previous.successor_host) : null;
         if (
+          previous?.relay_id === relayId &&
           mappedSite &&
           mappedSite.relay_id === relayId &&
           (!mappedSite.owner_id || mappedSite.owner_id === (user?.id || null))
@@ -1606,7 +1605,10 @@ export class Relay extends DurableObject {
           (!existing.owner_id || existing.owner_id === (user?.id || null)),
       );
       let reclaimingTemporary = Boolean(
-        existing && existing.temporary === 1 && existing.relay_id === relayId,
+        existing &&
+          existing.temporary === 1 &&
+          existing.relay_id === relayId &&
+          (!existing.owner_id || existing.owner_id === (user?.id || null)),
       );
 
       if (
@@ -1614,15 +1616,24 @@ export class Relay extends DurableObject {
         existing?.expires_at &&
         existing.expires_at <= now
       ) {
-        if (!msg.rotate) {
-          reply(false, "This temporary hostname has expired; re-register with rotation");
+        // The relay normally rotates before expiry. If an alarm was missed
+        // while this provider was offline, rotate now instead of rejecting it.
+        const rotated = await this.rotateTemporarySiteLocked(existing, ws);
+        if (!rotated) {
+          reply(false, "This temporary hostname has expired and could not be rotated");
           return;
         }
-        await deleteSite(this.env, existing.host);
-        existing = null;
-        ownsExisting = false;
-        reclaimingTemporary = false;
-        requestedHost = "";
+        await this.rememberWebGrace(settings);
+        reply(true, undefined, {
+          host: rotated.host,
+          url: rotated.url,
+          temporary: true,
+          expiresAt: rotated.expiresAt,
+          rotateSeconds: rotated.rotateSeconds,
+          backendCount: backends.length,
+          owner: user?.username,
+        });
+        return;
       }
 
       if (requestedHost) {
@@ -1642,15 +1653,6 @@ export class Relay extends DurableObject {
           reply(false, "This hostname is owned by another user");
           return;
         }
-      }
-
-      if (msg.rotate && requestedHost) {
-        // The provider asked for a fresh temporary host. Ignore the old host
-        // and let the server generate a new one below.
-        requestedHost = "";
-        existing = null;
-        ownsExisting = false;
-        reclaimingTemporary = false;
       }
 
       let host = requestedHost;
@@ -1695,7 +1697,7 @@ export class Relay extends DurableObject {
 
       const temporary = !requestedHost || reclaimingTemporary;
       let expiresAt = reservedClaim ? null : (existing?.expires_at ?? null);
-      if (temporary && (!expiresAt || expiresAt <= now || msg.rotate || !existing)) {
+      if (temporary && (!expiresAt || expiresAt <= now || !existing)) {
         expiresAt = settings.autoRotateSeconds > 0
           ? now + settings.autoRotateSeconds * 1000
           : null;
@@ -1756,6 +1758,7 @@ export class Relay extends DurableObject {
       meta.webAnonymous = !user;
       ws.serializeAttachment(meta);
       this.syncFromState(true);
+      await this.scheduleWebRotationAlarm();
 
       reply(true, undefined, {
         host,
@@ -1768,6 +1771,8 @@ export class Relay extends DurableObject {
       });
     } catch (err) {
       reply(false, err instanceof Error ? err.message : String(err));
+    } finally {
+      release();
     }
   }
 
@@ -1891,7 +1896,34 @@ export class Relay extends DurableObject {
   }
 
   private webRotationLeadMs(rotateSeconds: number): number {
-    return Math.min(Relay.WEB_ROTATE_LEAD_MS, Math.max(5_000, rotateSeconds * 500));
+    const configured = Number(this.env.WEB_ROTATION_LEAD_MS);
+    if (Number.isFinite(configured) && configured > 0) {
+      return Math.min(configured, Math.max(1_000, rotateSeconds * 1_000 - 1_000));
+    }
+    const halfLife = rotateSeconds * 500;
+    const beforeExpiry = rotateSeconds * 1_000 - 1_000;
+    return Math.min(Relay.WEB_ROTATE_LEAD_MS, Math.max(1_000, Math.min(halfLife, beforeExpiry)));
+  }
+
+  private async lockSiteMutation(): Promise<() => void> {
+    const previous = this.siteMutationChain;
+    let release = () => {};
+    this.siteMutationChain = previous.then(
+      () => new Promise<void>((resolve) => {
+        release = resolve;
+      }),
+    );
+    await previous;
+    return release;
+  }
+
+  private async withSiteMutation<T>(action: () => Promise<T>): Promise<T> {
+    const release = await this.lockSiteMutation();
+    try {
+      return await action();
+    } finally {
+      release();
+    }
   }
 
   private async allocateTemporaryHost(zone: string): Promise<string | null> {
@@ -1900,116 +1932,154 @@ export class Relay extends DurableObject {
     );
     for (let attempt = 0; attempt < 8; attempt++) {
       const candidate = `${randomHostLabel()}.${zone}`;
-      if (!reservedHosts.has(candidate) && !(await getSite(this.env, candidate))) {
-        return candidate;
-      }
+      if (reservedHosts.has(candidate)) continue;
+      if (await getRetiredHost(this.env, candidate)) continue;
+      if (await getSite(this.env, candidate)) continue;
+      return candidate;
     }
     return null;
   }
 
-  private async rememberWebRotation(oldHost: string, host: string): Promise<void> {
-    const now = Date.now();
-    const stored = (await this.storage.get("webRotations")) as Record<string, WebRotationRecord> | undefined;
-    const rotations: Record<string, WebRotationRecord> = {};
-    for (const [key, value] of Object.entries(stored || {})) {
-      if (value && now - value.at < Relay.WEB_ROTATION_MEMORY_MS) rotations[key] = value;
+  /**
+   * Schedule a relay alarm for the earliest temporary hostname that still has
+   * an online provider. The alarm is the only rotation trigger; clients just
+   * apply the WebRotate message they receive.
+   */
+  private async scheduleWebRotationAlarm(): Promise<void> {
+    if (!this.env.DB) return;
+    try {
+      const relayId = this.state.id.toString();
+      const sites = await listSitesByRelay(this.env, relayId);
+      let nextAt: number | null = null;
+      for (const site of sites) {
+        if (site.temporary !== 1 || site.rotate_seconds <= 0 || !site.expires_at) continue;
+        if (this.getWebProviders(site.host).length === 0) continue;
+        const dueAt = site.expires_at - this.webRotationLeadMs(site.rotate_seconds);
+        if (nextAt === null || dueAt < nextAt) nextAt = dueAt;
+      }
+      if (nextAt !== null) {
+        // A failed rotation leaves the deadline in the past; retry later instead
+        // of re-arming the same instant and spinning the alarm.
+        const when = nextAt > Date.now() ? nextAt : Date.now() + 30_000;
+        await this.scheduleAlarmAt(when);
+      }
+    } catch (error) {
+      console.error("web rotation: failed to schedule alarm", error);
     }
-    rotations[oldHost] = { host, at: now };
-    await this.storage.put("webRotations", rotations);
   }
 
-  private async findRecentRotation(oldHost: string): Promise<string | null> {
-    const stored = (await this.storage.get("webRotations")) as Record<string, WebRotationRecord> | undefined;
-    const record = stored?.[oldHost];
-    if (!record) return null;
-    if (Date.now() - record.at >= Relay.WEB_ROTATION_MEMORY_MS) return null;
-    return record.host;
+  private async rotateDueSites(): Promise<void> {
+    if (!this.env.DB) return;
+    const relayId = this.state.id.toString();
+    const sites = await listSitesByRelay(this.env, relayId);
+    const now = Date.now();
+    for (const site of sites) {
+      if (site.temporary !== 1 || site.rotate_seconds <= 0 || !site.expires_at) continue;
+      if (site.expires_at - now > this.webRotationLeadMs(site.rotate_seconds)) continue;
+      await this.rotateTemporarySite(site);
+    }
   }
 
   /**
    * Rotate a temporary site once for every provider serving it. All providers
-   * sharing the hostname must move together, otherwise each one registers its
-   * own replacement and the machines end up on different domains.
+   * sharing the hostname must move together, otherwise the machines end up on
+   * different domains.
    */
   private async rotateTemporarySite(site: SiteRow, initiator?: WebSocket): Promise<WebRotationResult | null> {
-    const previous = this.webRotationChain;
-    let release = () => {};
-    this.webRotationChain = new Promise<void>((resolve) => {
-      release = resolve;
-    });
-    await previous;
+    return this.withSiteMutation(() => this.rotateTemporarySiteLocked(site, initiator));
+  }
 
-    try {
-      const latest = await getSite(this.env, site.host);
-      if (!latest) {
-        // Another provider already rotated this host while we queued.
-        const mappedHost = await this.findRecentRotation(site.host);
-        if (!mappedHost) return null;
-        const mappedSite = await getSite(this.env, mappedHost);
-        if (!mappedSite || mappedSite.relay_id !== this.state.id.toString()) return null;
-        return {
-          host: mappedSite.host,
-          url: siteUrl(mappedSite.host),
-          expiresAt: mappedSite.expires_at || Date.now(),
-          rotateSeconds: mappedSite.rotate_seconds,
-        };
-      }
-
-      const zone = normalizeHost(this.env.WEB_ZONE || "");
-      if (!zone || latest.rotate_seconds <= 0) return null;
-      const providers = this.getWebProviders(latest.host);
-      if (initiator && !providers.includes(initiator)) providers.push(initiator);
-      if (providers.length === 0) return null;
-
-      const host = await this.allocateTemporaryHost(zone);
-      if (!host) return null;
-
-      const now = Date.now();
-      const expiresAt = now + latest.rotate_seconds * 1000;
-      const next: SiteRow = {
-        ...latest,
-        host,
-        expires_at: expiresAt,
-        updated_at: now,
-        last_seen_at: now,
-      };
-      await upsertSite(this.env, next);
-      await this.rememberWebRotation(latest.host, host);
-      await deleteSite(this.env, latest.host);
-      this.siteCache.delete(latest.host);
-      this.siteCache.delete(host);
-
-      const rotateMessage: WebRotateMessage = {
-        host,
-        url: siteUrl(host),
-        expiresAt,
-        rotateSeconds: latest.rotate_seconds,
-        getType: () => MessageType.WebRotate,
-      };
-      const encoded = packMessage(rotateMessage);
-      for (const provider of providers) {
-        const meta = this.safeDeserializeAttachment(provider);
-        meta.webHosts = [host];
-        provider.serializeAttachment(meta);
-        // The initiator gets the same data in its registration response.
-        if (provider === initiator) continue;
-        try {
-          provider.send(encoded);
-        } catch {
-          // The provider will re-register and follow the rotation record.
-        }
-      }
-      this.syncFromState(true);
-
+  // Caller must hold the site mutation lock.
+  private async rotateTemporarySiteLocked(site: SiteRow, initiator?: WebSocket): Promise<WebRotationResult | null> {
+    const relayId = this.state.id.toString();
+    const latest = await getSite(this.env, site.host);
+    if (!latest) {
+      // Another provider already rotated this host while we queued. Follow the
+      // tombstone to the current site instead of allocating a second domain.
+      const retired = await getRetiredHost(this.env, site.host);
+      if (!retired || retired.relay_id !== relayId) return null;
+      const mappedSite = await getSite(this.env, retired.successor_host);
+      if (!mappedSite || mappedSite.relay_id !== relayId) return null;
       return {
-        host,
-        url: siteUrl(host),
-        expiresAt,
-        rotateSeconds: latest.rotate_seconds,
+        host: mappedSite.host,
+        url: siteUrl(mappedSite.host),
+        expiresAt: mappedSite.expires_at || Date.now(),
+        rotateSeconds: mappedSite.rotate_seconds,
       };
-    } finally {
-      release();
     }
+
+    if (latest.rotate_seconds <= 0) return null;
+    if (latest.expires_at && latest.expires_at - Date.now() > this.webRotationLeadMs(latest.rotate_seconds)) {
+      return null;
+    }
+
+    const providers = this.getWebProviders(latest.host);
+    if (initiator && !providers.includes(initiator)) providers.push(initiator);
+    if (providers.length === 0) return null;
+
+    // Local dev and some deployments leave WEB_ZONE empty and let the public
+    // host double as the zone; providers carry that host in their attachment.
+    let zone = normalizeHost(this.env.WEB_ZONE || "");
+    if (!zone) {
+      for (const provider of providers) {
+        const { baseHost } = this.safeDeserializeAttachment(provider);
+        zone = normalizeHost(baseHost || "");
+        if (zone) break;
+      }
+    }
+    if (!zone) return null;
+
+    const host = await this.allocateTemporaryHost(zone);
+    if (!host) return null;
+
+    const now = Date.now();
+    const expiresAt = now + latest.rotate_seconds * 1000;
+    const next: SiteRow = {
+      ...latest,
+      host,
+      expires_at: expiresAt,
+      updated_at: now,
+      last_seen_at: now,
+    };
+    await rotateSiteRecord(this.env, next, {
+      host: latest.host,
+      relay_id: relayId,
+      owner_id: latest.owner_id,
+      successor_host: host,
+      retired_at: now,
+    });
+    this.siteCache.delete(latest.host);
+    this.siteCache.delete(host);
+
+    const rotateMessage: WebRotateMessage = {
+      host,
+      url: siteUrl(host),
+      expiresAt,
+      rotateSeconds: latest.rotate_seconds,
+      getType: () => MessageType.WebRotate,
+    };
+    const encoded = packMessage(rotateMessage);
+    for (const provider of providers) {
+      const meta = this.safeDeserializeAttachment(provider);
+      meta.webHosts = [host];
+      provider.serializeAttachment(meta);
+      // The initiator gets the same data in its registration response.
+      if (provider === initiator) continue;
+      try {
+        provider.send(encoded);
+      } catch {
+        // The provider will re-register and follow the tombstone.
+      }
+    }
+    this.syncFromState(true);
+    await this.scheduleWebRotationAlarm();
+
+    return {
+      host,
+      url: siteUrl(host),
+      expiresAt,
+      rotateSeconds: latest.rotate_seconds,
+    };
   }
 
   private ensureWebUsageDay(): void {
@@ -2675,9 +2745,22 @@ export class Relay extends DurableObject {
     await this.flushTraffic(true).catch(console.error);
     await this.flushWebUsage().catch(console.error);
 
+    // The alarm is the relay's rotation clock. A failure here must not stop
+    // disconnect cleanup, so log it and keep going.
+    try {
+      await this.rotateDueSites();
+    } catch (e) {
+      console.error("alarm: web rotation failed", e);
+    }
+
     const providerCount = this.getActualProviderCount();
     if (providerCount > 0) {
       await this.storage.delete('providerDisconnectTime');
+      try {
+        await this.scheduleWebRotationAlarm();
+      } catch (e) {
+        console.error("alarm: failed to schedule next web rotation", e);
+      }
       return;
     }
 

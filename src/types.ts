@@ -18,6 +18,8 @@ export interface Env extends Cloudflare.Env {
   SESSION_SECRET?: string;
   CF_API_TOKEN?: string;
   CF_ACCOUNT_ID?: string;
+  // Optional override for the rotation lead time, mainly for integration tests.
+  WEB_ROTATION_LEAD_MS?: string;
   RELAY: DurableObjectNamespace<Relay>;
   TOKEN: DurableObjectNamespace<Token>;
 }

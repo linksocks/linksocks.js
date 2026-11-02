@@ -105,6 +105,21 @@ export interface ReservationRow {
   created_at: number;
 }
 
+/**
+ * A temporary hostname that a rotation has permanently retired.
+ *
+ * The row survives relay restarts so a provider reconnecting with an old
+ * hostname can follow `successor_host` instead of resurrecting the site. The
+ * whole chain is released only when its relay retires.
+ */
+export interface RetiredHostRow {
+  host: string;
+  relay_id: string;
+  owner_id: string | null;
+  successor_host: string;
+  retired_at: number;
+}
+
 const SCHEMA: string[] = [
   `CREATE TABLE IF NOT EXISTS users (
     id TEXT PRIMARY KEY,
@@ -154,6 +169,15 @@ const SCHEMA: string[] = [
     created_at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS idx_reservations_user ON reservations(user_id)`,
+  `CREATE TABLE IF NOT EXISTS retired_hosts (
+    host TEXT PRIMARY KEY,
+    relay_id TEXT NOT NULL,
+    owner_id TEXT,
+    successor_host TEXT NOT NULL,
+    retired_at INTEGER NOT NULL
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_retired_hosts_relay ON retired_hosts(relay_id)`,
+  `CREATE INDEX IF NOT EXISTS idx_retired_hosts_successor ON retired_hosts(successor_host)`,
   `CREATE TABLE IF NOT EXISTS sessions (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -674,48 +698,90 @@ export async function listSitesByRelay(env: Env, relayId: string): Promise<SiteR
   return result.results || [];
 }
 
+const SITE_UPSERT_SQL = `INSERT INTO sites (
+  host, relay_id, owner_id, token_hash, temporary, expires_at, rotate_seconds,
+  backends_json, backend_count, insecure, anonymous, quota_bytes, quota_requests,
+  created_at, updated_at, last_seen_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(host) DO UPDATE SET
+  relay_id = excluded.relay_id,
+  owner_id = excluded.owner_id,
+  token_hash = excluded.token_hash,
+  temporary = excluded.temporary,
+  expires_at = excluded.expires_at,
+  rotate_seconds = excluded.rotate_seconds,
+  backends_json = excluded.backends_json,
+  backend_count = excluded.backend_count,
+  insecure = excluded.insecure,
+  anonymous = excluded.anonymous,
+  quota_bytes = excluded.quota_bytes,
+  quota_requests = excluded.quota_requests,
+  updated_at = excluded.updated_at`;
+
+function bindSiteStatement(statement: D1PreparedStatement, site: SiteRow): D1PreparedStatement {
+  return statement.bind(
+    site.host,
+    site.relay_id,
+    site.owner_id,
+    site.token_hash,
+    site.temporary,
+    site.expires_at,
+    site.rotate_seconds,
+    site.backends_json,
+    site.backend_count,
+    site.insecure,
+    site.anonymous,
+    site.quota_bytes,
+    site.quota_requests,
+    site.created_at,
+    site.updated_at,
+    site.last_seen_at,
+  );
+}
+
 export async function upsertSite(env: Env, site: SiteRow): Promise<void> {
-  await requireDb(env)
-    .prepare(
-      `INSERT INTO sites (
-         host, relay_id, owner_id, token_hash, temporary, expires_at, rotate_seconds,
-         backends_json, backend_count, insecure, anonymous, quota_bytes, quota_requests,
-         created_at, updated_at, last_seen_at
-       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(host) DO UPDATE SET
-         relay_id = excluded.relay_id,
-         owner_id = excluded.owner_id,
-         token_hash = excluded.token_hash,
-         temporary = excluded.temporary,
-         expires_at = excluded.expires_at,
-         rotate_seconds = excluded.rotate_seconds,
-         backends_json = excluded.backends_json,
-         backend_count = excluded.backend_count,
-         insecure = excluded.insecure,
-         anonymous = excluded.anonymous,
-         quota_bytes = excluded.quota_bytes,
-         quota_requests = excluded.quota_requests,
-         updated_at = excluded.updated_at`,
-    )
-    .bind(
-      site.host,
-      site.relay_id,
-      site.owner_id,
-      site.token_hash,
-      site.temporary,
-      site.expires_at,
-      site.rotate_seconds,
-      site.backends_json,
-      site.backend_count,
-      site.insecure,
-      site.anonymous,
-      site.quota_bytes,
-      site.quota_requests,
-      site.created_at,
-      site.updated_at,
-      site.last_seen_at,
-    )
-    .run();
+  await bindSiteStatement(requireDb(env).prepare(SITE_UPSERT_SQL), site).run();
+}
+
+/**
+ * Move a temporary site to its replacement and retire the old hostname in one
+ * D1 batch. Doing both writes without an interleaved read is what stops a
+ * concurrent registration from recreating the site row that rotation deleted.
+ */
+export async function rotateSiteRecord(
+  env: Env,
+  next: SiteRow,
+  retired: RetiredHostRow,
+): Promise<void> {
+  const db = requireDb(env);
+  await db.batch([
+    bindSiteStatement(db.prepare(SITE_UPSERT_SQL), next),
+    db
+      .prepare(
+        `UPDATE retired_hosts
+            SET successor_host = ?, retired_at = ?
+          WHERE relay_id = ? AND successor_host = ?`,
+      )
+      .bind(next.host, retired.retired_at, retired.relay_id, retired.host),
+    db
+      .prepare(
+        `INSERT INTO retired_hosts (host, relay_id, owner_id, successor_host, retired_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(host) DO UPDATE SET
+           relay_id = excluded.relay_id,
+           owner_id = excluded.owner_id,
+           successor_host = excluded.successor_host,
+           retired_at = excluded.retired_at`,
+      )
+      .bind(
+        retired.host,
+        retired.relay_id,
+        retired.owner_id,
+        retired.successor_host,
+        retired.retired_at,
+      ),
+    db.prepare("DELETE FROM sites WHERE host = ?").bind(retired.host),
+  ]);
 }
 
 export async function touchSite(env: Env, host: string): Promise<void> {
@@ -735,6 +801,26 @@ export async function countSitesByOwner(env: Env, ownerId: string): Promise<numb
     .bind(ownerId)
     .first<{ count: number }>();
   return Number(row?.count || 0);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Retired temporary hostnames                                               */
+/* -------------------------------------------------------------------------- */
+
+export async function getRetiredHost(env: Env, host: string): Promise<RetiredHostRow | null> {
+  return (
+    (await requireDb(env)
+      .prepare("SELECT * FROM retired_hosts WHERE host = ? LIMIT 1")
+      .bind(host.trim().toLowerCase())
+      .first<RetiredHostRow>()) || null
+  );
+}
+
+export async function deleteRetiredHostsByRelay(env: Env, relayId: string): Promise<void> {
+  await requireDb(env)
+    .prepare("DELETE FROM retired_hosts WHERE relay_id = ?")
+    .bind(relayId)
+    .run();
 }
 
 /* -------------------------------------------------------------------------- */

@@ -28,12 +28,15 @@ function inbox(socket) {
     if (resolve) resolve(frame);
     else queue.push(frame);
   });
-  return async (type) => {
+  return async (type, timeoutMs = 5000) => {
     for (;;) {
       const frame = queue.length
         ? queue.shift()
         : await new Promise((resolve, reject) => {
-            const timer = setTimeout(() => reject(new Error(`timed out waiting for message type ${type}`)), 5000);
+            const timer = setTimeout(
+              () => reject(new Error(`timed out waiting for message type ${type}`)),
+              timeoutMs,
+            );
             waiting.push((value) => {
               clearTimeout(timer);
               resolve(value);
@@ -66,7 +69,50 @@ async function register(provider, host, rotate = false) {
   return framePayload(await provider.next(0x13));
 }
 
-test("all providers sharing a temporary host rotate to one replacement", { timeout: 30000 }, async (context) => {
+async function createUserToken(worker, headers, csrf, username, password) {
+  const created = await worker.dispatchFetch("http://localhost/admin/action", {
+    method: "POST",
+    redirect: "manual",
+    headers,
+    body: new URLSearchParams({ csrf, action: "createUser", username, password }),
+  });
+  assert.equal(created.status, 303);
+  const userId = new URL(created.headers.get("location")).searchParams.get("user");
+  assert.ok(userId);
+
+  const policy = await worker.dispatchFetch("http://localhost/admin/action", {
+    method: "POST",
+    redirect: "manual",
+    headers,
+    body: new URLSearchParams({
+      csrf,
+      action: "saveSettings",
+      scope: "user",
+      userId,
+      allowCustomHost: "1",
+      autoRotateSeconds: "8",
+    }),
+  });
+  assert.equal(policy.status, 303);
+
+  const tokenCreated = await worker.dispatchFetch("http://localhost/admin/action", {
+    method: "POST",
+    redirect: "manual",
+    headers,
+    body: new URLSearchParams({ csrf, action: "createToken", userId, label: "rotation" }),
+  });
+  assert.equal(tokenCreated.status, 303);
+  const flashCookie = tokenCreated.headers.get("set-cookie")?.split(";", 1)[0];
+  const tokenPage = await worker.dispatchFetch(
+    new URL(tokenCreated.headers.get("location"), "http://localhost"),
+    { headers: { Cookie: `${headers.Cookie}; ${flashCookie}` } },
+  );
+  const token = (await tokenPage.text()).match(/id="new-token">([^<]+)</)?.[1];
+  assert.ok(token);
+  return token;
+}
+
+test("the relay alarm rotates every provider onto one replacement host", { timeout: 30000 }, async (context) => {
   const bundle = await build({
     absWorkingDir: root,
     entryPoints: ["src/index.ts"],
@@ -90,6 +136,7 @@ test("all providers sharing a temporary host rotate to one replacement", { timeo
       ADMIN_PASSWORD: "test-password-rotation",
       WEB_ZONE: "example.com",
       BASE_HOST: "localhost",
+      WEB_ROTATION_LEAD_MS: "1000",
     },
     outboundService: () => new Response("colo=TEST\n"),
   });
@@ -116,52 +163,13 @@ test("all providers sharing a temporary host rotate to one replacement", { timeo
       scope: "global",
       allowAnonymous: "1",
       allowCustomHost: "1",
-      autoRotateSeconds: "4",
+      autoRotateSeconds: "8",
     }),
   });
   assert.equal(saved.status, 303);
 
-  const created = await worker.dispatchFetch("http://localhost/admin/action", {
-    method: "POST",
-    redirect: "manual",
-    headers,
-    body: new URLSearchParams({
-      csrf,
-      action: "createUser",
-      username: "rotation-user",
-      password: "rotation-password",
-    }),
-  });
-  assert.equal(created.status, 303);
-  const userId = new URL(created.headers.get("location")).searchParams.get("user");
-  assert.ok(userId);
-  const userPolicy = await worker.dispatchFetch("http://localhost/admin/action", {
-    method: "POST",
-    redirect: "manual",
-    headers,
-    body: new URLSearchParams({
-      csrf,
-      action: "saveSettings",
-      scope: "user",
-      userId,
-      allowCustomHost: "1",
-      autoRotateSeconds: "4",
-    }),
-  });
-  assert.equal(userPolicy.status, 303);
-  const tokenCreated = await worker.dispatchFetch("http://localhost/admin/action", {
-    method: "POST",
-    redirect: "manual",
-    headers,
-    body: new URLSearchParams({ csrf, action: "createToken", userId, label: "rotation" }),
-  });
-  assert.equal(tokenCreated.status, 303);
-  const flashCookie = tokenCreated.headers.get("set-cookie")?.split(";", 1)[0];
-  const tokenPage = await worker.dispatchFetch(new URL(tokenCreated.headers.get("location"), "http://localhost"), {
-    headers: { Cookie: `${session}; ${flashCookie}` },
-  });
-  const token = (await tokenPage.text()).match(/id="new-token">([^<]+)</)?.[1];
-  assert.ok(token);
+  const token = await createUserToken(worker, headers, csrf, "rotation-user", "rotation-password");
+  const secondToken = await createUserToken(worker, headers, csrf, "intruder", "intruder-password");
 
   const first = await openProvider(worker, token);
   const published = await register(first, "");
@@ -174,55 +182,89 @@ test("all providers sharing a temporary host rotate to one replacement", { timeo
   assert.equal(joined.success, true, JSON.stringify(joined));
   assert.equal(joined.host, published.host);
 
-  first.socket.send(jsonFrame(0x12, {
-    host: "",
-    backends: first.backends,
-    rotate: true,
-  }));
-  const firstRotation = framePayload(await first.next(0x13));
-  const broadcast = framePayload(await second.next(0x18));
-  assert.equal(firstRotation.success, true, JSON.stringify(firstRotation));
-  assert.equal(firstRotation.temporary, true);
-  assert.notEqual(firstRotation.host, published.host);
-  assert.equal(broadcast.host, firstRotation.host);
-  assert.equal(broadcast.url, firstRotation.url);
-
-  // Both providers now race their own timers. The relay rotates once and
-  // hands the loser the same hostname instead of allocating a second one.
-  first.socket.send(jsonFrame(0x12, {
-    host: firstRotation.host,
-    backends: first.backends,
-    rotate: true,
-  }));
-  second.socket.send(jsonFrame(0x12, {
-    host: firstRotation.host,
-    backends: second.backends,
-    rotate: true,
-  }));
-  const [firstAgain, secondAgain] = await Promise.all([
-    first.next(0x13).then(framePayload),
-    second.next(0x13).then(framePayload),
+  // No provider asks for a rotation: the relay's alarm has to do it, and both
+  // providers must be told about the same replacement.
+  const [firstBroadcast, secondBroadcast] = await Promise.all([
+    first.next(0x18, 12000).then(framePayload),
+    second.next(0x18, 12000).then(framePayload),
   ]);
-  assert.equal(firstAgain.success, true, JSON.stringify(firstAgain));
-  assert.equal(secondAgain.success, true, JSON.stringify(secondAgain));
-  assert.equal(firstAgain.host, secondAgain.host);
-  assert.notEqual(firstAgain.host, firstRotation.host);
+  assert.equal(firstBroadcast.host, secondBroadcast.host);
+  assert.notEqual(firstBroadcast.host, published.host);
+  assert.equal(firstBroadcast.url, `https://${firstBroadcast.host}`);
 
-  // A provider that reconnects with the old host follows the recorded
-  // rotation rather than registering a fresh domain of its own.
+  // A client timer firing after the relay already rotated gets the current
+  // host back instead of allocating another one.
+  const lateNudge = await register(first, firstBroadcast.host, true);
+  assert.equal(lateNudge.success, true, JSON.stringify(lateNudge));
+  assert.equal(lateNudge.host, firstBroadcast.host);
+
+  // A provider that missed the broadcast and reconnects with the deprecated
+  // hostname is carried onto the shared successor.
   const reconnected = await openProvider(worker, token);
-  const followed = await register(reconnected, firstRotation.host);
-  assert.equal(followed.success, true);
-  assert.equal(followed.host, firstAgain.host);
+  const followed = await register(reconnected, published.host);
+  assert.equal(followed.success, true, JSON.stringify(followed));
+  assert.equal(followed.host, firstBroadcast.host);
+
+  // A different relay may not claim any hostname in the rotation chain.
+  const intruder = await openProvider(worker, secondToken);
+  const stolen = await register(intruder, published.host);
+  assert.equal(stolen.success, false);
+  assert.match(stolen.error || "", /retired/);
 
   const db = await worker.getD1Database("DB");
   const oldSite = await db.prepare("SELECT host FROM sites WHERE host = ?").bind(published.host).first();
   assert.equal(oldSite, null);
-  const rotatedSite = await db.prepare("SELECT host, rotate_seconds FROM sites WHERE host = ?").bind(firstAgain.host).first();
-  assert.equal(rotatedSite?.host, firstAgain.host);
-  assert.ok(rotatedSite.rotate_seconds > 0);
+  const retired = await db
+    .prepare("SELECT relay_id, successor_host FROM retired_hosts WHERE host = ?")
+    .bind(published.host)
+    .first();
+  assert.equal(retired?.successor_host, firstBroadcast.host);
+  assert.ok(retired.relay_id);
+  const currentSite = await db
+    .prepare("SELECT host, relay_id, owner_id, rotate_seconds FROM sites WHERE host = ?")
+    .bind(firstBroadcast.host)
+    .first();
+  assert.equal(currentSite?.host, firstBroadcast.host);
+  assert.ok(currentSite.rotate_seconds > 0);
+
+  // A missed alarm leaves an expired temporary host behind. Another account
+  // must not be able to rotate it into its own site just by registering it.
+  const expiredHost = "expired-hijack.example.com";
+  const intruderUser = await db
+    .prepare("SELECT id FROM users WHERE username = ?")
+    .bind("intruder")
+    .first();
+  assert.ok(intruderUser?.id);
+  await db
+    .prepare(
+      `INSERT INTO sites (
+         host, relay_id, owner_id, token_hash, temporary, expires_at, rotate_seconds,
+         backends_json, backend_count, insecure, anonymous, quota_bytes, quota_requests,
+         created_at, updated_at, last_seen_at
+       ) VALUES (?, ?, ?, NULL, 1, ?, 8, ?, 1, 0, 0, 0, 0, ?, ?, NULL)`,
+    )
+    .bind(
+      expiredHost,
+      currentSite.relay_id,
+      intruderUser.id,
+      Date.now() - 1_000,
+      JSON.stringify(["http://localhost:8080"]),
+      Date.now(),
+      Date.now(),
+    )
+    .run();
+  const hijacked = await register(first, expiredHost);
+  assert.equal(hijacked.success, false, JSON.stringify(hijacked));
+  assert.match(hijacked.error || "", /owned by another user/);
+  const expiredSite = await db
+    .prepare("SELECT relay_id, owner_id FROM sites WHERE host = ?")
+    .bind(expiredHost)
+    .first();
+  assert.equal(expiredSite?.relay_id, currentSite.relay_id);
+  assert.equal(expiredSite?.owner_id, intruderUser.id);
 
   first.socket.close();
   second.socket.close();
   reconnected.socket.close();
+  intruder.socket.close();
 });
