@@ -24,6 +24,9 @@ test("feature minimums are distinct and reject incompatible major versions", asy
   assert.equal(feature.supportsFeatureVersion(0x03, feature.MIN_VERSION_WEB), true);
   assert.equal(feature.supportsFeatureVersion(0x04, feature.MIN_VERSION_WEB), true);
   assert.equal(feature.supportsFeatureVersion(0x10, feature.MIN_VERSION_DIRECT), false);
+  // Generation 2 supersedes the generation 0 feature set.
+  assert.equal(feature.supportsFeatureVersion(0x20, feature.MIN_VERSION_WEB), true);
+  assert.equal(feature.supportsFeatureVersion(0x20, feature.MIN_VERSION_WEBSOCKET), true);
 });
 
 function logFrame(version) {

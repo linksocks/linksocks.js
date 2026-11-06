@@ -3,14 +3,17 @@ import zxcvbn from "zxcvbn";
 
 import type { Env, WebsocketMeta } from "./types";
 import {
+  type BaseMessage,
   type ConnectMessage,
   type ConnectorMessage,
   type ConnectorResponseMessage,
   type ConnectResponseMessage,
+  type ChannelOpenMessage,
   type DataMessage,
   type DisconnectMessage,
   type AuthMessage,
   type PartnersMessage,
+  type SealedMessage,
   type ChannelBindMessage,
   type ChannelMigrateMessage,
   type ChannelMigrateAckMessage,
@@ -25,8 +28,11 @@ import {
   type WebRotateMessage,
   parseMessageWithVersion,
   packMessage,
+  protocolMajor,
+  isCurrentProtocolMinor,
   MessageType,
   PROTOCOL_VERSION,
+  PROTOCOL_VERSION_V2,
   AuthResponseMessage,
   LogMessage,
 } from "./message";
@@ -306,6 +312,21 @@ export class Relay extends DurableObject {
       // Ignore
     }
     return {};
+  }
+
+  // socketProtocolVersion resolves the generation stamped on relay-generated
+  // frames for a connection. Connections that never declared one speak the
+  // native legacy generation.
+  private socketProtocolVersion(ws: WebSocket): number {
+    const version = this.safeDeserializeAttachment(ws).peerProtocolVersion;
+    return typeof version === "number" && version > 0 ? version : PROTOCOL_VERSION;
+  }
+
+  // sendMessage writes a relay-generated message stamped with the generation
+  // the target connection speaks. Raw forwarded frames bypass this and are
+  // relayed byte for byte.
+  private sendMessage(ws: WebSocket, msg: BaseMessage): void {
+    ws.send(packMessage(msg, this.socketProtocolVersion(ws)));
   }
 
   private syncFromState(force: boolean = false) {
@@ -778,8 +799,27 @@ export class Relay extends DurableObject {
 
         const clientIp = request.headers.get('CF-Connecting-IP') || request.headers.get('X-Forwarded-For')?.split(',')[0].trim() || 'unknown';
 
+        // Updated clients declare the protocol generation they speak in the
+        // query string (the Go client sends version=0x20). Seeding it here
+        // lets even the very first relay response be stamped correctly.
+        const versionParam = url.searchParams.get("version");
+        let declaredVersion: number | undefined;
+        if (versionParam) {
+          const parsed = Number.parseInt(versionParam.replace(/^0x/i, ""), 16);
+          if (Number.isFinite(parsed) && parsed > 0) {
+            declaredVersion = parsed;
+          }
+        }
+
         // Save session data for hibernation
-        server.serializeAttachment({ isProvider, actualToken, clientIp, web: isWebProvider, baseHost } satisfies WebsocketMeta);
+        server.serializeAttachment({
+          isProvider,
+          actualToken,
+          clientIp,
+          web: isWebProvider,
+          baseHost,
+          ...(declaredVersion !== undefined ? { peerProtocolVersion: declaredVersion } : {}),
+        } satisfies WebsocketMeta);
 
         const currentProviders = this.getActualProviderCount();
         const currentConnectors = this.getActualConnectorCount();
@@ -789,7 +829,7 @@ export class Relay extends DurableObject {
           token: actualToken,
           getType: () => MessageType.AuthResponse,
         };
-        server.send(packMessage(response));
+        this.sendMessage(server, response);
 
         const edgeColo = request.cf && request.cf.colo ? String(request.cf.colo) : 'unknown';
         const edgeColoDescription = describeCloudflareColo(edgeColo);
@@ -809,7 +849,7 @@ export class Relay extends DurableObject {
           msg: `Welcome to LinkSocks.js relay server. This server is running in ${datacenterInfo}. Your connection comes from ${clientCountry} (${clientIp}). After you connected, this relay group has ${currentProviders} ${providerLabel} and ${currentConnectors} ${connectorLabel}.`,
           getType: () => MessageType.Log,
         };
-        server.send(packMessage(log));
+        this.sendMessage(server, log);
 
         // Send partners count after auth response
         if (isProvider) {
@@ -844,11 +884,10 @@ export class Relay extends DurableObject {
       count: actualProviderCount,
       getType: () => MessageType.Partners,
     };
-    const encodedMsg = packMessage(partnersMsg);
     for (const connector of this.connectors) {
       if (exclude && connector === exclude) continue;
       try {
-        connector.send(encodedMsg);
+        this.sendMessage(connector, partnersMsg);
       } catch (e) {
         // Ignore send errors
       }
@@ -867,11 +906,10 @@ export class Relay extends DurableObject {
       count: actualConnectorCount,
       getType: () => MessageType.Partners,
     };
-    const encodedMsg = packMessage(partnersMsg);
     for (const provider of this.providers) {
       if (exclude && provider === exclude) continue;
       try {
-        provider.send(encodedMsg);
+        this.sendMessage(provider, partnersMsg);
       } catch (e) {
         // Ignore send errors
       }
@@ -900,7 +938,7 @@ export class Relay extends DurableObject {
       getType: () => MessageType.Partners,
     };
     try {
-      connector.send(packMessage(partnersMsg));
+      this.sendMessage(connector, partnersMsg);
     } catch (e) {
       // Ignore send errors
     }
@@ -960,16 +998,29 @@ export class Relay extends DurableObject {
       const { message: msg, version } = parseMessageWithVersion(messageData);
       const meta = this.safeDeserializeAttachment(ws);
       if (meta.peerProtocolVersion !== version) {
+        // A connection must not change protocol generation mid-stream: a
+        // generation-2 peer sending generation-0 frames (or vice versa) is
+        // either broken or attempting a silent downgrade.
+        if (typeof meta.peerProtocolVersion === "number" &&
+            protocolMajor(meta.peerProtocolVersion) !== protocolMajor(version)) {
+          ws.close(1008, "Connection changed protocol generation mid-stream");
+          return;
+        }
         meta.peerProtocolVersion = version;
         ws.serializeAttachment(meta);
-        if (version !== PROTOCOL_VERSION) {
-          const warning = `Protocol minor version mismatch: peer=0x${version.toString(16).padStart(2, "0")} relay=0x${PROTOCOL_VERSION.toString(16).padStart(2, "0")}; connection allowed but features may differ`;
+        if (!isCurrentProtocolMinor(version)) {
+          const knownMajor = protocolMajor(version);
+          const knownMinor = knownMajor === protocolMajor(PROTOCOL_VERSION_V2)
+            ? PROTOCOL_VERSION_V2 & 0x0f
+            : PROTOCOL_VERSION & 0x0f;
+          const baseline = (knownMajor << 4) | knownMinor;
+          const warning = `Protocol minor version mismatch: peer=0x${version.toString(16).padStart(2, "0")} relay=0x${baseline.toString(16).padStart(2, "0")}; connection allowed but features may differ`;
           console.warn(warning);
-          ws.send(packMessage({
+          this.sendMessage(ws, {
             level: "warn",
             msg: warning,
             getType: () => MessageType.Log,
-          } as LogMessage));
+          } as LogMessage);
         }
       }
       const isProvider = meta.isProvider === true;
@@ -979,6 +1030,13 @@ export class Relay extends DurableObject {
       }
       if (msg.getType() === MessageType.WebSocketFrame && !supportsFeatureVersion(version, MIN_VERSION_WEBSOCKET)) {
         ws.close(1008, "WebSocket frames require protocol 0x04 or newer");
+        return;
+      }
+      if (
+        (msg.getType() === MessageType.ChannelOpen || msg.getType() === MessageType.Sealed) &&
+        protocolMajor(version) !== protocolMajor(PROTOCOL_VERSION_V2)
+      ) {
+        ws.close(1008, "Sealed channels require protocol generation 2");
         return;
       }
 
@@ -997,7 +1055,7 @@ export class Relay extends DurableObject {
               error: "Missing actual token",
               getType: () => MessageType.AuthResponse,
             };
-            ws.send(packMessage(response));
+            this.sendMessage(ws, response);
             break;
           }
 
@@ -1009,7 +1067,7 @@ export class Relay extends DurableObject {
                 error: "Anonymous token is only allowed for providers",
                 getType: () => MessageType.AuthResponse,
               };
-              ws.send(packMessage(response));
+              this.sendMessage(ws, response);
               break;
             }
             const response: AuthResponseMessage = {
@@ -1017,7 +1075,7 @@ export class Relay extends DurableObject {
               token: actualToken,
               getType: () => MessageType.AuthResponse,
             };
-            ws.send(packMessage(response));
+            this.sendMessage(ws, response);
             if (isProvider) await this.markProviderOnline();
             break;
           }
@@ -1029,7 +1087,7 @@ export class Relay extends DurableObject {
               error: "Invalid token",
               getType: () => MessageType.AuthResponse,
             };
-            ws.send(packMessage(response));
+            this.sendMessage(ws, response);
             break;
           }
 
@@ -1040,7 +1098,7 @@ export class Relay extends DurableObject {
             token: actualToken,
             getType: () => MessageType.AuthResponse,
           };
-          ws.send(packMessage(response));
+          this.sendMessage(ws, response);
           if (isProvider) await this.markProviderOnline();
           break;
         }
@@ -1080,11 +1138,97 @@ export class Relay extends DurableObject {
           break;
         }
 
+        case MessageType.ChannelOpen: {
+          if (isProvider) {
+            ws.close(1008, "Invalid connector token.");
+            break;
+          }
+          // Protocol V2 channel request. The destination stays sealed inside
+          // the channel, so the relay only binds a provider and forwards
+          // frames from here on.
+          const openMsg = msg as ChannelOpenMessage;
+          const channelId = openMsg.channelId;
+
+          // Bind and forward through the same per-channel action queue that
+          // carries sealed frames: the peer's first sealed handshake frame
+          // can already be in flight while this handler awaits a provider,
+          // and it must not overtake the binding.
+          await this.queueNetworkAction(channelId, async () => {
+            // A resume must reach the provider the channel is already bound
+            // to; only a fresh open picks a (possibly different) provider
+            // and counts against the request quota.
+            let provider = this.providerChannels.get(channelId) ?? null;
+            if (provider && !this.providers.has(provider)) {
+              // The bound provider is gone; drop the stale binding.
+              this.disconnectChannel(channelId);
+              provider = null;
+            }
+
+            if (!provider) {
+              // Get round-robin provider
+              provider = await this.waitForNextProvider(Relay.DEFAULT_CONNECTOR_WAIT_PROVIDER_MS);
+              if (!provider) {
+                const response: ConnectResponseMessage = {
+                  success: false,
+                  error: 'No available providers',
+                  channelId,
+                  getType: () => MessageType.ConnectResponse,
+                };
+                this.sendMessage(ws, response);
+                return;
+              }
+
+              const quota = await this.getNetworkQuota(provider);
+              if (quota && !await consumeQuota(this.env, quota.principal, 0, 1, quota.bytes, quota.requests)) {
+                const response: ConnectResponseMessage = {
+                  success: false,
+                  error: "Quota exceeded",
+                  channelId,
+                  getType: () => MessageType.ConnectResponse,
+                };
+                this.sendMessage(ws, response);
+                return;
+              }
+
+              this.providerChannels.set(channelId, provider);
+              this.connectorChannels.set(channelId, ws);
+
+              // Report channel creation (batched — flushed together with traffic)
+              this.pendingChannelCreations++;
+
+              // Update metadata for both WebSockets
+              const providerMeta = this.safeDeserializeAttachment(provider);
+              if (quota) {
+                providerMeta.quotaPrincipal = quota.principal;
+                providerMeta.quotaBytes = quota.bytes;
+                providerMeta.quotaRequests = quota.requests;
+              }
+              providerMeta.channels = providerMeta.channels || [];
+              providerMeta.channels.push(channelId);
+              provider.serializeAttachment(providerMeta);
+
+              const connectorMeta = ws.deserializeAttachment() as WebsocketMeta;
+              connectorMeta.channels = connectorMeta.channels || [];
+              connectorMeta.channels.push(channelId);
+              ws.serializeAttachment(connectorMeta);
+            }
+
+            // Forward the open (raw bytes) to the provider.
+            provider.send(message);
+          });
+          break;
+        }
+
         case MessageType.Connect: {
-          if (!isProvider) {
-            // Only connectors can send Connect messages
-            const connectMsg = msg as ConnectMessage;
-            
+          if (isProvider) {
+            ws.close(1008, "Invalid connector token.");
+            break;
+          }
+          // Only connectors can send Connect messages. Binding and forwarding
+          // go through the per-channel action queue so the first Data frame
+          // cannot overtake the bind while a provider is being awaited.
+          const connectMsg = msg as ConnectMessage;
+          await this.queueNetworkAction(connectMsg.channelId, async () => {
             // Get round-robin provider
             const provider = await this.waitForNextProvider(Relay.DEFAULT_CONNECTOR_WAIT_PROVIDER_MS);
             if (!provider) {
@@ -1094,8 +1238,8 @@ export class Relay extends DurableObject {
                 channelId: connectMsg.channelId,
                 getType: () => MessageType.ConnectResponse,
               };
-              ws.send(packMessage(response));
-              break;
+              this.sendMessage(ws, response);
+              return;
             }
 
             const quota = await this.getNetworkQuota(provider);
@@ -1106,8 +1250,8 @@ export class Relay extends DurableObject {
                 channelId: connectMsg.channelId,
                 getType: () => MessageType.ConnectResponse,
               };
-              ws.send(packMessage(response));
-              break;
+              this.sendMessage(ws, response);
+              return;
             }
 
             // Create a new channel
@@ -1136,9 +1280,7 @@ export class Relay extends DurableObject {
 
             // Forward the connect message to provider
             provider.send(message);
-          } else {
-            ws.close(1008, "Invalid connector token.");
-          }
+          });
           break;
         }
 
@@ -1180,7 +1322,7 @@ export class Relay extends DurableObject {
                 connectorToken,
                 getType: () => MessageType.ConnectorResponse,
               };
-              ws.send(packMessage(response));
+              this.sendMessage(ws, response);
               break;
             }
 
@@ -1201,7 +1343,7 @@ export class Relay extends DurableObject {
                   channelId: connectorMsg.channelId,
                   getType: () => MessageType.ConnectorResponse,
                 };
-                ws.send(packMessage(response));
+                this.sendMessage(ws, response);
                 break;
               }
             }
@@ -1217,7 +1359,7 @@ export class Relay extends DurableObject {
                 channelId: connectorMsg.channelId,
                 getType: () => MessageType.ConnectorResponse,
               };
-              ws.send(packMessage(response));
+              this.sendMessage(ws, response);
               break;
             }
             
@@ -1241,7 +1383,7 @@ export class Relay extends DurableObject {
               getType: () => MessageType.ConnectorResponse,
             };
 
-            ws.send(packMessage(response));
+            this.sendMessage(ws, response);
           }
           break;
         }
@@ -1261,6 +1403,15 @@ export class Relay extends DurableObject {
         case MessageType.Data: {
           const dataMsg = msg as DataMessage;
           await this.queueNetworkAction(dataMsg.channelId, () => this.forwardNetworkData(ws, message, dataMsg, isProvider));
+          break;
+        }
+
+        case MessageType.Sealed: {
+          // Protocol V2 opaque payload: routed exactly like Data through the
+          // per-channel action queue, but the relay never looks inside.
+          const sealedMsg = msg as SealedMessage;
+          await this.queueNetworkAction(sealedMsg.channelId, () =>
+            this.forwardChannelPayload(ws, message, sealedMsg.channelId, sealedMsg.data.byteLength, isProvider));
           break;
         }
 
@@ -1379,8 +1530,21 @@ export class Relay extends DurableObject {
   }
 
   private async forwardNetworkData(ws: WebSocket, message: ArrayBuffer | string, data: DataMessage, isProvider: boolean): Promise<void> {
-    const provider = this.providerChannels.get(data.channelId);
-    const connector = this.connectorChannels.get(data.channelId);
+    await this.forwardChannelPayload(ws, message, data.channelId, data.data.byteLength, isProvider);
+  }
+
+  // forwardChannelPayload routes one channel payload frame to the peer and
+  // applies per-provider byte quota. Both the legacy Data frame and the
+  // protocol V2 Sealed frame use it; the relay never inspects the payload.
+  private async forwardChannelPayload(
+    ws: WebSocket,
+    message: ArrayBuffer | string,
+    channelId: string,
+    payloadBytes: number,
+    isProvider: boolean,
+  ): Promise<void> {
+    const provider = this.providerChannels.get(channelId);
+    const connector = this.connectorChannels.get(channelId);
     if (!provider || !connector || (isProvider ? provider !== ws : connector !== ws)) return;
 
     let meta = this.safeDeserializeAttachment(provider);
@@ -1395,14 +1559,14 @@ export class Relay extends DurableObject {
       }
     }
     if (meta.quotaPrincipal && this.env.DB && !await consumeQuota(this.env, meta.quotaPrincipal,
-      data.data.byteLength, 0, meta.quotaBytes || 0, meta.quotaRequests || 0)) {
-      const disconnect = packMessage({ channelId: data.channelId, getType: () => MessageType.Disconnect } as DisconnectMessage);
-      try { provider.send(disconnect); } catch {}
-      try { connector.send(disconnect); } catch {}
-      this.disconnectChannel(data.channelId);
+      payloadBytes, 0, meta.quotaBytes || 0, meta.quotaRequests || 0)) {
+      const disconnect: DisconnectMessage = { channelId, getType: () => MessageType.Disconnect };
+      try { this.sendMessage(provider, disconnect); } catch {}
+      try { this.sendMessage(connector, disconnect); } catch {}
+      this.disconnectChannel(channelId);
       return;
     }
-    if (this.providerChannels.get(data.channelId) !== provider || this.connectorChannels.get(data.channelId) !== connector) return;
+    if (this.providerChannels.get(channelId) !== provider || this.connectorChannels.get(channelId) !== connector) return;
     (isProvider ? connector : provider).send(message);
   }
 
@@ -1420,7 +1584,7 @@ export class Relay extends DurableObject {
         getType: () => MessageType.WebRegisterResponse,
       };
       try {
-        ws.send(packMessage(response));
+        this.sendMessage(ws, response);
       } catch {
         // The provider may have disconnected while registration was in flight.
       }
@@ -1743,7 +1907,7 @@ export class Relay extends DurableObject {
           getType: () => MessageType.Log,
         };
         try {
-          ws.send(packMessage(notice));
+          this.sendMessage(ws, notice);
         } catch {
           // The response below still carries the new host.
         }
@@ -1872,13 +2036,11 @@ export class Relay extends DurableObject {
     }
     if (error) {
       try {
-        pending.ws.send(
-          packMessage({
-            channelId,
-            reason: error.message,
-            getType: () => MessageType.WebCancel,
-          } as WebCancelMessage),
-        );
+        this.sendMessage(pending.ws, {
+          channelId,
+          reason: error.message,
+          getType: () => MessageType.WebCancel,
+        } as WebCancelMessage);
       } catch {
         // Ignore provider disconnect.
       }
@@ -2065,7 +2227,6 @@ export class Relay extends DurableObject {
       rotateSeconds: latest.rotate_seconds,
       getType: () => MessageType.WebRotate,
     };
-    const encoded = packMessage(rotateMessage);
     for (const provider of providers) {
       const meta = this.safeDeserializeAttachment(provider);
       meta.webHosts = [host];
@@ -2073,7 +2234,7 @@ export class Relay extends DurableObject {
       // The initiator gets the same data in its registration response.
       if (provider === initiator) continue;
       try {
-        provider.send(encoded);
+        this.sendMessage(provider, rotateMessage);
       } catch {
         // The provider will re-register and follow the tombstone.
       }
@@ -2323,7 +2484,7 @@ export class Relay extends DurableObject {
     };
 
     try {
-      ws.send(packMessage(webRequest));
+      this.sendMessage(ws, webRequest);
     } catch {
       this.finishWebPending(channelId, new Error("Provider disconnected"));
       return new Response("Origin disconnected", { status: 502 });
@@ -2334,14 +2495,12 @@ export class Relay extends DurableObject {
         const chunk = body.slice(offset, offset + WEB_DATA_CHUNK_BYTES);
         const end = offset + chunk.byteLength >= body.byteLength;
         try {
-          ws.send(
-            packMessage({
-              channelId,
-              data: chunk,
-              end,
-              getType: () => MessageType.WebData,
-            } as WebDataMessage),
-          );
+          this.sendMessage(ws, {
+            channelId,
+            data: chunk,
+            end,
+            getType: () => MessageType.WebData,
+          } as WebDataMessage);
         } catch {
           this.finishWebPending(channelId, new Error("Provider disconnected"));
           return new Response("Origin disconnected", { status: 502 });
@@ -2437,7 +2596,7 @@ export class Relay extends DurableObject {
       headers, hasBody: false, host, webSocket: true, getType: () => MessageType.WebRequest,
     };
     try {
-      provider.send(packMessage(webRequest));
+      this.sendMessage(provider, webRequest);
     } catch {
       this.finishWebPending(channelId, new Error("Provider disconnected"));
       return new Response("Origin disconnected", { status: 502 });
@@ -2493,7 +2652,7 @@ export class Relay extends DurableObject {
       return;
     }
     if (meta.webHost) this.reportWebBytes(meta.webHost, data.byteLength);
-    provider.send(packMessage({ channelId, opcode: typeof message === "string" ? 1 : 2, data, getType: () => MessageType.WebSocketFrame } as WebSocketFrameMessage));
+    this.sendMessage(provider, { channelId, opcode: typeof message === "string" ? 1 : 2, data, getType: () => MessageType.WebSocketFrame } as WebSocketFrameMessage);
   }
 
   private async forwardWebSocketProvider(ws: WebSocket, frame: WebSocketFrameMessage): Promise<void> {
@@ -2518,7 +2677,7 @@ export class Relay extends DurableObject {
       meta.webSocketChannels = (meta.webSocketChannels || []).filter((item) => item !== channelId);
       try { provider.serializeAttachment(meta); } catch {}
       if (notifyProvider) {
-        try { provider.send(packMessage({ channelId, code, reason, getType: () => MessageType.WebCancel } as WebCancelMessage)); } catch {}
+        try { this.sendMessage(provider, { channelId, code, reason, getType: () => MessageType.WebCancel } as WebCancelMessage); } catch {}
       }
     }
     if (client) {
@@ -2724,14 +2883,13 @@ export class Relay extends DurableObject {
       getType: () => MessageType.Log,
     };
 
-    const encodedMsg = packMessage(msg);
     let notified = 0;
 
     for (const ws of this.state.getWebSockets()) {
       const meta = this.safeDeserializeAttachment(ws);
       if (meta.isProvider === true) continue;
       try {
-        ws.send(encodedMsg);
+        this.sendMessage(ws, msg);
         notified++;
       } catch {
         // Ignore send errors

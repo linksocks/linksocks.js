@@ -5,8 +5,35 @@ import { gzip, ungzip } from "pako";
 // ask the project owner for approval. Feature minimums are separate from this version.
 export const PROTOCOL_VERSION = 0x04;
 
-function protocolMajor(v: number): number {
+// Protocol generation 2 replaces plaintext relay payloads with end-to-end
+// encrypted channels: peers ask the relay to bind a channel (ChannelOpen), run
+// a Noise handshake between themselves and exchange Sealed frames the relay
+// only routes by channel id. Destinations, payloads and peer decisions never
+// cross the wire in plaintext.
+export const PROTOCOL_VERSION_V2 = 0x20;
+
+export function protocolMajor(v: number): number {
   return (v >> 4) & 0x0f;
+}
+
+// Protocol generations this relay can parse: generation 0 is the legacy
+// plaintext protocol, generation 2 is the end-to-end encrypted protocol.
+const SUPPORTED_PROTOCOL_MAJORS = [0, 2];
+
+// Newest minor version this relay knows for each generation; peers are
+// compared against their own generation's baseline.
+const KNOWN_MINOR_BY_MAJOR: Record<number, number> = {
+  0: PROTOCOL_VERSION & 0x0f,
+  2: PROTOCOL_VERSION_V2 & 0x0f,
+};
+
+function protocolMinorIsCurrent(version: number): boolean {
+  const known = KNOWN_MINOR_BY_MAJOR[protocolMajor(version)];
+  return known !== undefined && (version & 0x0f) === known;
+}
+
+export function isCurrentProtocolMinor(version: number): boolean {
+  return protocolMinorIsCurrent(version);
 }
 
 // Binary message types
@@ -36,6 +63,8 @@ export const enum BinaryType {
   WebCancel = 0x17,
   WebRotate = 0x18,
   WebSocketFrame = 0x19,
+  ChannelOpen = 0x1A,
+  Sealed = 0x1B,
 }
 
 // Protocol types
@@ -77,6 +106,8 @@ export const enum MessageType {
   WebCancel = "web_cancel",
   WebRotate = "web_rotate",
   WebSocketFrame = "websocket_frame",
+  ChannelOpen = "channel_open",
+  Sealed = "sealed",
   Unknown = "unknown",
 }
 
@@ -152,6 +183,21 @@ export interface LogMessage extends BaseMessage {
 
 export interface PartnersMessage extends BaseMessage {
   count: number;
+}
+
+// Protocol V2 channel request: ask the relay to bind a channel to a peer.
+// The destination stays sealed inside the channel, so it is not represented
+// here.
+export interface ChannelOpenMessage extends BaseMessage {
+  channelId: string;
+  resume?: boolean;
+}
+
+// Protocol V2 opaque payload frame: the relay routes it by channel id and
+// never parses the data.
+export interface SealedMessage extends BaseMessage {
+  channelId: string;
+  data: Uint8Array;
 }
 
 export interface DirectCandidate {
@@ -364,9 +410,9 @@ function concatUint8Arrays(...arrays: Uint8Array[]): Uint8Array {
   return result;
 }
 
-export function packMessage(msg: BaseMessage): Uint8Array {
+export function packMessage(msg: BaseMessage, version: number = PROTOCOL_VERSION): Uint8Array {
   // Start with version
-  const header = new Uint8Array([PROTOCOL_VERSION]);
+  const header = new Uint8Array([version]);
 
   switch (msg.getType()) {
     case MessageType.Auth: {
@@ -838,6 +884,31 @@ export function packMessage(msg: BaseMessage): Uint8Array {
       return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
     }
 
+    case MessageType.ChannelOpen: {
+      const openMsg = msg as ChannelOpenMessage;
+      const channelIdBytes = uuidToBytes(openMsg.channelId);
+      const payload = [BinaryType.ChannelOpen, ...channelIdBytes];
+      if (openMsg.resume) {
+        payload.push(1);
+      }
+      return concatUint8Arrays(header, new Uint8Array(payload));
+    }
+
+    case MessageType.Sealed: {
+      const sealedMsg = msg as SealedMessage;
+      const channelIdBytes = uuidToBytes(sealedMsg.channelId);
+      const dataLen = sealedMsg.data.length;
+      const payload = [
+        BinaryType.Sealed,
+        ...channelIdBytes,
+        (dataLen >> 24) & 0xff,
+        (dataLen >> 16) & 0xff,
+        (dataLen >> 8) & 0xff,
+        dataLen & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), sealedMsg.data);
+    }
+
     default:
       throw new Error("Unsupported message type for binary serialization");
   }
@@ -865,7 +936,7 @@ export function parseMessageWithVersion(data: Uint8Array): ParsedMessageWithVers
   }
 
   const version = data[0];
-  if (protocolMajor(version) !== protocolMajor(PROTOCOL_VERSION)) {
+  if (!SUPPORTED_PROTOCOL_MAJORS.includes(protocolMajor(version))) {
     throw new Error(
       `Unsupported protocol major version: peer=0x${version.toString(16).padStart(2, "0")} local=0x${PROTOCOL_VERSION.toString(16).padStart(2, "0")}`,
     );
@@ -1467,6 +1538,42 @@ export function parseMessageWithVersion(data: Uint8Array): ParsedMessageWithVers
           rotateSeconds: parsed.rotate_seconds,
           getType: () => MessageType.WebRotate,
         } as WebRotateMessage,
+      };
+    }
+
+    case BinaryType.ChannelOpen: {
+      if (payload.length < 16) {
+        throw new Error("Invalid channel open message");
+      }
+      return {
+        version,
+        message: {
+          channelId: bytesToUUID(payload.slice(0, 16)),
+          resume: payload.length > 16 ? Boolean(payload[16]) : false,
+          getType: () => MessageType.ChannelOpen,
+        } as ChannelOpenMessage,
+      };
+    }
+
+    case BinaryType.Sealed: {
+      if (payload.length < 20) {
+        throw new Error("Invalid sealed message");
+      }
+      const dataLen =
+        (payload[16] << 24) |
+        (payload[17] << 16) |
+        (payload[18] << 8) |
+        payload[19];
+      if (payload.length < 20 + dataLen) {
+        throw new Error("Invalid sealed message length");
+      }
+      return {
+        version,
+        message: {
+          channelId: bytesToUUID(payload.slice(0, 16)),
+          data: payload.slice(20, 20 + dataLen),
+          getType: () => MessageType.Sealed,
+        } as SealedMessage,
       };
     }
 

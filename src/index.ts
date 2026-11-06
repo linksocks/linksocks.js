@@ -2,7 +2,7 @@ import type { DurableObjectUsage, Env, HealthStatusCache, HealthStatusResponse }
 import zxcvbn from "zxcvbn";
 
 import { handleErrors } from "./common";
-import { AuthResponseMessage, packMessage, MessageType } from "./message";
+import { AuthResponseMessage, packMessage, PROTOCOL_VERSION, MessageType } from "./message";
 import { formatBytes, getAnonymousSettings, getSite, normalizeHost } from "./db";
 import { ensureSchema } from "./db";
 import { handleAdmin, handleDashboard, handleRegister } from "./panel";
@@ -1942,16 +1942,27 @@ async function sha256Hex(input: string): Promise<string> {
     .join("");
 }
 
-function rejectWithMessage(message: string): Response {
+// rejectWithMessage answers a rejected WebSocket handshake. When the caller
+// declared a protocol generation in its URL (version=0x..), the rejection is
+// stamped with it so the peer parses the reason in its own generation.
+function rejectWithMessage(message: string, request?: Request): Response {
   const pair = new WebSocketPair();
   const [client, server] = [pair[0], pair[1]];
   server.accept();
+  let version = PROTOCOL_VERSION;
+  const declared = request ? new URL(request.url).searchParams.get("version") : null;
+  if (declared) {
+    const parsed = Number.parseInt(declared.replace(/^0x/i, ""), 16);
+    if (Number.isFinite(parsed) && parsed > 0) {
+      version = parsed;
+    }
+  }
   const response: AuthResponseMessage = {
     success: false,
     error: message,
     getType: () => MessageType.AuthResponse,
   };
-  server.send(packMessage(response));
+  server.send(packMessage(response, version));
   return new Response(null, { status: 101, webSocket: client });
 }
 
@@ -1972,7 +1983,7 @@ async function handleWebsocket(request: Request, env: Env, token: string, isProv
     const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
     const relayStr = await tokenDO.getRelay(token);
     if (!relayStr) {
-      return rejectWithMessage(`invalid token (${request.url})`);
+      return rejectWithMessage(`invalid token (${request.url})`, request);
     }
     relayId = env.RELAY.idFromString(relayStr);
   } else {
@@ -1993,7 +2004,7 @@ async function handleWebsocket(request: Request, env: Env, token: string, isProv
     if (token !== ANONYMOUS_TOKEN_HASH && !isKnownHash) {
       const validation = isTokenComplexEnough(token);
       if (!validation.valid) {
-        return rejectWithMessage(validation.reason!);
+        return rejectWithMessage(validation.reason!, request);
       }
     }
 
@@ -2009,7 +2020,7 @@ async function handleWebsocket(request: Request, env: Env, token: string, isProv
 
     const tombstoned = await tokenDO.isRelayDeleted(relayId.toString());
     if (tombstoned) {
-      return rejectWithMessage("relay has been deleted");
+      return rejectWithMessage("relay has been deleted", request);
     }
 
     // Remember sha256(actualToken) -> actualToken so clients that send the
