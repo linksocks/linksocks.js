@@ -8,6 +8,9 @@ This project is mainly used to quickly connect to uncertain user intranet enviro
 
 [中文文档 / Chinese README](README.cn.md)
 
+**Website**: [l.zetx.tech](https://l.zetx.tech) ·
+[Public zones](https://l.zetx.tech/zones)
+
 ## Installation
 
 ### Client Setup
@@ -38,6 +41,67 @@ linksocks connector -t your_token -u l.zetx.tech -p 1180
 After running both commands, you can access the internal network through the SOCKS5 proxy at `127.0.0.1:1180` on machine B.
 
 Configure your browser or applications to use this SOCKS5 proxy to access internal network resources.
+
+## Zone Networks
+
+Open `/zones` on your Worker website to browse public networks, view members
+and copy a join command. No account is needed to browse or join; signed-in
+users create zones and delete their own, and administrators manage all zones.
+Networks must be RFC1918 IPv4 CIDRs from `/16` to `/30`, with 2–256 members
+within the usable address capacity.
+
+New zones are private: they are not listed anywhere, and only machines given
+the ID can join. Only administrators can create public zones, which appear in
+the website's Public zones view and in `linksocks zone list`. Public zone
+cards mask the ID and join command until a warning is confirmed.
+
+Joining needs no privileges by default: the CLI runs a local SOCKS5 proxy for
+TCP and UDP. On Linux, `--vlan` (root) creates an L2 TAP interface with ARP,
+ICMP, broadcast, multicast and Wake-on-LAN support, MTU 1500.
+
+A machine keeps a local Ed25519 identity; an abrupt disconnect retains its
+virtual address for 24 hours, while Ctrl+C or `zone leave` releases it at once.
+The relay forwards end-to-end encrypted packets and trusts the coordinator's
+peer directory. Zone owners and administrators can set a welcome message, edit
+ordered firewall rules (up to 64, first match wins, with a default allow/deny
+policy) and kick or remove members; `--vlan` frames are filtered by the
+receiving members.
+
+See the [zone guide](https://linksocks.github.io/guide/zones) for joining,
+identity files, non-overlapping routes and platform requirements. Linux has
+real TAP and proxy-mode verification; Windows and macOS have cross-compilation
+checks only. The Python library does not expose a zone API.
+
+### Enable Zones on Your Deployment
+
+Keep the existing `RELAY`, `TOKEN` and `DB` bindings. The checked-in
+`wrangler.jsonc` also includes a `durable_objects.bindings` entry for zones:
+
+```json
+{ "name": "ZONE", "class_name": "Zone" }
+```
+
+The `exports` configuration declares SQLite storage for the exported class:
+
+```json
+{ "Zone": { "type": "durable-object", "storage": "sqlite" } }
+```
+
+Use both entries when upgrading an existing configuration. Keep the `DB`
+database ID set to your own D1 database and `migrations_dir` set to `migrations`.
+Apply the D1 migrations, including `migrations/0005_zones.sql` and
+`migrations/0006_zone_visibility.sql`, before deploying the updated Worker:
+
+```bash
+npx wrangler d1 migrations apply linksocks --remote
+npx wrangler deploy
+```
+
+For local development, apply migrations with `--local` in place of `--remote`,
+then run `npx wrangler dev`. Zone networks do not need wildcard DNS or
+`WEB_ZONE`; those settings are for publishing websites. If you configure
+`BASE_HOST`, open `/zones` on that control-plane hostname. Account setup uses
+`ADMIN_USERNAME` and the `ADMIN_PASSWORD` secret described below.
 
 ## Key Benefits
 
@@ -292,4 +356,3 @@ toward the same transfer quota as HTTP traffic.
 - WebSocket permessage-deflate extensions are not negotiated through the proxy.
 - Request bodies are capped at 16 MB; responses are streamed.
 - Temporary hosts must be re-registered after expiry.
-

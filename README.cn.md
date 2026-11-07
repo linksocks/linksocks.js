@@ -6,6 +6,9 @@
 
 本项目主要用于快速连接到不确定用户的内网环境。
 
+**网站**：[l.zetx.tech](https://l.zetx.tech) ·
+[公开 Zone](https://l.zetx.tech/zones)
+
 ## 安装
 
 ### 客户端设置
@@ -36,6 +39,60 @@ linksocks connector -t your_token -u l.zetx.tech -p 1180
 运行这两个命令后，你可以通过机器 B 上的 SOCKS5 代理（`127.0.0.1:1180`）访问内部网络。
 
 将你的浏览器或应用程序配置为使用此 SOCKS5 代理来访问内部网络资源。
+
+## Zone 虚拟网络
+
+打开 Worker 网站的 `/zones` 页面，即可浏览公开网络、查看成员并复制加入命令。
+浏览和加入无需账号；登录用户可以创建 Zone、删除自己的 Zone，管理员可以管理
+全部 Zone。网段必须是 RFC1918 私有 IPv4 CIDR，前缀为 `/16` 到 `/30`；成员上限为
+2–256，且不能超过网段的可用地址数。
+
+新建 Zone 默认为私有：不出现在任何列表中，只有拿到 ID 的机器才能加入。公开
+Zone 仅管理员可以创建，会出现在网站的 **Public zones** 视图和 CLI 的
+`linksocks zone list` 中。公开 Zone 的卡片会遮盖 ID 和加入命令，确认警告后才显示。
+
+默认加入不需要特殊权限：CLI 会在本机运行 SOCKS5 代理，支持 TCP 和 UDP。
+Linux 下可用 `--vlan`（需要 root）创建二层 TAP 网卡，支持 ARP、ICMP、广播、组播
+和 WOL，MTU 为 1500。
+
+每台机器保留本地 Ed25519 身份；异常掉线后虚拟地址保留 24 小时，Ctrl+C 或
+`zone leave` 则立即释放。中继转发端到端加密的数据包，并依赖协调服务提供可信的
+成员目录。Zone 所有者和管理员可以设置欢迎语、编辑有序防火墙规则（最多 64 条，
+首条匹配生效，另有默认 allow/deny 策略），并踢出或移除成员；`--vlan` 的以太网帧
+由接收端成员过滤。
+
+加入方法、身份文件、路由冲突和平台要求见
+[Zone 使用指南](https://linksocks.github.io/zh/guide/zones)。Linux 已通过真实 TAP
+和代理模式验证，Windows 和 macOS 仅通过交叉编译检查。Python 库不提供 Zone API。
+
+### 为部署启用 Zone
+
+保留已有的 `RELAY`、`TOKEN` 和 `DB` 绑定。仓库中的 `wrangler.jsonc` 还在
+`durable_objects.bindings` 中包含 Zone 绑定：
+
+```json
+{ "name": "ZONE", "class_name": "Zone" }
+```
+
+`exports` 配置将导出的类声明为使用 SQLite 存储：
+
+```json
+{ "Zone": { "type": "durable-object", "storage": "sqlite" } }
+```
+
+升级已有配置时需要同时加入这两项。`DB` 的数据库 ID 应填写你自己的 D1 数据库，
+`migrations_dir` 保持为 `migrations`。部署新版 Worker 前，应用 D1 迁移，
+其中包含 `migrations/0005_zones.sql` 和 `migrations/0006_zone_visibility.sql`：
+
+```bash
+npx wrangler d1 migrations apply linksocks --remote
+npx wrangler deploy
+```
+
+本地开发时把 `--remote` 改为 `--local` 应用迁移，再运行 `npx wrangler dev`。
+Zone 不需要通配 DNS 或 `WEB_ZONE`，这些配置用于网站发布。如果设置了 `BASE_HOST`，
+请在该控制台域名下打开 `/zones`。账号初始化使用下文介绍的 `ADMIN_USERNAME` 和
+`ADMIN_PASSWORD` secret。
 
 ## 核心优势
 
@@ -269,4 +326,3 @@ SOCKS5 中继流量与网站代理流量消耗同一个计数器，额度用尽�
 - 代理不会协商 WebSocket 的 permessage-deflate 扩展。
 - 请求体上限 16 MB；响应体为流式转发。
 - 每个临时域名有失效时间，过期后必须重新注册才能获得新域名。
-
