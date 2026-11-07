@@ -25,6 +25,7 @@ test("administrator can enable and disable policy checkboxes", { timeout: 20000 
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: "settings-test" },
     bindings: { ADMIN_USERNAME: "admin", ADMIN_PASSWORD: password },

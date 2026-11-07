@@ -7,8 +7,11 @@ import { formatBytes, getAnonymousSettings, getSite, normalizeHost } from "./db"
 import { ensureSchema } from "./db";
 import { handleAdmin, handleDashboard, handleRegister } from "./panel";
 import { renderErrorPage, renderExpiredPage } from "./ui";
+import { handleZones } from "./zone";
+import { handleZonesPage } from "./zone-ui";
 export { Relay } from "./relay";
 export { Token } from "./token";
+export { Zone } from "./zone";
 
 const HEALTH_CACHE_TTL_MS = 60 * 60 * 1000;
 const HEALTH_REFRESH_WINDOW_MS = 10 * 60 * 1000;
@@ -187,6 +190,14 @@ export default {
       // control-plane routes only exist on the configured base host(s).
       if (!isInternalRequestHost(requestHost, env)) {
         return await handleSiteProxy(request, env, url, requestHost);
+      }
+
+      if (path[1] === "zone" || (path[1] === "api" && path[2] === "zones")) {
+        return await handleZones(request, env, url);
+      }
+
+      if (url.pathname === "/zones") {
+        return await handleZonesPage(request, env, url);
       }
 
       if (path[1] === "admin" && env.DB) {
@@ -734,6 +745,7 @@ export default {
     @media (max-width: 640px) {
       .usageSection { padding: 18px; }
       .usageGrid { grid-template-columns: 1fr; }
+      .signInBtn { min-height: 44px; }
     }
   </style>
 </head>
@@ -758,7 +770,7 @@ export default {
         <div class="intro">
           <div class="kicker">Cloudflare Workers · WebSocket relay</div>
           <h1 class="title">Public Relay Server</h1>
-          <p class="subtitle">One endpoint for both LinkSocks cores: relay traffic and published sites share the same server. Live relay traffic and quota usage are below.</p>
+          <p class="subtitle">Relay proxy traffic, publish a site, or connect machines in a zone. Live relay traffic and quota usage are below.</p>
         </div>
         ${statsError ? `<div class="errBanner">Stats temporarily unavailable: ${statsError}</div>` : ""}
         <div class="stats">
@@ -2173,4 +2185,3 @@ async function handleSiteProxy(
     );
   }
 }
-

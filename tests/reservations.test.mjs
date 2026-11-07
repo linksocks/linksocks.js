@@ -60,6 +60,7 @@ test("reserved hostnames block other accounts and forced temporary mode rotates 
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: "reservations-test" },
     bindings: {

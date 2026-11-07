@@ -46,6 +46,10 @@
       {
         "name": "TOKEN",
         "class_name": "Token"
+      },
+      {
+        "name": "ZONE",
+        "class_name": "Zone"
       }
     ]
   },
@@ -56,6 +60,10 @@
       "storage": "sqlite"
     },
     "Token": {
+      "type": "durable-object",
+      "storage": "sqlite"
+    },
+    "Zone": {
       "type": "durable-object",
       "storage": "sqlite"
     }

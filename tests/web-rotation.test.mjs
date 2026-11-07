@@ -129,6 +129,7 @@ test("the relay alarm rotates every provider onto one replacement host", { timeo
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: "web-rotation-test" },
     bindings: {

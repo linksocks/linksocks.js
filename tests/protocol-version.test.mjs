@@ -138,6 +138,7 @@ test("SOCKS connections never select a Web-only provider", { timeout: 20000 }, a
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: "provider-test" },
     bindings: { WEB_ZONE: "example.com", BASE_HOST: "localhost" },
@@ -194,6 +195,7 @@ test("worker checks versions and ends cancelled web requests", { timeout: 20000 
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: "linksocks-test" },
     bindings: { WEB_ZONE: "example.com", BASE_HOST: "localhost", ADMIN_USERNAME: "admin" },

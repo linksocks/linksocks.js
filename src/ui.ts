@@ -435,13 +435,14 @@ footer a:hover{color:var(--ink)}
 }
 `;
 
-function layout(opts: {
+export function layout(opts: {
   title: string;
   subtitle?: string;
   nav?: Array<{ href: string; label: string; active?: boolean }>;
   userLabel?: string;
   logoutAction?: string;
   content: string;
+  styles?: string;
   scripts?: string;
   bare?: boolean;
 }): string {
@@ -460,7 +461,7 @@ function layout(opts: {
 <meta charset="UTF-8"/>
 <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
 <title>${escapeHtml(opts.title)} · LinkSocks</title>
-<style>${STYLE}</style>
+<style>${STYLE}${opts.styles || ""}</style>
 </head>
 <body>
 ${opts.bare ? opts.content : `<div class="wrap">
@@ -470,7 +471,7 @@ ${opts.bare ? opts.content : `<div class="wrap">
       <div>
         <div class="eyebrow">LinkSocks</div>
         <h1>${escapeHtml(opts.title)}</h1>
-        <div class="sub">${escapeHtml(opts.subtitle || "Relay and site control plane")}</div>
+        <div class="sub">${escapeHtml(opts.subtitle || "Relays, sites and zones")}</div>
       </div>
     </div>
     <div class="actions">
@@ -480,7 +481,7 @@ ${opts.bare ? opts.content : `<div class="wrap">
   </div>
   ${nav ? `<div class="nav">${nav}</div>` : ""}
   <div class="section">${opts.content}</div>
-  <footer><span>LinkSocks.js · Relay and site control plane · D1</span><span><a href="/">Home</a> · <a href="/dashboard">Dashboard</a></span></footer>
+  <footer><span>LinkSocks.js · Relays, sites and zones</span><span><a href="/">Home</a> · <a href="/dashboard">Dashboard</a></span></footer>
 </div>`}
 <script>
 (function(){
@@ -970,6 +971,7 @@ export function renderAdminPage(data: AdminPageData): string {
     { href: "/admin?tab=tokens", label: "Tokens", active: data.tab === "tokens" },
     { href: "/admin?tab=reservations", label: "Reservations", active: data.tab === "reservations" },
     { href: "/admin?tab=settings", label: "Settings", active: data.tab === "settings" },
+    { href: "/zones", label: "My Zones", active: false },
     { href: "/dashboard", label: "My dashboard", active: false },
   ];
 
@@ -1203,6 +1205,7 @@ export function renderDashboardPage(data: DashboardPageData): string {
     { href: "/dashboard?tab=overview", label: "Overview", active: data.tab === "overview" },
     { href: "/dashboard?tab=sites", label: "My sites", active: data.tab === "sites" },
     { href: "/dashboard?tab=tokens", label: "Tokens", active: data.tab === "tokens" },
+    { href: "/zones", label: "My Zones", active: false },
   ];
   if (data.user.isAdmin) {
     nav.push({ href: "/admin", label: "Admin console", active: false });

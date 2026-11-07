@@ -166,6 +166,16 @@ const SCHEMA: string[] = [
   )`,
   `CREATE INDEX IF NOT EXISTS idx_sites_owner ON sites(owner_id)`,
   `CREATE INDEX IF NOT EXISTS idx_sites_relay ON sites(relay_id)`,
+  `CREATE TABLE IF NOT EXISTS zones (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    cidr TEXT NOT NULL,
+    max_members INTEGER NOT NULL CHECK (max_members BETWEEN 2 AND 256),
+    owner_id TEXT NOT NULL,
+    created_at INTEGER NOT NULL,
+    visibility TEXT NOT NULL DEFAULT 'private'
+  )`,
+  `CREATE INDEX IF NOT EXISTS idx_zones_owner ON zones(owner_id)`,
   `CREATE TABLE IF NOT EXISTS reservations (
     host TEXT PRIMARY KEY,
     user_id TEXT NOT NULL,
@@ -220,6 +230,8 @@ export async function ensureSchema(env: Env): Promise<void> {
 async function initSchema(env: Env): Promise<void> {
   const db = requireDb(env);
   await db.batch(SCHEMA.map((sql) => db.prepare(sql)));
+  // Databases created before zone visibility shipped need the column added in place.
+  await db.prepare("ALTER TABLE zones ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private'").run().catch(() => undefined);
   await ensureAdminUser(env);
 }
 

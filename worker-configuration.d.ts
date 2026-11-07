@@ -8,11 +8,12 @@ interface __BaseEnv_Env {
 	ADMIN_USERNAME: "admin";
 	RELAY: DurableObjectNamespace<import("./src/index").Relay>;
 	TOKEN: DurableObjectNamespace<import("./src/index").Token>;
+	ZONE: DurableObjectNamespace<import("./src/index").Zone>;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
 		mainModule: typeof import("./src/index");
-		durableNamespaces: "Relay" | "Token";
+		durableNamespaces: "Relay" | "Token" | "Zone";
 	}
 	interface Env extends __BaseEnv_Env {}
 }

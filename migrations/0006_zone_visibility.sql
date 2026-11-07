@@ -1,0 +1,1 @@
+ALTER TABLE zones ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private';

@@ -66,6 +66,7 @@ async function newWorker(context, name) {
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: name },
     bindings: { WEB_ZONE: "example.com", BASE_HOST: "localhost" },

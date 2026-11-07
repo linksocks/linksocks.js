@@ -1,12 +1,13 @@
 import type { Relay } from "./relay";
 import type { Token } from "./token";
+import type { Zone } from "./zone";
 
 /**
  * Environment bindings.
  *
  * The generated `worker-configuration.d.ts` (run `wrangler types`) provides
  * the authoritative `Cloudflare.Env` shape for bindings declared in
- * `wrangler.jsonc` (RELAY, TOKEN, DB, WEB_ZONE, BASE_HOST, ADMIN_USERNAME).
+ * `wrangler.jsonc` (RELAY, TOKEN, ZONE, DB, WEB_ZONE, BASE_HOST, ADMIN_USERNAME).
  * Secrets and optional settings are layered on top here.
  *
  * `DB` stays opt-in at runtime: legacy SOCKS/relay deployments keep working
@@ -22,6 +23,7 @@ export interface Env extends Cloudflare.Env {
   WEB_ROTATION_LEAD_MS?: string;
   RELAY: DurableObjectNamespace<Relay>;
   TOKEN: DurableObjectNamespace<Token>;
+  ZONE: DurableObjectNamespace<Zone>;
 }
 
 export interface DurableObjectUsage {

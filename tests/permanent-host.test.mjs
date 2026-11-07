@@ -126,6 +126,7 @@ test("the permanent-host grant is per account and survives forced temporary mode
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: "permanent-host-test" },
     bindings: {

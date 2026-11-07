@@ -86,6 +86,7 @@ test("website WebSocket upgrades and forwards text and binary frames", { timeout
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: "websocket-test" },
     bindings: { WEB_ZONE: "example.com", BASE_HOST: "localhost" },
@@ -175,6 +176,7 @@ test("real Go Web provider proxies a WebSocket origin", { timeout: 20000, skip: 
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: "websocket-go-test" },
     bindings: { WEB_ZONE: "example.com", BASE_HOST: "localhost" },

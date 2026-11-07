@@ -129,6 +129,7 @@ test("a single Web response cannot exceed the byte quota", { timeout: 20000 }, a
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: "quota-test" },
     bindings: { WEB_ZONE: "example.com", BASE_HOST: "localhost", ADMIN_USERNAME: "admin", ADMIN_PASSWORD: password },
@@ -196,6 +197,7 @@ test("anonymous SOCKS and Web traffic share the same byte quota", { timeout: 200
     durableObjects: {
       RELAY: { className: "Relay", useSQLite: true },
       TOKEN: { className: "Token", useSQLite: true },
+      ZONE: { className: "Zone", useSQLite: true },
     },
     d1Databases: { DB: "shared-quota-test" },
     bindings: { WEB_ZONE: "example.com", BASE_HOST: "localhost", ADMIN_USERNAME: "admin", ADMIN_PASSWORD: password },
