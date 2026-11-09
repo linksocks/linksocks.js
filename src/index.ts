@@ -858,7 +858,6 @@ export default {
         <div class="grid">
           <div class="panel">
             <p class="panelTitle">Quick start</p>
-            <p class="qsNote"><strong>End-to-end encrypted:</strong> the relay only forwards ciphertext. Site publishing is the exception.</p>
             <ol class="qsSteps">
               <li>Download the <b>linksocks</b> client: <a href="https://github.com/linksocks/linksocks/releases" target="_blank" rel="noreferrer">GitHub Releases</a></li>
               <li><b>Relay:</b> run <b>Provider</b> near the service and <b>Connector</b> on the client machine.</li>
