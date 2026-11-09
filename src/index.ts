@@ -1914,6 +1914,10 @@ export default {
         });
       }
 
+      if (path[1] === "api" && path[2] === "ech") {
+        return await handleECHConfig(request, url);
+      }
+
       if (path[1] === "api" && path[2] === "usage") {
         const usage = await getDurableObjectUsage(env);
         return new Response(JSON.stringify(usage), {
@@ -2210,4 +2214,60 @@ async function handleSiteProxy(
       { status: 502, headers: { "Content-Type": "text/html; charset=utf-8" } },
     );
   }
+}
+
+// handleECHConfig serves the Encrypted Client Hello config of this Worker's own
+// hostname, looked up through Cloudflare's DNS-over-HTTPS resolver.
+//
+// A client that cannot reach a DNS-over-HTTPS endpoint (or whose resolver
+// hides the HTTPS record behind the relay's rotating CNAME chain) still needs
+// the config to keep the relay connection alive on networks that block
+// hostnames by SNI. The relay itself is reachable, so it answers with the
+// config for its own name; the deployed edge serves every relay hostname with
+// the same ECH key, which is what makes it usable for the redirect target too.
+async function handleECHConfig(request: Request, url: URL): Promise<Response> {
+  const host = normalizeHost(url.hostname);
+  const list = await lookupECHConfigList(host);
+  return new Response(JSON.stringify({ host, ech: list }), {
+    status: 200,
+    headers: {
+      "Content-Type": "application/json",
+      // Public data, safe to cache at the edge for a few minutes.
+      "Cache-Control": "public, max-age=300",
+    },
+  });
+}
+
+// lookupECHConfigList resolves the HTTPS record of host and returns the
+// base64 ech parameter, following CNAME chains because some names only carry
+// the record on the chain's terminal name.
+async function lookupECHConfigList(host: string): Promise<string> {
+  let name = host;
+  for (let hop = 0; hop < 8 && name; hop++) {
+    let response: Response;
+    try {
+      response = await fetch(
+        `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(name)}&type=HTTPS`,
+        { headers: { accept: "application/dns-json" } },
+      );
+    } catch {
+      return "";
+    }
+    if (!response.ok) return "";
+    let payload: { Answer?: Array<{ name?: string; type?: number; data?: string }> };
+    try {
+      payload = (await response.json()) as typeof payload;
+    } catch {
+      return "";
+    }
+    const answers = Array.isArray(payload.Answer) ? payload.Answer : [];
+    const https = answers.find((answer) => answer.type === 65 && typeof answer.data === "string");
+    if (https?.data) {
+      const match = /ech="?([A-Za-z0-9+/=_-]+)/.exec(https.data);
+      return match ? match[1] : "";
+    }
+    const cname = [...answers].reverse().find((answer) => answer.type === 5 && typeof answer.data === "string");
+    name = cname?.data ? cname.data.replace(/\.$/, "") : "";
+  }
+  return "";
 }
