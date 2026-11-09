@@ -2,6 +2,8 @@
 
 A SOCKS proxy over WebSocket service built on Cloudflare Workers, designed for simple intranet penetration with no server setup required.
 
+Proxy traffic is end-to-end encrypted: the provider and connector negotiate their own session per channel, and the relay only forwards ciphertext.
+
 If you own certain intranet server, please use [FRP](https://github.com/fatedier/frp) or [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/).
 
 This project is mainly used to quickly connect to uncertain user intranet environment.
@@ -105,6 +107,7 @@ then run `npx wrangler dev`. Zone networks do not need wildcard DNS or
 
 ## Key Benefits
 
+- **End-to-end encrypted**: proxy channels negotiate a Noise XX session between provider and connector, so destinations and payloads stay inside the ciphertext — the relay only routes frames by channel ID. Zone packets are encrypted between members. Site publishing is the exception, because the relay reads HTTP to serve the hostname.
 - **Zero Infrastructure**: No need to maintain servers, infinite bandwidth.
 - **Plug and Play**: Just two commands to establish connection, no config file, no online setup.
 - **Proxy at Cloudflare Edge**: Low latency for global application.

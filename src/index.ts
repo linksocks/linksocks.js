@@ -438,6 +438,31 @@ export default {
       line-height: 1.6;
       max-width: 620px;
     }
+    .e2eBadge {
+      display: inline-flex;
+      align-items: center;
+      gap: 7px;
+      margin-top: 18px;
+      padding: 6px 12px;
+      border-radius: 999px;
+      border: 1px solid #c3cdf5;
+      background: var(--accent-soft);
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 10.5px;
+      font-weight: 600;
+      letter-spacing: 0.09em;
+      text-transform: uppercase;
+      white-space: nowrap;
+    }
+    .e2eBadge svg { display: block; width: 12px; height: 12px; flex-shrink: 0; }
+    .qsNote {
+      margin: -8px 0 18px;
+      color: var(--muted);
+      font-size: 12.5px;
+      line-height: 1.6;
+    }
+    .qsNote strong { color: var(--ink); font-weight: 600; }
 
     .stats {
       display: grid;
@@ -770,7 +795,8 @@ export default {
         <div class="intro">
           <div class="kicker">Cloudflare Workers · WebSocket relay</div>
           <h1 class="title">Public Relay Server</h1>
-          <p class="subtitle">Relay proxy traffic, publish a site, or connect machines in a zone. Live relay traffic and quota usage are below.</p>
+          <p class="e2eBadge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>End-to-end encrypted</p>
+          <p class="subtitle">Relay proxy traffic, publish a site, or connect machines in a zone. Proxy and zone traffic is end-to-end encrypted: the relay only forwards ciphertext, never your proxy destinations or payloads.</p>
         </div>
         ${statsError ? `<div class="errBanner">Stats temporarily unavailable: ${statsError}</div>` : ""}
         <div class="stats">
@@ -832,6 +858,7 @@ export default {
         <div class="grid">
           <div class="panel">
             <p class="panelTitle">Quick start</p>
+            <p class="qsNote"><strong>End-to-end encrypted.</strong> Proxy channels negotiate a Noise XX session between provider and connector, so destinations and payloads stay inside the ciphertext and this relay routes them by channel ID. Zone packets are encrypted between members. Site publishing is the exception: the relay reads HTTP to serve the hostname.</p>
             <ol class="qsSteps">
               <li>Download the <b>linksocks</b> client: <a href="https://github.com/linksocks/linksocks/releases" target="_blank" rel="noreferrer">GitHub Releases</a></li>
               <li><b>Relay:</b> run <b>Provider</b> near the service and <b>Connector</b> on the client machine.</li>

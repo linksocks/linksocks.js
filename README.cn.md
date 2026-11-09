@@ -2,6 +2,8 @@
 
 这是一个基于 Cloudflare Workers 构建的 WebSocket SOCKS 代理服务，用于简单内网穿透，无需任何服务器部署。
 
+代理流量端到端加密：provider 与 connector 为每条通道协商各自的加密会话，中继只转发密文。
+
 如果你已有特定的内网服务器，建议使用 [FRP](https://github.com/fatedier/frp) 或 [Cloudflare Tunnel](https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/)。
 
 本项目主要用于快速连接到不确定用户的内网环境。
@@ -96,6 +98,7 @@ Zone 不需要通配 DNS 或 `WEB_ZONE`，这些配置用于网站发布。如�
 
 ## 核心优势
 
+- **端到端加密**：provider 与 connector 为每条代理通道协商 Noise XX 会话，目标地址和载荷都在密文内，中继只按 channel ID 转发；Zone 数据包在成员之间加密；网站发布是例外，中继需要读取 HTTP 才能提供服务域名
 - **零基础设施**：无需维护服务器，带宽不受限制
 - **即插即用**：仅需两条命令建立连接，无需配置文件，无需在线预设置
 - **Cloudflare 边缘代理**：全球覆盖，低延迟访问
