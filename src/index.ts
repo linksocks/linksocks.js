@@ -796,7 +796,7 @@ export default {
           <div class="kicker">Cloudflare Workers · WebSocket relay</div>
           <h1 class="title">Public Relay Server</h1>
           <p class="e2eBadge"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>End-to-end encrypted</p>
-          <p class="subtitle">Relay proxy traffic, publish a site, or connect machines in a zone. Proxy and zone traffic is end-to-end encrypted: the relay only forwards ciphertext, never your proxy destinations or payloads.</p>
+          <p class="subtitle">Relay proxy traffic, publish a site, or connect machines in a zone. Live relay traffic and quota usage are below.</p>
         </div>
         ${statsError ? `<div class="errBanner">Stats temporarily unavailable: ${statsError}</div>` : ""}
         <div class="stats">
@@ -858,7 +858,7 @@ export default {
         <div class="grid">
           <div class="panel">
             <p class="panelTitle">Quick start</p>
-            <p class="qsNote"><strong>End-to-end encrypted.</strong> Proxy channels negotiate a Noise XX session between provider and connector, so destinations and payloads stay inside the ciphertext and this relay routes them by channel ID. Zone packets are encrypted between members. Site publishing is the exception: the relay reads HTTP to serve the hostname.</p>
+            <p class="qsNote"><strong>End-to-end encrypted:</strong> the relay only forwards ciphertext. Site publishing is the exception.</p>
             <ol class="qsSteps">
               <li>Download the <b>linksocks</b> client: <a href="https://github.com/linksocks/linksocks/releases" target="_blank" rel="noreferrer">GitHub Releases</a></li>
               <li><b>Relay:</b> run <b>Provider</b> near the service and <b>Connector</b> on the client machine.</li>
