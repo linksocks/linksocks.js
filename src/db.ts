@@ -1027,6 +1027,12 @@ export function isSiteHostForZone(host: string, zone: string): boolean {
   return host.endsWith(`.${normalizedZone}`);
 }
 
+// isDomainPrefix reports whether value is a single DNS label. Web providers
+// request a prefix, and the relay composes "<prefix>.<WEB_ZONE>" for them.
+export function isDomainPrefix(value: string): boolean {
+  return value.length > 0 && value.length <= 63 && /^[a-z0-9](?:[a-z0-9-]*[a-z0-9])?$/.test(value);
+}
+
 export function siteUrl(host: string, scheme = "https"): string {
   return `${scheme}://${host}`;
 }

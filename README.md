@@ -46,64 +46,49 @@ Configure your browser or applications to use this SOCKS5 proxy to access intern
 
 ## Zone Networks
 
-Open `/zones` on your Worker website to browse public networks, view members
-and copy a join command. No account is needed to browse or join; signed-in
-users create zones and delete their own, and administrators manage all zones.
-Networks must be RFC1918 IPv4 CIDRs from `/16` to `/30`, with 2–256 members
-within the usable address capacity.
+A zone connects machines into a virtual IPv4 network: every member gets an
+address, members reach each other's TCP and UDP services, and traffic between
+them is end-to-end encrypted. Create a zone on `/zones`, then join it from each
+machine. No account is needed to join:
 
-New zones are private: they are not listed anywhere, and only machines given
-the ID can join. Only administrators can create public zones, which appear in
-the website's Public zones view and in `linksocks zone list`. Public zone
-cards mask the ID and join command until a warning is confirmed.
+```bash
+# Machine A
+linksocks zone join <zone-id> -u wss://l.zetx.tech
 
-Joining needs no privileges by default: the CLI runs a local SOCKS5 proxy for
-TCP and UDP. On Linux, `--vlan` (root) creates an L2 TAP interface with ARP,
-ICMP, broadcast, multicast and Wake-on-LAN support, MTU 1500.
+# Machine B
+linksocks zone join <zone-id> -u wss://l.zetx.tech
+```
 
-A machine keeps a local Ed25519 identity; an abrupt disconnect retains its
-virtual address for 24 hours, while Ctrl+C or `zone leave` releases it at once.
-The relay forwards end-to-end encrypted packets and trusts the coordinator's
-peer directory. Zone owners and administrators can set a welcome message, edit
-ordered firewall rules (up to 64, first match wins, with a default allow/deny
-policy) and kick or remove members; `--vlan` frames are filtered by the
-receiving members.
+Each machine prints the address it received and starts a local SOCKS5 proxy on
+`127.0.0.1:1080`; members are then reachable by address or by name:
 
-See the [zone guide](https://linksocks.github.io/guide/zones) for joining,
-identity files, non-overlapping routes and platform requirements. Linux has
-real TAP and proxy-mode verification; Windows and macOS have cross-compilation
-checks only. The Python library does not expose a zone API.
+```bash
+curl --socks5-hostname 127.0.0.1:1080 http://machine-b:8080
+```
+
+On Linux, `--vlan` (root) joins with an L2 TAP interface instead, adding ARP,
+ICMP, broadcast, multicast and Wake-on-LAN. `linksocks zone leave` releases the
+address at once and `linksocks zone list` shows public zones.
+
+New zones are private: only machines given the zone ID can join; administrators
+can create public ones. Owners and administrators manage members, firewall
+rules, the welcome message and kicking from the same `/zones` page. The
+[zone guide](https://linksocks.github.io/guide/zones) covers identity files,
+platform requirements and a verified Linux run. Zones have no Python API.
 
 ### Enable Zones on Your Deployment
 
-Keep the existing `RELAY`, `TOKEN` and `DB` bindings. The checked-in
-`wrangler.jsonc` also includes a `durable_objects.bindings` entry for zones:
-
-```json
-{ "name": "ZONE", "class_name": "Zone" }
-```
-
-The `exports` configuration declares SQLite storage for the exported class:
-
-```json
-{ "Zone": { "type": "durable-object", "storage": "sqlite" } }
-```
-
-Use both entries when upgrading an existing configuration. Keep the `DB`
-database ID set to your own D1 database and `migrations_dir` set to `migrations`.
-Apply the D1 migrations, including `migrations/0005_zones.sql` and
-`migrations/0006_zone_visibility.sql`, before deploying the updated Worker:
+Zones need the `ZONE` Durable Object binding, which the checked-in
+`wrangler.jsonc` already declares, plus the D1 migrations `0005_zones.sql` and
+`0006_zone_visibility.sql`:
 
 ```bash
 npx wrangler d1 migrations apply linksocks --remote
 npx wrangler deploy
 ```
 
-For local development, apply migrations with `--local` in place of `--remote`,
-then run `npx wrangler dev`. Zone networks do not need wildcard DNS or
-`WEB_ZONE`; those settings are for publishing websites. If you configure
-`BASE_HOST`, open `/zones` on that control-plane hostname. Account setup uses
-`ADMIN_USERNAME` and the `ADMIN_PASSWORD` secret described below.
+Zones do not need wildcard DNS or `WEB_ZONE`; those are for publishing
+websites.
 
 ## Key Benefits
 
@@ -159,7 +144,7 @@ Returns the current cached health status. If no cache exists or it has expired, 
 **Example:**
 
 ```bash
-curl https://your-worker.example.com/api/health
+curl https://l.zetx.tech/api/health
 ```
 
 ### `GET /api/health/poll`
@@ -169,7 +154,7 @@ Polling endpoint designed for external uptime monitors. Behaves the same as `/ap
 Typical usage: configure your monitoring tool to poll every 5 minutes. The cache will auto-refresh once per hour, and near-expiry polls will keep it fresh.
 
 ```bash
-curl https://your-worker.example.com/api/health/poll
+curl https://l.zetx.tech/api/health/poll
 ```
 
 #### Force Refresh
@@ -177,7 +162,7 @@ curl https://your-worker.example.com/api/health/poll
 Append `?force=1` to skip the cache entirely and run a fresh probe immediately:
 
 ```bash
-curl https://your-worker.example.com/api/health/poll?force=1
+curl https://l.zetx.tech/api/health/poll?force=1
 ```
 
 ## Web Reverse Proxy (Web Mode)
@@ -186,8 +171,8 @@ Besides SOCKS5 relaying, linksocks.js can publish a local website directly from
 the Cloudflare edge:
 
 ```bash
-# Run locally: publishes 127.0.0.1:8080 as https://<random>.example.com
-linksocks web -u wss://your-worker.example.com -l http://127.0.0.1:8080
+# Publishes 127.0.0.1:8080 under a generated host on the public relay
+linksocks web -u wss://l.zetx.tech -l http://127.0.0.1:8080
 ```
 
 Cloudflare never dials your intranet. Incoming HTTP requests are forwarded over
@@ -219,7 +204,7 @@ port, and no origin address stored in the Worker.
    | Variable | Description |
    |---|---|
    | `WEB_ZONE` | Base domain for generated hosts, e.g. `example.com` |
-   | `BASE_HOST` | Hostname of the control plane, e.g. `linksocks.example.com` (falls back to `WEB_ZONE`) |
+   | `BASE_HOST` | Hostname of the control plane, e.g. `cdn.example.com` (falls back to `WEB_ZONE`) |
    | `ADMIN_USERNAME` | Initial administrator username, defaults to `admin` |
 
 3. DNS: point both `example.com` and `*.example.com` at this Worker, and add
@@ -245,7 +230,7 @@ linksocks web -u <server> -l <local-url> [options]
 | `-t, --token` | Provider token from `/dashboard`; anonymous when omitted |
 | `-u, --url` | LinkSocks.js server (`ws://`, `wss://`, `http://`, `https://`) |
 | `-l, --local` | Local backend URL, repeatable for in-provider load balancing |
-| `--domain` | Custom remote hostname (must be a `WEB_ZONE` subdomain and allowed) |
+| `-p, --domain-prefix` | Prefix for a host of your own under `WEB_ZONE`, e.g. `blog` for `blog.<WEB_ZONE>` |
 | `--insecure` | Skip TLS verification for `https://` backends |
 | `-R, --no-reconnect` | Stop when the server disconnects |
 | `-d, --debug` | Debug logs (`-dd` for trace) |
@@ -254,11 +239,11 @@ Examples:
 
 ```bash
 # Anonymous temporary host
-linksocks web -u wss://linksocks.example.com -l http://127.0.0.1:3000
+linksocks web -u wss://l.zetx.tech -l http://127.0.0.1:3000
 
 # Account-bound permanent host with two origins
-linksocks web -u wss://linksocks.example.com -t ls_xxx \
-  --domain blog.example.com \
+linksocks web -u wss://l.zetx.tech -t ls_xxx \
+  --domain-prefix blog \
   -l http://127.0.0.1:3000 -l http://127.0.0.1:3001
 ```
 
@@ -277,11 +262,9 @@ linksocks web -u wss://linksocks.example.com -t ls_xxx \
 - Administrators can edit anonymous site publishing, custom hostname
   allowance, registration, and whether users may edit their own policy;
   per-user overrides live on the user detail page.
-- `allowCustomHost` on a user is the **permanent hostname grant**: the account
-  may publish a hostname of its own under `WEB_ZONE`, and that site never
-  rotates and never expires. It is denied by default, so operators grant it
-  account by account. A global `forceTemporaryHost` still applies to every
-  account that does not hold the grant.
+- `allowCustomHost` on a user is the **permanent hostname grant**: it lets the
+  account publish under a domain prefix of its own (`--domain-prefix`). It is
+  denied by default, so operators grant it account by account.
 
 ### Hostname Holds and Reservations
 
@@ -312,13 +295,12 @@ Each site freezes a policy at creation time:
 | `maxSites` | Sites per account / per anonymous token |
 | `maxBackends` | Origins allowed per registration |
 
-Auto-generated hosts are always `temporary` with a countdown in the UI. A custom
-host needs the account's permanent-host grant; a granted host is `temporary =
-false`, never rotates, and ignores `quotaDurationSeconds`, so the site stays up
-until its provider leaves. Without the grant the relay refuses a requested host,
-and under `forceTemporaryHost` an ungranted provider is simply rewritten to a
-generated host. Quota overruns return `429` at the edge and expired temporary
-hosts return `410`.
+Auto-generated hosts are always `temporary` with a countdown in the UI. A
+prefix of your own (`--domain-prefix`) needs the account's permanent-host grant;
+see the [web publishing guide](https://linksocks.github.io/guide/quick-start)
+for how the grant, rotation and forced temporary mode interact at the provider.
+Quota overruns return `429` at the edge and expired temporary hosts return
+`410`.
 
 The byte and request quotas are hard limits shared by every site of the same
 principal (one account, or one anonymous provider token). SOCKS5 relay traffic
@@ -337,7 +319,7 @@ Binary message types 0x12–0x19 (shared with the Go client):
 
 | Type | Direction | Purpose |
 |---|---|---|
-| `web_register` (0x12) | Provider → Relay | Host, origins, TLS verification and rotation intent |
+| `web_register` (0x12) | Provider → Relay | Domain prefix (a bare label, empty for a generated host), origins, TLS verification and rotation intent |
 | `web_register_response` (0x13) | Relay → Provider | Final host, temporary flag, expiry, origin count |
 | `web_request` (0x14) | Relay → Provider | Method, path, headers, body metadata |
 | `web_response` (0x15) | Provider → Relay | Status code and response headers |

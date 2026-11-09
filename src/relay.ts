@@ -53,6 +53,7 @@ import {
   getReservation,
   getRetiredHost,
   getSite,
+  isDomainPrefix,
   isSiteHostForZone,
   listReservations,
   listSites,
@@ -1658,6 +1659,23 @@ export class Relay extends DurableObject {
         .find((value) => value) || "";
       let requestedHost = normalizeHost(msg.host || "");
       const originalRequestedHost = requestedHost;
+
+      // Providers request a domain prefix, not a hostname: a bare label is
+      // composed under this relay's WEB_ZONE, so a provider can never point a
+      // site at a domain outside this deployment. A value that already
+      // contains a dot stays supported for older clients and is validated
+      // against the same zone below.
+      if (requestedHost && !requestedHost.includes(".")) {
+        if (!zone) {
+          reply(false, "WEB_ZONE is not configured, so a domain prefix cannot be used");
+          return;
+        }
+        if (!isDomainPrefix(requestedHost)) {
+          reply(false, "Domain prefix must be a single label using letters, digits and hyphens");
+          return;
+        }
+        requestedHost = `${requestedHost}.${zone}`;
+      }
 
       // A reservation binds a hostname to one account even while no site exists.
       // It is invisible on the user side and only blocks other accounts.

@@ -44,57 +44,45 @@ linksocks connector -t your_token -u l.zetx.tech -p 1180
 
 ## Zone 虚拟网络
 
-打开 Worker 网站的 `/zones` 页面，即可浏览公开网络、查看成员并复制加入命令。
-浏览和加入无需账号；登录用户可以创建 Zone、删除自己的 Zone，管理员可以管理
-全部 Zone。网段必须是 RFC1918 私有 IPv4 CIDR，前缀为 `/16` 到 `/30`；成员上限为
-2–256，且不能超过网段的可用地址数。
+Zone 把多台机器连成一个虚拟 IPv4 网络：每台机器获得自己的地址，成员之间可以互相
+访问 TCP 和 UDP 服务，流量端到端加密。先在网站的 `/zones` 页面创建 Zone，再在每台
+机器上加入；加入无需账号：
 
-新建 Zone 默认为私有：不出现在任何列表中，只有拿到 ID 的机器才能加入。公开
-Zone 仅管理员可以创建，会出现在网站的 **Public zones** 视图和 CLI 的
-`linksocks zone list` 中。公开 Zone 的卡片会遮盖 ID 和加入命令，确认警告后才显示。
+```bash
+# 机器 A
+linksocks zone join <zone-id> -u wss://l.zetx.tech
 
-默认加入不需要特殊权限：CLI 会在本机运行 SOCKS5 代理，支持 TCP 和 UDP。
-Linux 下可用 `--vlan`（需要 root）创建二层 TAP 网卡，支持 ARP、ICMP、广播、组播
-和 WOL，MTU 为 1500。
+# 机器 B
+linksocks zone join <zone-id> -u wss://l.zetx.tech
+```
 
-每台机器保留本地 Ed25519 身份；异常掉线后虚拟地址保留 24 小时，Ctrl+C 或
-`zone leave` 则立即释放。中继转发端到端加密的数据包，并依赖协调服务提供可信的
-成员目录。Zone 所有者和管理员可以设置欢迎语、编辑有序防火墙规则（最多 64 条，
-首条匹配生效，另有默认 allow/deny 策略），并踢出或移除成员；`--vlan` 的以太网帧
-由接收端成员过滤。
+每台机器会打印分配到的地址，并在本机 `127.0.0.1:1080` 启动 SOCKS5 代理；之后可以
+用虚拟地址或成员名访问其他成员：
 
-加入方法、身份文件、路由冲突和平台要求见
-[Zone 使用指南](https://linksocks.github.io/zh/guide/zones)。Linux 已通过真实 TAP
-和代理模式验证，Windows 和 macOS 仅通过交叉编译检查。Python 库不提供 Zone API。
+```bash
+curl --socks5-hostname 127.0.0.1:1080 http://machine-b:8080
+```
+
+Linux 下 `--vlan`（需要 root）会改用二层 TAP 网卡加入，额外支持 ARP、ICMP、广播、
+组播和 WOL。`linksocks zone leave` 立即释放地址，`linksocks zone list` 列出公开
+Zone。
+
+新建 Zone 默认为私有，只有拿到 Zone ID 的机器才能加入；公开 Zone 仅管理员可以创建。
+所有者和管理员可以在同一个 `/zones` 页面管理成员、防火墙规则、欢迎语和踢人。
+身份文件、平台要求等细节和真实 Linux 实测见
+[Zone 使用指南](https://linksocks.github.io/zh/guide/zones)。Python 库不提供 Zone API。
 
 ### 为部署启用 Zone
 
-保留已有的 `RELAY`、`TOKEN` 和 `DB` 绑定。仓库中的 `wrangler.jsonc` 还在
-`durable_objects.bindings` 中包含 Zone 绑定：
-
-```json
-{ "name": "ZONE", "class_name": "Zone" }
-```
-
-`exports` 配置将导出的类声明为使用 SQLite 存储：
-
-```json
-{ "Zone": { "type": "durable-object", "storage": "sqlite" } }
-```
-
-升级已有配置时需要同时加入这两项。`DB` 的数据库 ID 应填写你自己的 D1 数据库，
-`migrations_dir` 保持为 `migrations`。部署新版 Worker 前，应用 D1 迁移，
-其中包含 `migrations/0005_zones.sql` 和 `migrations/0006_zone_visibility.sql`：
+Zone 需要 `ZONE` Durable Object 绑定（仓库中的 `wrangler.jsonc` 已包含），以及
+D1 迁移 `0005_zones.sql` 和 `0006_zone_visibility.sql`：
 
 ```bash
 npx wrangler d1 migrations apply linksocks --remote
 npx wrangler deploy
 ```
 
-本地开发时把 `--remote` 改为 `--local` 应用迁移，再运行 `npx wrangler dev`。
-Zone 不需要通配 DNS 或 `WEB_ZONE`，这些配置用于网站发布。如果设置了 `BASE_HOST`，
-请在该控制台域名下打开 `/zones`。账号初始化使用下文介绍的 `ADMIN_USERNAME` 和
-`ADMIN_PASSWORD` secret。
+Zone 不需要通配 DNS 或 `WEB_ZONE`，这些配置用于网站发布。
 
 ## 核心优势
 
@@ -150,7 +138,7 @@ Worker 提供健康状态接口，用于外部监控。健康检查结果缓存�
 **示例：**
 
 ```bash
-curl https://your-worker.example.com/api/health
+curl https://l.zetx.tech/api/health
 ```
 
 ### `GET /api/health/poll`
@@ -160,7 +148,7 @@ curl https://your-worker.example.com/api/health
 典型用法：配置监控工具每 5 分钟轮询一次。缓存每小时自动刷新一次，接近过期时的轮询会保持缓存新鲜。
 
 ```bash
-curl https://your-worker.example.com/api/health/poll
+curl https://l.zetx.tech/api/health/poll
 ```
 
 #### 强制刷新
@@ -168,7 +156,7 @@ curl https://your-worker.example.com/api/health/poll
 在 URL 后附加 `?force=1` 可跳过缓存，立即运行一次全新探测：
 
 ```bash
-curl https://your-worker.example.com/api/health/poll?force=1
+curl https://l.zetx.tech/api/health/poll?force=1
 ```
 
 ## 网站反向代理（Web 模式）
@@ -176,8 +164,8 @@ curl https://your-worker.example.com/api/health/poll?force=1
 除 SOCKS5 中转外，linksocks.js 现在还可以把本地网站直接发布到 Cloudflare 边缘：
 
 ```bash
-# 在本机运行，将 127.0.0.1:8080 发布为 https://<随机>.example.com
-linksocks web -u wss://your-worker.example.com -l http://127.0.0.1:8080
+# 在公共中继上为 127.0.0.1:8080 分配一个域名并发布
+linksocks web -u wss://l.zetx.tech -l http://127.0.0.1:8080
 ```
 
 服务端不再直接访问你的内网：Cloudflare 收到 HTTP 请求后，通过现有的 WebSocket 隧道
@@ -207,7 +195,7 @@ IP、不需要开放入站端口，也不需要在 Worker 中配置任何源站�
    | 变量 | 说明 |
    |---|---|
    | `WEB_ZONE` | 生成域名使用的基础域，例如 `example.com` |
-   | `BASE_HOST` | Control Plane 所在主机名，例如 `linksocks.example.com`；为空时回退到 `WEB_ZONE` |
+   | `BASE_HOST` | Control Plane 所在主机名，例如 `cdn.example.com`；为空时回退到 `WEB_ZONE` |
    | `ADMIN_USERNAME` | 初始管理员用户名，默认 `admin` |
 
 3. DNS 与路由：把 `example.com` 与 `*.example.com` 都指向这个 Worker，并为
@@ -232,7 +220,7 @@ linksocks web -u <server> -l <local-url> [选项]
 | `-t, --token` | 在 `/dashboard` 创建的 Provider Token；省略时为匿名 |
 | `-u, --url` | linksocks.js 服务地址，支持 `ws://`、`wss://`、`http://`、`https://` |
 | `-l, --local` | 本地后端地址，可重复指定以在同一 Provider 内做负载均衡 |
-| `--domain` | 自定义远程域名（必须是 `WEB_ZONE` 的子域，且服务端允许自定义域名） |
+| `-p, --domain-prefix` | 自定义域名前缀，发布为 `<前缀>.<WEB_ZONE>`，例如 `blog` |
 | `--insecure` | 本地后端为 `https://` 时跳过证书校验 |
 | `-R, --no-reconnect` | 服务端断开后不再重连 |
 | `-d, --debug` | 调试日志（`-dd` 为 trace） |
@@ -241,11 +229,11 @@ linksocks web -u <server> -l <local-url> [选项]
 
 ```bash
 # 匿名发布一个临时域名
-linksocks web -u wss://linksocks.example.com -l http://127.0.0.1:3000
+linksocks web -u wss://l.zetx.tech -l http://127.0.0.1:3000
 
 # 使用账号令牌发布固定域名，并配置两个源站
-linksocks web -u wss://linksocks.example.com -t ls_xxx \
-  --domain blog.example.com \
+linksocks web -u wss://l.zetx.tech -t ls_xxx \
+  --domain-prefix blog \
   -l http://127.0.0.1:3000 -l http://127.0.0.1:3001
 ```
 
@@ -260,9 +248,8 @@ linksocks web -u wss://linksocks.example.com -t ls_xxx \
 - 管理员可以在“Settings”中配置匿名站点发布开关、是否允许自定义域名、是否允许用户注册、
   主连接域名以及全局配额；用户策略、改密和账户访问权限都在 `/admin?tab=users`
   的独立弹窗中管理，普通用户面板只保留站点、令牌和流量。
-- 用户的 `allowCustomHost` 就是**永久域名授权**：获得授权后该账号可以在 `WEB_ZONE`
-  下发布自己的域名，站点不会轮换也不会过期。默认不授权，由管理员逐个账号开放；
-  全局开启 `forceTemporaryHost` 时，未获授权的账号仍然会被强制换成随机域名。
+- 用户的 `allowCustomHost` 就是**永久域名授权**：获得授权后该账号可以用
+  `--domain-prefix` 发布自己的域名前缀。默认不授权，由管理员逐个账号开放。
 
 ### 域名持有与保留
 
@@ -288,10 +275,9 @@ URL 的日志消息。纯 SOCKS 中继仍保持原有的 60 秒宽限期。
 | `maxSites` | 每个账号 / 每个匿名令牌可创建的站点数 |
 | `maxBackends` | 单次注册允许的源站数量 |
 
-自动生成的域名永远标记为 `temporary`，界面会显示剩余有效期。自定义域名需要账号持有
-永久域名授权：获授权后该站点 `temporary = false`，不轮换、也不受 `quotaDurationSeconds`
-限制，Provider 在场就一直有效。没有授权时中继会直接拒绝请求的域名；开启
-`forceTemporaryHost` 时，未授权的 Provider 会被改写成随机域名。
+自动生成的域名永远标记为 `temporary`，界面会显示剩余有效期。自定义前缀
+（`--domain-prefix`）需要账号持有永久域名授权；授权、轮换与强制临时域名的具体规则见
+[网站发布指南](https://linksocks.github.io/zh/guide/quick-start)。
 超过配额时边缘会直接返回 `429`，临时域名过期后返回 `410`。
 
 字节与请求数配额是硬上限，由同一身份的所有站点共享（一个账号，或一个匿名 Provider 令牌）：
@@ -309,7 +295,7 @@ SOCKS5 中继流量与网站代理流量消耗同一个计数器，额度用尽�
 
 | 类型 | 方向 | 说明 |
 |---|---|---|
-| `web_register` (0x12) | Provider → Relay | 上报域名（可空）、源站列表、TLS 校验与轮换意图 |
+| `web_register` (0x12) | Provider → Relay | 上报域名前缀（裸标签，留空则分配随机域名）、源站列表、TLS 校验与轮换意图 |
 | `web_register_response` (0x13) | Relay → Provider | 返回最终域名、是否临时、到期时间、源站数量 |
 | `web_request` (0x14) | Relay → Provider | 请求方法、路径、头部、请求体长度等元数据 |
 | `web_response` (0x15) | Provider → Relay | 响应状态码与响应头 |

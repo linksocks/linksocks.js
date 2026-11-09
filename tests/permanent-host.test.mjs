@@ -183,6 +183,18 @@ test("the permanent-host grant is per account and survives forced temporary mode
   assert.equal(published.temporary, false);
   assert.equal(published.expiresAt, undefined);
 
+  // A bare label is the supported request: the relay composes it under its
+  // own zone, so the account never names a domain itself.
+  const prefixProvider = await openProvider(worker, granted.token);
+  const prefixed = await register(prefixProvider, "notes");
+  assert.equal(prefixed.success, true, JSON.stringify(prefixed));
+  assert.equal(prefixed.host, "notes.example.com");
+  assert.equal(prefixed.temporary, false);
+
+  const badLabel = await register(prefixProvider, "bad_label");
+  assert.equal(badLabel.success, false, JSON.stringify(badLabel));
+  assert.match(badLabel.error, /single label/);
+
   const db = await worker.getD1Database("DB");
   const row = await db.prepare("SELECT temporary, expires_at FROM sites WHERE host = ?").bind("blog.example.com").first();
   assert.equal(row.temporary, 0);
