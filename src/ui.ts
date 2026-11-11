@@ -535,7 +535,12 @@ ${opts.bare ? opts.content : `<div class="wrap">
     dialog.querySelectorAll("[data-close]").forEach(function(button){
       button.addEventListener("click",function(){dialog.close();});
     });
-    dialog.addEventListener("click",function(e){if(e.target===dialog)dialog.close();});
+    // A dialog that collects input (Create zone, settings, a new token) must
+    // not close because a click landed on the backdrop: that discards what was
+    // typed. Informational dialogs keep closing that way.
+    if(!dialog.querySelector("form")){
+      dialog.addEventListener("click",function(e){if(e.target===dialog)dialog.close();});
+    }
     if(dialog.hasAttribute("data-auto-open")){
       try{dialog.showModal();}catch(err){}
     }
