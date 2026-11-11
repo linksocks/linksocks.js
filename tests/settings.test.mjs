@@ -128,6 +128,23 @@ test("administrator can enable and disable policy checkboxes", { timeout: 20000 
   assert.equal(dashboardHtml.includes('id="settingsForm"'), false, "regular users must not edit quotas or limits");
   assert.ok(dashboardHtml.includes("<h2>Overview</h2>"));
 
+  // The overview cards say what each number covers: sites with the site
+  // providers serving them, today's traffic, relays with the links attached
+  // to them, and zones with the members online.
+  const cards = [...dashboardHtml.matchAll(
+    /<div class="stat"><div class="label">([^<]+)<\/div><div class="value">([^<]*)<\/div><div class="hint">([^<]*)<\/div>/g,
+  )].map((m) => ({ label: m[1], value: m[2], hint: m[3] }));
+  assert.deepEqual(
+    cards.map((card) => card.label),
+    ["My sites", "Requests", "Relays", "Zones", "Transfer"],
+  );
+  assert.match(cards[0].hint, /online now, \d+ providers?$/);
+  assert.equal(cards[1].hint, "today UTC");
+  assert.match(cards[2].hint, /\d+ providers?, \d+ connectors?$/);
+  assert.match(cards[3].hint, /\d+ members? online$/);
+  assert.equal(cards[4].hint, "today UTC");
+  assert.equal(dashboardHtml.includes("active tokens"), false, "the token count belongs to the Tokens tab, not the overview");
+
   const users = await (await worker.dispatchFetch("http://localhost/admin?tab=users", { headers })).text();
   assert.ok(users.includes("modal=password"), "password changes must open in a dialog");
   assert.ok(users.includes("modal=policy"), "policy changes must open in a dialog");

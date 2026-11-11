@@ -55,6 +55,7 @@ import {
   upsertReservation,
   verifyPassword,
 } from "./db";
+import { listZones } from "./zone";
 
 const FLASH_COOKIE = "ls_flash";
 
@@ -610,6 +611,70 @@ async function disconnectHost(env: Env, relayId: string, host: string): Promise<
   }
 }
 
+// loadNetworkStats counts what the overview cards show beyond the sites
+// themselves: the relays this user's tokens created (with the provider and
+// connector links attached to them) and this user's zones (with the members
+// currently online).
+async function loadNetworkStats(
+  env: Env,
+  userId: string,
+  tokens: TokenRow[],
+  sites: SiteRow[],
+): Promise<{
+  relays: number;
+  relayProviders: number;
+  relayConnectors: number;
+  zones: number;
+  zoneMembersOnline: number;
+}> {
+  const relayIds = new Set<string>();
+  for (const site of sites) {
+    if (site.relay_id) relayIds.add(site.relay_id);
+  }
+  const activeHashes = tokens.filter((token) => token.revoked === 0).map((token) => token.token_hash);
+  if (activeHashes.length > 0) {
+    try {
+      const tokenDO = env.TOKEN.get(env.TOKEN.idFromName("main"));
+      const metadata = await tokenDO.getRelayMetadataBatch(activeHashes.slice(0, 64));
+      for (const entry of metadata.values()) {
+        if (entry.relayId) relayIds.add(entry.relayId);
+      }
+    } catch {
+      // The token store is best effort here; the cards still render.
+    }
+  }
+
+  const runtimeInfos = await Promise.all(
+    Array.from(relayIds).slice(0, 64).map(async (relayId) => {
+      try {
+        return await env.RELAY.get(env.RELAY.idFromString(relayId)).adminGetRuntimeInfo();
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const live = runtimeInfos.filter((info) => info !== null);
+  const relays = live.filter((info) => info.providerCount + info.connectorCount > 0).length;
+  const relayProviders = live.reduce((sum, info) => sum + (Number(info.providerCount) || 0), 0);
+  const relayConnectors = live.reduce((sum, info) => sum + (Number(info.connectorCount) || 0), 0);
+
+  const zones = await listZones(env, userId);
+  const rosters = await Promise.all(
+    zones.slice(0, 32).map(async (zone) => {
+      try {
+        return await env.ZONE.get(env.ZONE.idFromName(zone.id)).getMembers();
+      } catch {
+        return null;
+      }
+    }),
+  );
+  const zoneMembersOnline = rosters
+    .filter((members) => members !== null)
+    .reduce((sum, members) => sum + (members ?? []).filter((member) => member.online).length, 0);
+
+  return { relays, relayProviders, relayConnectors, zones: zones.length, zoneMembersOnline };
+}
+
 export async function handleDashboard(request: Request, env: Env, url: URL): Promise<Response> {
   const dbError = await requireDb(env);
   if (dbError) {
@@ -683,7 +748,10 @@ export async function handleDashboard(request: Request, env: Env, url: URL): Pro
     getAnonymousSettings(env),
   ]);
   const usersById = new Map([[context.user.id, context.user]]);
-  const live = await loadLiveInfo(env, allSites);
+  const [live, network] = await Promise.all([
+    loadLiveInfo(env, allSites),
+    loadNetworkStats(env, context.user.id, allTokens, allSites),
+  ]);
   const siteViews = toSiteViews(allSites, live, usersById);
   const tokenViews = allTokens.map((token) => toTokenView(token, usersById));
 
@@ -693,7 +761,18 @@ export async function handleDashboard(request: Request, env: Env, url: URL): Pro
     tab,
     sites: siteViews,
     tokens: tokenViews,
-    overview: buildOverview([context.user], allSites, allTokens, siteViews),
+    overview: {
+      sites: siteViews.length,
+      onlineSites: siteViews.filter((site) => site.providerCount > 0).length,
+      siteProviders: siteViews.reduce((sum, site) => sum + site.providerCount, 0),
+      requests: siteViews.reduce((sum, site) => sum + site.requests, 0),
+      bytes: siteViews.reduce((sum, site) => sum + site.bytes, 0),
+      relays: network.relays,
+      relayProviders: network.relayProviders,
+      relayConnectors: network.relayConnectors,
+      zones: network.zones,
+      zoneMembersOnline: network.zoneMembersOnline,
+    },
     serverUrl: global.publicUrl || url.origin,
     flash: readFlash(request),
   };

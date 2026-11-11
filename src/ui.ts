@@ -62,6 +62,23 @@ export interface Overview {
   tokens: number;
 }
 
+// DashboardOverview is what the user's own overview cards show: their sites
+// (with the site providers serving them), today's traffic, their relays with
+// the provider and connector links attached to them, and their zones with the
+// members currently online.
+export interface DashboardOverview {
+  sites: number;
+  onlineSites: number;
+  siteProviders: number;
+  requests: number;
+  bytes: number;
+  relays: number;
+  relayProviders: number;
+  relayConnectors: number;
+  zones: number;
+  zoneMembersOnline: number;
+}
+
 export interface Flash {
   kind: "ok" | "error";
   message: string;
@@ -92,7 +109,7 @@ export interface DashboardPageData {
   tab: "overview" | "sites" | "tokens";
   sites: SiteView[];
   tokens: TokenView[];
-  overview: Overview;
+  overview: DashboardOverview;
   serverUrl: string;
   flash?: Flash | null;
 }
@@ -1212,13 +1229,13 @@ export function renderDashboardPage(data: DashboardPageData): string {
   }
   let content = data.flash?.token ? "" : flashHtml(data.flash);
   if (data.tab === "overview") {
-    content += pageHead("Overview", "Your relay tokens, site providers and today's traffic.");
+    content += pageHead("Overview", "Your sites, relays and zones, with today's traffic.");
     content += `<div class="stats">
-      ${statCard("My sites", data.overview.sites, `${data.overview.onlineSites} online now`)}
-      ${statCard("Live site providers", data.overview.providers, "connected site providers")}
+      ${statCard("My sites", data.overview.sites, `${data.overview.onlineSites} online now, ${data.overview.siteProviders} provider${data.overview.siteProviders === 1 ? "" : "s"}`)}
       ${statCard("Requests", data.overview.requests.toLocaleString(), "today UTC")}
+      ${statCard("Relays", data.overview.relays, `${data.overview.relayProviders} provider${data.overview.relayProviders === 1 ? "" : "s"}, ${data.overview.relayConnectors} connector${data.overview.relayConnectors === 1 ? "" : "s"}`)}
+      ${statCard("Zones", data.overview.zones, `${data.overview.zoneMembersOnline} member${data.overview.zoneMembersOnline === 1 ? "" : "s"} online`)}
       ${statCard("Transfer", formatBytes(data.overview.bytes), "today UTC")}
-      ${statCard("Tokens", data.overview.tokens, "active tokens")}
     </div>
     <div class="section panel">
       <div class="panel-head"><h2>My sites</h2><a class="btn small ghost" href="/dashboard?tab=sites">View all</a></div>
