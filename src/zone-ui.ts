@@ -7,8 +7,8 @@ interface ZonesPageData {
   csrf?: string;
 }
 
-const PRIVATE_INTRO = "Zones are private. Only machines you share a zone ID with can join its network. Each member gets its own virtual IP address.";
-const PUBLIC_INTRO = "Anyone with a public zone ID can join and reach machines in the network. Check this machine's firewall before joining one.";
+const PRIVATE_INTRO = "Your zones are not listed anywhere: only machines you give the zone ID to can join. Each member gets its own virtual IP address.";
+const PUBLIC_INTRO = "These zones are listed publicly, so anyone can find their ID and join. Members can reach services running on the machines that join. Check this machine's firewall before joining one.";
 
 const ZONE_STYLE = `
 .wrap{padding:0 22px 56px}
@@ -571,7 +571,7 @@ const ZONE_SCRIPT = `<script>
         updateCreateVisibility();
         search.value="";
         message(feedback,"");
-        message(status,visibility==="public"?"Public zone created. Anyone with its ID can join and reach its members.":"Zone created. Share its ID and join command only with people you trust.");
+        message(status,visibility==="public"?"Public zone created. It is listed on the Public zones page, so anyone can find its ID and join.":"Zone created. It is not listed anywhere, so share its ID and join command only with people you trust.");
         await loadZones();
       }catch(err){message(feedback,err.message,true);}
       finally{submit.disabled=false;submit.textContent="Create zone";createForm.setAttribute("aria-busy","false");}
@@ -790,19 +790,19 @@ function managementDialogs(isAdmin: boolean): string {
     <div class="modal-head"><h2 id="zone-create-title">Create zone</h2><button class="modal-close" type="button" data-zone-close aria-label="Close create zone dialog">&times;</button></div>
     <form class="zone-modal-form" id="zone-create-form" novalidate>
       <div class="modal-body">
-        <p class="zone-modal-note" id="zone-create-note">${isAdmin ? "Private zones are reachable only by machines you share the ID with. Public zones can be joined by anyone who has the ID." : "This zone is private. Only machines you share its ID with can join its network."}</p>
+        <p class="zone-modal-note" id="zone-create-note">${isAdmin ? "Private: not listed anywhere, so only machines you give the ID to can join. Public: listed on the Public zones page, so anyone who finds it can join." : "This zone stays private: it is not listed anywhere, and only machines you give the ID to can join."}</p>
         <div class="field"><label for="zone-name">Zone name</label><input id="zone-name" name="name" maxlength="64" placeholder="Office network" required autofocus aria-describedby="zone-name-error"/><p id="zone-name-error" class="zone-field-error" hidden></p></div>
         <div class="field"><label for="zone-cidr">IPv4 network (CIDR)</label><input id="zone-cidr" name="cidr" value="10.88.0.0/24" required spellcheck="false" autocapitalize="off" aria-describedby="zone-cidr-hint zone-cidr-error"/><div class="hint" id="zone-cidr-hint">Use a private network from /16 to /30 that does not overlap your machines' existing routes.</div><p id="zone-cidr-error" class="zone-field-error" hidden></p></div>
         <div class="field"><label for="zone-limit">Member limit</label><input id="zone-limit" name="max_members" type="number" min="2" max="256" step="1" value="32" required aria-describedby="zone-limit-hint zone-limit-error"/><div class="hint" id="zone-limit-hint">2–256 machines, within the network's available addresses.</div><p id="zone-limit-error" class="zone-field-error" hidden></p></div>
         ${isAdmin
           ? `<div class="field"><label id="zone-visibility-label">Visibility</label>
           <div class="toggle-grid" role="radiogroup" aria-labelledby="zone-visibility-label">
-            <label class="check"><input type="radio" id="zone-visibility-private" name="visibility" value="private" checked/><span class="check-body"><span class="check-label">Private <span class="badge gray">recommended</span></span><span class="hint">Only machines you share the zone ID with can join its network.</span></span></label>
-            <label class="check"><input type="radio" id="zone-visibility-public" name="visibility" value="public"/><span class="check-body"><span class="check-label">Public</span><span class="hint">Anyone with the zone ID can join and reach exposed services. Only administrators can create public zones.</span></span></label>
+            <label class="check"><input type="radio" id="zone-visibility-private" name="visibility" value="private" checked/><span class="check-body"><span class="check-label">Private <span class="badge gray">recommended</span></span><span class="hint">Not listed anywhere. Only machines you give the ID to can join.</span></span></label>
+            <label class="check"><input type="radio" id="zone-visibility-public" name="visibility" value="public"/><span class="check-body"><span class="check-label">Public</span><span class="hint">Listed on the Public zones page, so anyone can find the ID and join. Members can reach services exposed on joining machines.</span></span></label>
           </div>
-          <p class="zone-modal-note zone-public-warning" id="zone-public-warning" hidden>Anyone with a public zone ID can join and reach services exposed on member machines. Check your firewall before sharing it.</p>
+          <p class="zone-modal-note zone-public-warning" id="zone-public-warning" hidden>This zone will be listed on the Public zones page: anyone can find the ID and join. Members can reach services exposed on the machines that join, including this one, so check its firewall before creating it.</p>
         </div>`
-          : `<div class="field"><label>Visibility</label><div class="note"><div><strong>Private</strong> · Recommended. Only machines you share the zone ID with can join its network.</div></div></div>`}
+          : `<div class="field"><label>Visibility</label><div class="note"><div><strong>Private</strong> · Recommended. Not listed anywhere; only machines you give the ID to can join.</div></div></div>`}
         <p id="zone-create-status" class="zone-status" role="status" aria-live="polite"></p>
       </div>
       <div class="modal-actions"><button type="button" class="btn" data-zone-close>Cancel</button><button type="submit" class="btn primary">Create zone</button></div>
@@ -853,7 +853,7 @@ function revealDialog(): string {
   return `<dialog class="modal" id="zone-reveal-dialog" aria-labelledby="zone-reveal-title">
     <div class="modal-head"><h2 id="zone-reveal-title">Reveal public zone details?</h2><button class="modal-close" type="button" data-zone-close aria-label="Close reveal dialog">&times;</button></div>
     <div class="modal-body">
-      <p class="zone-modal-note">Anyone with this zone ID can join. Members of a public zone can reach services running on the machines that join, including this one.</p>
+      <p class="zone-modal-note">This zone is listed publicly, so anyone can find its ID and join. Members can reach services running on the machines that join, including this one.</p>
       <p class="zone-reveal-zone">Zone: <span class="mono" id="zone-reveal-zone"></span></p>
       <p class="zone-modal-note">Before revealing the ID and join command, check this machine's firewall and make sure only the services you intend are reachable from the zone network.</p>
       <label class="check"><input type="checkbox" id="zone-reveal-ack"/><span class="check-body"><span class="check-label">I have checked my firewall and understand what this machine exposes</span></span></label>
