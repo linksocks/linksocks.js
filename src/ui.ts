@@ -88,11 +88,12 @@ export interface Flash {
 export interface AdminPageData {
   user: { username: string };
   csrf: string;
-  tab: "overview" | "users" | "sites" | "tokens" | "reservations" | "settings";
+  tab: "overview" | "users" | "sites" | "tokens" | "reservations" | "zones" | "settings";
   users: UserView[];
   sites: SiteView[];
   tokens: TokenView[];
   reservations: ReservationView[];
+  zones: AdminZoneView[];
   overview: Overview;
   globalSettings: Settings;
   serverUrl: string;
@@ -101,6 +102,19 @@ export interface AdminPageData {
   selectedUserSettings?: Settings;
   userModal?: "password" | "access" | "policy" | "delete";
   flash?: Flash | null;
+}
+
+// AdminZoneView is one zone in the admin console, across every account.
+export interface AdminZoneView {
+  id: string;
+  name: string;
+  cidr: string;
+  visibility: string;
+  maxMembers: number;
+  owner: string;
+  createdAt: number;
+  members: number;
+  online: number;
 }
 
 export interface DashboardPageData {
@@ -945,6 +959,42 @@ function reservationsTable(reservations: ReservationView[], opts: { csrf: string
   </table></div>`;
 }
 
+function adminZonesTable(zones: AdminZoneView[], opts: { csrf: string; action: string }): string {
+  if (zones.length === 0) {
+    return `<div class="empty">
+      <div class="empty-icon">◈</div>
+      <strong>No zones yet</strong>
+      <div class="sub">An account creates a zone from its dashboard and shares the zone ID with the machines that join it.</div>
+    </div>`;
+  }
+  const rows = zones
+    .map((zone) => {
+      const visibility = zone.visibility === "public"
+        ? `<span class="badge"><span class="dot"></span>public</span>`
+        : `<span class="badge gray"><span class="dot"></span>private</span>`;
+      const members = zone.members === 0
+        ? `<span class="sub">no members</span>`
+        : `<span class="nowrap">${zone.online} of ${zone.members} online</span>`;
+      return `<tr>
+        <td><div><strong>${escapeHtml(zone.name)}</strong> ${visibility}</div><div class="sub mono nowrap">${escapeHtml(zone.id)}</div></td>
+        <td class="owner-col">${escapeHtml(zone.owner)}</td>
+        <td><div class="mono nowrap">${escapeHtml(zone.cidr)}</div><div class="sub">up to ${zone.maxMembers} members</div></td>
+        <td>${members}<div class="sub">created ${escapeHtml(formatDateCompact(zone.createdAt))}</div></td>
+        <td class="actions"><form method="POST" action="${opts.action}">
+          <input type="hidden" name="csrf" value="${escapeHtml(opts.csrf)}"/>
+          <input type="hidden" name="action" value="deleteZone"/>
+          <input type="hidden" name="zoneId" value="${escapeHtml(zone.id)}"/>
+          <button class="btn danger" type="submit">Delete</button>
+        </form></td>
+      </tr>`;
+    })
+    .join("");
+  return `<div class="table-wrap"><table>
+    <thead><tr><th>Zone</th><th class="owner-col">Owner</th><th>Network</th><th>Members</th><th></th></tr></thead>
+    <tbody>${rows}</tbody>
+  </table></div>`;
+}
+
 function pageHead(title: string, description: string): string {
   return `<div class="page-head"><div><h2>${escapeHtml(title)}</h2><div class="sub">${escapeHtml(description)}</div></div></div>`;
 }
@@ -992,8 +1042,8 @@ export function renderAdminPage(data: AdminPageData): string {
     { href: "/admin?tab=sites", label: "Sites", active: data.tab === "sites" },
     { href: "/admin?tab=tokens", label: "Tokens", active: data.tab === "tokens" },
     { href: "/admin?tab=reservations", label: "Reservations", active: data.tab === "reservations" },
+    { href: "/admin?tab=zones", label: "Zones", active: data.tab === "zones" },
     { href: "/admin?tab=settings", label: "Settings", active: data.tab === "settings" },
-    { href: "/zones", label: "My Zones", active: false },
     { href: "/dashboard", label: "My dashboard", active: false },
   ];
 
@@ -1151,6 +1201,22 @@ export function renderAdminPage(data: AdminPageData): string {
   } else if (data.tab === "tokens") {
     content += pageHead("Tokens", "Tokens bind relay and site providers to the account that created them. Raw tokens are shown only once.");
     content += `<div class="panel"><div class="panel-head"><h2>${data.tokens.length} token${data.tokens.length === 1 ? "" : "s"}</h2></div><div class="panel-body flush">${tokensTable(data.tokens, { csrf: data.csrf, action: "/admin/action", admin: true })}</div></div>`;
+  } else if (data.tab === "zones") {
+    const online = data.zones.reduce((sum, zone) => sum + zone.online, 0);
+    const members = data.zones.reduce((sum, zone) => sum + zone.members, 0);
+    content += pageHead(
+      "Zones",
+      "Every zone on this server, across all accounts. Members read the roster here; the machine list is owned by each zone's coordinator.",
+    );
+    content += `<div class="stats">
+      ${statCard("Zones", data.zones.length)}
+      ${statCard("Members", members, `${online} online now`)}
+      ${statCard("Public zones", data.zones.filter((zone) => zone.visibility === "public").length)}
+    </div>`;
+    content += `<div class="panel">
+      <div class="panel-head"><h2>${data.zones.length} zone${data.zones.length === 1 ? "" : "s"}</h2></div>
+      <div class="panel-body flush">${adminZonesTable(data.zones, { csrf: data.csrf, action: "/admin/action" })}</div>
+    </div>`;
   } else if (data.tab === "reservations") {
     content += pageHead("Reservations", "Admin-only hostname holds. A reservation keeps a name bound to one account while its site provider is offline, and is invisible on the user side.");
     content += `<div class="two-col">

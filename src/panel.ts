@@ -2,6 +2,7 @@ import type { Env } from "./types";
 import {
   type Flash,
   type AdminPageData,
+  type AdminZoneView,
   type DashboardPageData,
   type Overview,
   type ReservationView,
@@ -55,7 +56,7 @@ import {
   upsertReservation,
   verifyPassword,
 } from "./db";
-import { listZones } from "./zone";
+import { deleteZone, getZone, listZones } from "./zone";
 
 const FLASH_COOKIE = "ls_flash";
 
@@ -275,6 +276,35 @@ function toReservationViews(
   });
 }
 
+// loadAdminZones lists every zone on the server with its owner and live member
+// counts, so the admin console covers accounts the viewer does not own.
+async function loadAdminZones(env: Env, usersById: Map<string, UserRow>): Promise<AdminZoneView[]> {
+  const zones = await listZones(env);
+  const rosters = await Promise.all(
+    zones.slice(0, 64).map(async (zone) => {
+      try {
+        return await env.ZONE.get(env.ZONE.idFromName(zone.id)).getMembers();
+      } catch {
+        return null;
+      }
+    }),
+  );
+  return zones.map((zone, index) => {
+    const members = rosters[index] ?? null;
+    return {
+      id: zone.id,
+      name: zone.name,
+      cidr: zone.cidr,
+      visibility: zone.visibility,
+      maxMembers: zone.max_members,
+      owner: usersById.get(zone.owner_id)?.username ?? "deleted account",
+      createdAt: zone.created_at,
+      members: members?.length ?? 0,
+      online: members?.filter((member) => member.online).length ?? 0,
+    };
+  });
+}
+
 export async function handleAdmin(request: Request, env: Env, url: URL): Promise<Response> {
   const dbError = await requireDb(env);
   if (dbError) {
@@ -343,7 +373,7 @@ export async function handleAdmin(request: Request, env: Env, url: URL): Promise
   }
 
   const tabParam = url.searchParams.get("tab") || "overview";
-  const tab = (["overview", "users", "sites", "tokens", "reservations", "settings"].includes(tabParam)
+  const tab = (["overview", "users", "sites", "tokens", "reservations", "zones", "settings"].includes(tabParam)
     ? tabParam
     : "overview") as AdminPageData["tab"];
 
@@ -360,6 +390,7 @@ export async function handleAdmin(request: Request, env: Env, url: URL): Promise
   const tokenViews = tokens.map((token) => toTokenView(token, usersById));
   const userViews = users.map((user) => toUserView(user, sites, tokens));
   const reservationViews = toReservationViews(reservations, sites, usersById);
+  const adminZones = await loadAdminZones(env, usersById);
 
   const selectedUserId = url.searchParams.get("user");
   const selectedUser = selectedUserId
@@ -381,6 +412,7 @@ export async function handleAdmin(request: Request, env: Env, url: URL): Promise
     sites: siteViews,
     tokens: tokenViews,
     reservations: reservationViews,
+    zones: adminZones,
     overview: buildOverview(users, sites, tokens, siteViews),
     globalSettings,
     serverUrl: globalSettings.publicUrl || url.origin,
@@ -489,6 +521,14 @@ async function handleAdminAction(
       if (!token) return redirectWithFlash(`${back}?tab=tokens`, { kind: "error", message: "Token not found." });
       await revokeToken(env, tokenId);
       return redirectWithFlash(`${back}?tab=tokens`, { kind: "ok", message: "Token revoked." });
+    }
+
+    if (action === "deleteZone") {
+      const zoneId = String(form.get("zoneId") || "");
+      const zone = await getZone(env, zoneId);
+      if (!zone) return redirectWithFlash(`${back}?tab=zones`, { kind: "error", message: "Zone not found." });
+      await deleteZone(env, zone.id);
+      return redirectWithFlash(`${back}?tab=zones`, { kind: "ok", message: `Zone ${zone.name} deleted; its members were disconnected.` });
     }
 
     if (action === "deleteSite") {
