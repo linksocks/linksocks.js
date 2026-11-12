@@ -5,7 +5,7 @@ import { fileURLToPath } from "node:url";
 import { build } from "esbuild";
 import { Miniflare } from "miniflare";
 
-import { channelOpenFrame, sealedFrame } from "./v2-frames.mjs";
+import { channelOpenFrame, directSealedFrame, sealedFrame } from "./v2-frames.mjs";
 
 const projectRoot = fileURLToPath(new URL("..", import.meta.url));
 
@@ -138,6 +138,90 @@ test("V2 peers exchange sealed frames the relay only routes", { timeout: 20000 }
 
   connector.socket.close();
   provider.socket.close();
+});
+
+test("V2 peers exchange sealed direct-mode signaling through the relay", { timeout: 20000 }, async (context) => {
+  const worker = await newWorker(context, "protocol-v2-direct");
+  const providerToken = randomBytes(24).toString("hex");
+  const connectorToken = randomBytes(24).toString("hex");
+  const hash = (value) => createHash("sha256").update(value).digest("hex");
+
+  async function open(token, reverse, version) {
+    const versionParam = version ? `&version=0x${version.toString(16).padStart(2, "0")}` : "";
+    const response = await worker.dispatchFetch(
+      `http://localhost/socket?token=${hash(token)}&reverse=${reverse}${versionParam}`,
+      { headers: { Upgrade: "websocket" } },
+    );
+    assert.equal(response.status, 101);
+    const socket = response.webSocket;
+    assert.ok(socket);
+    const inbox = messageInbox(socket);
+    socket.accept();
+    const auth = await nextType(inbox, 0x02);
+    assert.equal(auth[2], 1);
+    return { socket, inbox, auth };
+  }
+
+  const provider = await open(providerToken, true, 0x21);
+  provider.socket.send(connectorFrame(0x21, randomBytes(16), connectorToken));
+  await nextType(provider.inbox, 0x08);
+
+  const connector = await open(connectorToken, false, 0x21);
+  await nextType(connector.inbox, 0x0a);
+
+  // The envelope's contents are opaque to the relay: it forwards the JSON
+  // bytes untouched so the two peers can authenticate and decrypt them.
+  const envelope = {
+    sender_session_id: "11111111-1111-4111-8111-111111111111",
+    recipient_session_id: "22222222-2222-4222-8222-222222222222",
+    nonce: "AAAAAAAAAAAAAAAA",
+    payload: "q83vEjRWeJq83vEjRWeJq83v",
+  };
+  connector.socket.send(directSealedFrame(0x21, envelope));
+  const forwarded = await nextType(provider.inbox, 0x1c);
+  assert.equal(forwarded[0], 0x21);
+  const length = new DataView(forwarded.buffer, forwarded.byteOffset).getUint32(2);
+  const decoded = JSON.parse(new TextDecoder().decode(forwarded.slice(6, 6 + length)));
+  assert.deepEqual(decoded, envelope);
+
+  // Replies travel the other way and are equally opaque.
+  const reply = { ...envelope, sender_session_id: envelope.recipient_session_id, recipient_session_id: envelope.sender_session_id };
+  provider.socket.send(directSealedFrame(0x21, reply));
+  const back = await nextType(connector.inbox, 0x1c);
+  const backLength = new DataView(back.buffer, back.byteOffset).getUint32(2);
+  assert.deepEqual(JSON.parse(new TextDecoder().decode(back.slice(6, 6 + backLength))), reply);
+
+  connector.socket.close();
+  provider.socket.close();
+});
+
+test("legacy connections cannot use sealed direct signaling", { timeout: 20000 }, async (context) => {
+  const worker = await newWorker(context, "protocol-v2-direct-legacy");
+  const providerToken = randomBytes(24).toString("hex");
+  const hash = (value) => createHash("sha256").update(value).digest("hex");
+
+  const response = await worker.dispatchFetch(
+    `http://localhost/socket?token=${hash(providerToken)}&reverse=true`,
+    { headers: { Upgrade: "websocket" } },
+  );
+  assert.equal(response.status, 101);
+  const socket = response.webSocket;
+  assert.ok(socket);
+  const inbox = messageInbox(socket);
+  socket.accept();
+  const auth = await nextType(inbox, 0x02);
+  assert.equal(auth[2], 1);
+  assert.equal(auth[0], 0x04, "legacy connections keep the native generation");
+
+  const closed = new Promise((resolve) => {
+    socket.addEventListener("close", (event) => resolve(event));
+  });
+  socket.send(directSealedFrame(0x04, { sender_session_id: "33333333-3333-4333-8333-333333333333" }));
+  const event = await Promise.race([
+    closed,
+    new Promise((_, reject) => setTimeout(() => reject(new Error("relay did not close legacy sealed direct signaling")), 5000)),
+  ]);
+  assert.equal(event.code, 1008);
 });
 
 test("legacy connections cannot use sealed channels", { timeout: 20000 }, async (context) => {

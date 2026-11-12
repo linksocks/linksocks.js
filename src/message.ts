@@ -10,7 +10,7 @@ export const PROTOCOL_VERSION = 0x04;
 // a Noise handshake between themselves and exchange Sealed frames the relay
 // only routes by channel id. Destinations, payloads and peer decisions never
 // cross the wire in plaintext.
-export const PROTOCOL_VERSION_V2 = 0x20;
+export const PROTOCOL_VERSION_V2 = 0x21;
 
 export function protocolMajor(v: number): number {
   return (v >> 4) & 0x0f;
@@ -65,6 +65,7 @@ export const enum BinaryType {
   WebSocketFrame = 0x19,
   ChannelOpen = 0x1A,
   Sealed = 0x1B,
+  DirectSealed = 0x1C,
 }
 
 // Protocol types
@@ -108,6 +109,7 @@ export const enum MessageType {
   WebSocketFrame = "websocket_frame",
   ChannelOpen = "channel_open",
   Sealed = "sealed",
+  DirectSealed = "direct_sealed",
   Unknown = "unknown",
 }
 
@@ -217,6 +219,7 @@ export interface DirectCapabilitiesMessage extends BaseMessage {
   candidates?: DirectCandidate[];
   discoveries?: string[];
   publicKey?: string;
+  sealed?: boolean;
 }
 
 export interface DirectRendezvousMessage extends BaseMessage {
@@ -229,6 +232,15 @@ export interface DirectStatusMessage extends BaseMessage {
   sessionId: string;
   status: string;
   metrics?: DirectMetrics;
+}
+
+// DirectSealedMessage carries one encrypted direct-mode signaling message. The
+// relay forwards it by role without being able to read the payload.
+export interface DirectSealedMessage extends BaseMessage {
+  senderSessionId: string;
+  recipientSessionId: string;
+  nonce: string;
+  payload: string;
 }
 
 export interface ChannelBindMessage extends BaseMessage {
@@ -608,6 +620,7 @@ export function packMessage(msg: BaseMessage, version: number = PROTOCOL_VERSION
         candidates: directMsg.candidates,
         discoveries: directMsg.discoveries,
         public_key: directMsg.publicKey,
+        sealed: directMsg.sealed,
       };
       const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
       const payload = [
@@ -654,6 +667,25 @@ export function packMessage(msg: BaseMessage, version: number = PROTOCOL_VERSION
       const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
       const payload = [
         BinaryType.DirectStatus,
+        (jsonData.length >> 24) & 0xff,
+        (jsonData.length >> 16) & 0xff,
+        (jsonData.length >> 8) & 0xff,
+        jsonData.length & 0xff,
+      ];
+      return concatUint8Arrays(header, new Uint8Array(payload), jsonData);
+    }
+
+    case MessageType.DirectSealed: {
+      const sealedMsg = msg as DirectSealedMessage;
+      const payloadBody = {
+        sender_session_id: sealedMsg.senderSessionId,
+        recipient_session_id: sealedMsg.recipientSessionId,
+        nonce: sealedMsg.nonce,
+        payload: sealedMsg.payload,
+      };
+      const jsonData = new TextEncoder().encode(JSON.stringify(payloadBody));
+      const payload = [
+        BinaryType.DirectSealed,
         (jsonData.length >> 24) & 0xff,
         (jsonData.length >> 16) & 0xff,
         (jsonData.length >> 8) & 0xff,
@@ -1245,6 +1277,7 @@ export function parseMessageWithVersion(data: Uint8Array): ParsedMessageWithVers
           candidates: parsed.candidates,
           discoveries: parsed.discoveries,
           publicKey: parsed.public_key,
+          sealed: parsed.sealed,
           getType: () => MessageType.DirectCapabilities,
         } as DirectCapabilitiesMessage,
       };
@@ -1306,11 +1339,36 @@ export function parseMessageWithVersion(data: Uint8Array): ParsedMessageWithVers
       };
     }
 
+    case BinaryType.DirectSealed: {
+      if (payload.length < 4) {
+        throw new Error("Invalid direct sealed message");
+      }
+      const dataLen =
+        (payload[0] << 24) |
+        (payload[1] << 16) |
+        (payload[2] << 8) |
+        payload[3];
+      if (payload.length < 4 + dataLen) {
+        throw new Error("Invalid direct sealed message length");
+      }
+      const jsonData = new TextDecoder().decode(payload.slice(4, 4 + dataLen));
+      const parsed = JSON.parse(jsonData);
+      return {
+        version,
+        message: {
+          senderSessionId: parsed.sender_session_id,
+          recipientSessionId: parsed.recipient_session_id,
+          nonce: parsed.nonce,
+          payload: parsed.payload,
+          getType: () => MessageType.DirectSealed,
+        } as DirectSealedMessage,
+      };
+    }
+
     case BinaryType.ChannelBind: {
       if (payload.length < 4) {
         throw new Error("Invalid channel bind message");
-      }
-      const dataLen =
+      }      const dataLen =
         (payload[0] << 24) |
         (payload[1] << 16) |
         (payload[2] << 8) |

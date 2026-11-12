@@ -1034,7 +1034,9 @@ export class Relay extends DurableObject {
         return;
       }
       if (
-        (msg.getType() === MessageType.ChannelOpen || msg.getType() === MessageType.Sealed) &&
+        (msg.getType() === MessageType.ChannelOpen ||
+          msg.getType() === MessageType.Sealed ||
+          msg.getType() === MessageType.DirectSealed) &&
         protocolMajor(version) !== protocolMajor(PROTOCOL_VERSION_V2)
       ) {
         ws.close(1008, "Sealed channels require protocol generation 2");
@@ -1473,7 +1475,8 @@ export class Relay extends DurableObject {
 
         case MessageType.DirectCapabilities:
         case MessageType.DirectRendezvous:
-        case MessageType.DirectStatus: {
+        case MessageType.DirectStatus:
+        case MessageType.DirectSealed: {
           if (isProvider) {
             for (const connector of this.connectors) {
               try {

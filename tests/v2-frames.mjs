@@ -17,3 +17,15 @@ export function sealedFrame(version, channelId, data) {
   frame.set(data, 22);
   return frame;
 }
+
+// directSealedFrame builds a DirectSealedMessage (0x1c) carrying an opaque
+// signaling envelope, mirroring what a Go peer sends for encrypted direct-mode
+// negotiation.
+export function directSealedFrame(version, body) {
+  const json = new TextEncoder().encode(JSON.stringify(body));
+  const frame = new Uint8Array(2 + 4 + json.length);
+  frame.set([version, 0x1c]);
+  new DataView(frame.buffer).setUint32(2, json.length);
+  frame.set(json, 6);
+  return frame;
+}
